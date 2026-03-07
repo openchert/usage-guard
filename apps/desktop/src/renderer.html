@@ -1,0 +1,85 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>UsageGuard</title>
+    <style>
+      body { font-family: Inter, Arial, sans-serif; margin: 24px; background: #0b0e14; color: #e7ecf3; }
+      h1 { margin-top: 0; }
+      .card { background: #121826; border: 1px solid #263041; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+      label { display: block; margin: 8px 0 4px; }
+      input { width: 220px; padding: 8px; border-radius: 8px; border: 1px solid #3a4860; background: #0f1420; color: #e7ecf3; }
+      button { margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 8px; cursor: pointer; background: #2d7ef7; color: white; }
+      .alerts li { margin-bottom: 6px; }
+      .muted { color: #9fb0c8; }
+      .row { display: flex; gap: 16px; flex-wrap: wrap; }
+      code { background: #1a2233; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>UsageGuard (Desktop MVP)</h1>
+    <p class="muted">Local-only usage monitor. No cloud backend required.</p>
+
+    <div class="card">
+      <h3>Quick Check</h3>
+      <div class="row">
+        <div><label>Spent (USD)</label><input id="spent" type="number" value="12" step="0.01" /></div>
+        <div><label>Limit (USD)</label><input id="limit" type="number" value="20" step="0.01" /></div>
+        <div><label>Inactive Hours</label><input id="inactive" type="number" value="9" step="1" /></div>
+        <div><label>Inactive Threshold</label><input id="inactiveThreshold" type="number" value="8" step="1" /></div>
+      </div>
+      <button id="checkBtn">Evaluate Alerts</button>
+      <ul id="alerts" class="alerts"></ul>
+    </div>
+
+    <div class="card">
+      <h3>Demo Provider Snapshots</h3>
+      <button id="demoBtn">Load Demo</button>
+      <div id="demoOut"></div>
+    </div>
+
+    <div class="card">
+      <h3>Next Step</h3>
+      <p>Plug real provider adapters into <code>core/providers.js</code> (API key / OAuth / runtime adapters).</p>
+    </div>
+
+    <script>
+      const alertsEl = document.getElementById('alerts');
+      const demoOut = document.getElementById('demoOut');
+
+      document.getElementById('checkBtn').addEventListener('click', async () => {
+        const payload = {
+          spent: Number(document.getElementById('spent').value),
+          limit: Number(document.getElementById('limit').value),
+          inactiveHours: Number(document.getElementById('inactive').value),
+          inactiveThresholdHours: Number(document.getElementById('inactiveThreshold').value)
+        };
+        const res = await window.usageGuard.evaluate(payload);
+        alertsEl.innerHTML = '';
+        if (!res.alerts.length) {
+          alertsEl.innerHTML = '<li>No alerts</li>';
+          return;
+        }
+        for (const a of res.alerts) {
+          const li = document.createElement('li');
+          li.textContent = `[${a.level}] ${a.message}`;
+          alertsEl.appendChild(li);
+        }
+      });
+
+      document.getElementById('demoBtn').addEventListener('click', async () => {
+        const { snapshots } = await window.usageGuard.demo();
+        demoOut.innerHTML = snapshots.map(s => `
+          <div style="margin-top:10px;padding:10px;border:1px solid #2b3750;border-radius:8px;">
+            <b>${s.provider}</b> (${s.accountLabel})<br/>
+            Spend: $${s.spent.toFixed(2)} / $${s.limit.toFixed(2)}<br/>
+            Tokens: in=${s.tokensIn.toLocaleString()} out=${s.tokensOut.toLocaleString()}<br/>
+            Inactive: ${s.inactiveHours}h<br/>
+            Alerts: ${s.alerts.length ? s.alerts.map(a => `[${a.level}] ${a.code}`).join(', ') : 'none'}
+          </div>
+        `).join('');
+      });
+    </script>
+  </body>
+</html>
