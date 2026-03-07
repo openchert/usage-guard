@@ -23,6 +23,18 @@ cargo run -p usageguard-desktop
 ## Installation (end users — no Rust required)
 Download the latest release from GitHub Releases and use the package for your OS.
 
+### One-command install
+
+#### Windows (PowerShell)
+```powershell
+irm https://raw.githubusercontent.com/openchert/usage-guard/main/install.ps1 | iex
+```
+
+#### macOS / Linux (bash)
+```bash
+curl -fsSL https://raw.githubusercontent.com/openchert/usage-guard/main/install.sh | bash
+```
+
 ### Windows (x64)
 1. Download: `usage-guard-windows-x64.zip`
 2. Extract the zip.
