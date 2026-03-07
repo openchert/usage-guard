@@ -20,6 +20,19 @@ cargo run -p usageguard-cli -- demo
 cargo run -p usageguard-desktop
 ```
 
+## Downloadable builds (no Rust required for users)
+- GitHub Actions builds binaries on tag push (`v*`) for:
+  - Linux (x64)
+  - Windows (x64)
+  - macOS (arm64)
+- Artifacts are attached to GitHub Releases as `.tar.gz`/`.zip`.
+
+Create a release build:
+```bash
+git tag v0.4.1
+git push origin v0.4.1
+```
+
 ## Current UI behavior
 - No top bar/window decorations
 - Compact information-focused panel
