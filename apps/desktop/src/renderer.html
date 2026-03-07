@@ -15,11 +15,12 @@
       .muted { color: #9fb0c8; }
       .row { display: flex; gap: 16px; flex-wrap: wrap; }
       code { background: #1a2233; padding: 2px 6px; border-radius: 6px; }
+      .small { font-size: 13px; }
     </style>
   </head>
   <body>
     <h1>UsageGuard (Desktop MVP)</h1>
-    <p class="muted">Local-only usage monitor. No cloud backend required.</p>
+    <p class="muted">Local-only usage monitor. Uses API/log adapters when available, otherwise mock data.</p>
 
     <div class="card">
       <h3>Quick Check</h3>
@@ -34,19 +35,27 @@
     </div>
 
     <div class="card">
-      <h3>Demo Provider Snapshots</h3>
-      <button id="demoBtn">Load Demo</button>
+      <h3>Provider Snapshots</h3>
+      <button id="demoBtn">Load snapshots</button>
+      <p id="configOut" class="small muted"></p>
       <div id="demoOut"></div>
     </div>
 
-    <div class="card">
-      <h3>Next Step</h3>
-      <p>Plug real provider adapters into <code>core/providers.js</code> (API key / OAuth / runtime adapters).</p>
+    <div class="card small">
+      <h3>Real data wiring</h3>
+      <p>Set env vars before launching:</p>
+      <ul>
+        <li><code>OPENAI_API_KEY</code> (optional API query path)</li>
+        <li><code>OPENAI_USAGE_LOG=/path/to/openai.ndjson</code></li>
+        <li><code>ANTHROPIC_API_KEY</code> and optional <code>ANTHROPIC_COSTS_ENDPOINT</code></li>
+        <li><code>ANTHROPIC_USAGE_LOG=/path/to/anthropic.ndjson</code></li>
+      </ul>
     </div>
 
     <script>
       const alertsEl = document.getElementById('alerts');
       const demoOut = document.getElementById('demoOut');
+      const configOut = document.getElementById('configOut');
 
       document.getElementById('checkBtn').addEventListener('click', async () => {
         const payload = {
@@ -69,13 +78,15 @@
       });
 
       document.getElementById('demoBtn').addEventListener('click', async () => {
-        const { snapshots } = await window.usageGuard.demo();
+        const { snapshots, config } = await window.usageGuard.demo();
+        configOut.textContent = `Quiet hours: ${config.quietHours.startHour}:00 - ${config.quietHours.endHour}:00 | nearLimitRatio=${config.nearLimitRatio}`;
         demoOut.innerHTML = snapshots.map(s => `
           <div style="margin-top:10px;padding:10px;border:1px solid #2b3750;border-radius:8px;">
             <b>${s.provider}</b> (${s.accountLabel})<br/>
             Spend: $${s.spent.toFixed(2)} / $${s.limit.toFixed(2)}<br/>
             Tokens: in=${s.tokensIn.toLocaleString()} out=${s.tokensOut.toLocaleString()}<br/>
             Inactive: ${s.inactiveHours}h<br/>
+            Source: ${s.source || 'unknown'}<br/>
             Alerts: ${s.alerts.length ? s.alerts.map(a => `[${a.level}] ${a.code}`).join(', ') : 'none'}
           </div>
         `).join('');

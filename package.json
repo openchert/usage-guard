@@ -1,6 +1,6 @@
 {
   "name": "usage-guard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": false,
   "description": "Local-first AI usage monitor with cross-platform desktop app and CLI",
   "license": "MIT",
@@ -13,13 +13,45 @@
     "start": "electron apps/desktop/src/main.js",
     "cli:demo": "node apps/cli/bin/usageguard.js demo",
     "cli:check": "node apps/cli/bin/usageguard.js check --spent 12 --limit 20 --inactive-hours 9",
-    "lint": "node -e \"console.log('no lint configured yet')\""
+    "test": "node --test tests/*.test.js",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
   },
   "dependencies": {
     "commander": "^13.1.0",
     "electron-store": "^10.1.0"
   },
   "devDependencies": {
-    "electron": "^35.1.5"
+    "electron": "^35.1.5",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "ai.usageguard.app",
+    "productName": "UsageGuard",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "apps/**/*",
+      "core/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "target": [
+        "dmg"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    }
   }
 }

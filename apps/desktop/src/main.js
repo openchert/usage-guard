@@ -1,16 +1,18 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, Notification } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { evaluateAlerts } from '../../../core/alerts.js';
-import { getOpenAIMockSnapshot, getAnthropicMockSnapshot } from '../../../core/providers.js';
+import { loadConfig } from '../../../core/config.js';
+import { shouldNotifyNow } from '../../../core/notifications.js';
+import { getOpenAISnapshot, getAnthropicSnapshot } from '../../../core/providers.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function createWindow() {
   const win = new BrowserWindow({
-    width: 920,
-    height: 700,
+    width: 980,
+    height: 760,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -20,17 +22,38 @@ function createWindow() {
   win.loadFile(path.join(__dirname, 'renderer.html'));
 }
 
+function maybeNotify(provider, alerts, cfg) {
+  if (!shouldNotifyNow({ alerts, quietHours: cfg.quietHours })) return;
+  const summary = alerts.map((a) => `${a.level}:${a.code}`).join(', ');
+  new Notification({
+    title: `UsageGuard • ${provider}`,
+    body: summary || 'No alerts'
+  }).show();
+}
+
 ipcMain.handle('evaluate-usage', async (_, payload) => {
-  const alerts = evaluateAlerts(payload);
-  return { alerts };
+  const cfg = loadConfig();
+  const alerts = evaluateAlerts({
+    ...payload,
+    nearLimitRatio: cfg.nearLimitRatio,
+    inactiveThresholdHours: cfg.inactiveThresholdHours
+  });
+  return { alerts, config: cfg };
 });
 
 ipcMain.handle('demo-snapshots', async () => {
-  const openai = await getOpenAIMockSnapshot();
-  const anthropic = await getAnthropicMockSnapshot();
-  return {
-    snapshots: [openai, anthropic].map((s) => ({ ...s, alerts: evaluateAlerts(s) }))
-  };
+  const cfg = loadConfig();
+  const snapshots = [await getOpenAISnapshot(), await getAnthropicSnapshot()].map((s) => {
+    const alerts = evaluateAlerts({
+      ...s,
+      nearLimitRatio: cfg.nearLimitRatio,
+      inactiveThresholdHours: cfg.inactiveThresholdHours
+    });
+    maybeNotify(s.provider, alerts, cfg);
+    return { ...s, alerts };
+  });
+
+  return { snapshots, config: cfg };
 });
 
 app.whenReady().then(() => {
