@@ -3791,7 +3791,9 @@ dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "mac-notification-sys",
  "notify-rust",
+ "tauri-winrt-notification",
  "usageguard-core",
 ]
 

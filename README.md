@@ -142,6 +142,7 @@ UsageGuard now includes built-in adapters for:
 Plus custom provider profiles via config.
 
 See `docs/INTERFACES.md` for exact environment variables, headers, endpoint contracts, and normalized schema.
+See `docs/ADAPTER_EXAMPLES.md` for custom provider/profile examples.
 See `docs/NEXT_STEPS.md` for the public short roadmap.
 
 ## Troubleshooting
@@ -164,6 +165,7 @@ git push origin v0.4.1
 
 ## Current UI behavior
 - No top bar/window decorations
+- Draggable desktop window (drag by title area)
 - Compact information-focused panel
 - **Idle mode by default:** usage bars only
 - Click provider row to expand exact numbers/details

@@ -1,0 +1,7 @@
+{
+  "id": "my_provider",
+  "label": "My Provider",
+  "endpoint": "https://example.com/usage",
+  "auth_header": "Authorization",
+  "api_key": "YOUR_TOKEN"
+}

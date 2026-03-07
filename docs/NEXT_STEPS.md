@@ -5,8 +5,9 @@ This is the public high-level roadmap.
 ## Next priorities
 1. Provider schema parity hardening with real production payloads.
 2. Retry/backoff + typed adapter errors.
-3. Native notifications parity on Windows/macOS (Linux already supported).
+3. Validate native notification parity on Windows/macOS release runners (Linux already validated).
 4. Signed/notarized release artifacts for trust and smoother installs.
+5. Provider extension UX polish (adapter examples + validation tooling).
 
 ## Current status
 - Minimal desktop + CLI shipped.

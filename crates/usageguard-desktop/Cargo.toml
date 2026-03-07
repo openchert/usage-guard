@@ -14,6 +14,12 @@ usageguard-core = { path = "../usageguard-core" }
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = "4"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+tauri-winrt-notification = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-notification-sys = "0.6"
+
 [[bin]]
 name = "usageguard-desktop"
 path = "src/main.rs"

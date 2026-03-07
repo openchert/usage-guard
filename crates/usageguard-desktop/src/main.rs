@@ -1,6 +1,7 @@
 use chrono::Local;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use usageguard_core::{
     evaluate_alerts, load_config, provider_snapshots, save_config, set_provider_api_key,
     should_notify, Alert, AppConfig, UsageSnapshot,
@@ -110,14 +111,58 @@ fn emit_native_notification(title: &str, body: &str) {
         .show();
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn emit_native_notification(title: &str, body: &str) {
+    let _ =
+        tauri_winrt_notification::Toast::new(tauri_winrt_notification::Toast::POWERSHELL_APP_ID)
+            .title(title)
+            .text1(body)
+            .show();
+}
+
+#[cfg(target_os = "macos")]
+fn emit_native_notification(title: &str, body: &str) {
+    let _ = mac_notification_sys::send_notification(title, None, body, None);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn emit_native_notification(_title: &str, _body: &str) {}
+
+fn forecast_eta_to_limit(snapshot: &UsageSnapshot) -> Option<String> {
+    if snapshot.limit_usd <= snapshot.spent_usd || snapshot.limit_usd <= 0.0 {
+        return None;
+    }
+    let burn_env = format!(
+        "{}_BURN_USD_PER_HOUR",
+        snapshot.provider.to_uppercase().replace('-', "_")
+    );
+    let burn_rate = std::env::var(&burn_env)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())?;
+    if burn_rate <= 0.0 {
+        return None;
+    }
+    let remaining = snapshot.limit_usd - snapshot.spent_usd;
+    let eta_hours = remaining / burn_rate;
+    if eta_hours.is_finite() && eta_hours > 0.0 {
+        Some(format!("ETA to limit: {:.1}h", eta_hours))
+    } else {
+        None
+    }
+}
 
 impl eframe::App for UsageGuardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(Duration::from_secs(30));
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-            ui.heading("UsageGuard");
+
+            let drag_resp =
+                ui.add(egui::Label::new("UsageGuard").sense(egui::Sense::click_and_drag()));
+            if drag_resp.dragged() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
 
             ui.horizontal(|ui| {
                 if ui.button("Refresh").clicked() {
@@ -171,6 +216,9 @@ impl eframe::App for UsageGuardApp {
                         ui.label(format!("tokens in={} out={}", s.tokens_in, s.tokens_out));
                         ui.label(format!("inactive {}h", s.inactive_hours));
                         ui.small(format!("source: {}", s.source));
+                        if let Some(eta) = forecast_eta_to_limit(s) {
+                            ui.small(eta);
+                        }
 
                         if alerts.is_empty() {
                             ui.label("status: ok");
