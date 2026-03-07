@@ -45,8 +45,32 @@ impl Default for QuietHours {
 pub struct ApiCredentials {
     pub openai_api_key: Option<String>,
     pub anthropic_api_key: Option<String>,
+    pub gemini_api_key: Option<String>,
+    pub mistral_api_key: Option<String>,
+    pub groq_api_key: Option<String>,
+    pub together_api_key: Option<String>,
+    pub openrouter_api_key: Option<String>,
+    pub azure_openai_api_key: Option<String>,
+    pub ollama_api_key: Option<String>,
+
     pub openai_costs_endpoint: Option<String>,
     pub anthropic_costs_endpoint: Option<String>,
+    pub gemini_costs_endpoint: Option<String>,
+    pub mistral_costs_endpoint: Option<String>,
+    pub groq_costs_endpoint: Option<String>,
+    pub together_costs_endpoint: Option<String>,
+    pub openrouter_costs_endpoint: Option<String>,
+    pub azure_openai_costs_endpoint: Option<String>,
+    pub ollama_usage_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    pub id: String,
+    pub label: String,
+    pub endpoint: String,
+    pub auth_header: Option<String>,
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +79,8 @@ pub struct AppConfig {
     pub inactive_threshold_hours: u32,
     pub quiet_hours: QuietHours,
     pub api: ApiCredentials,
+    #[serde(default)]
+    pub profiles: Vec<ProviderProfile>,
 }
 
 impl Default for AppConfig {
@@ -64,8 +90,21 @@ impl Default for AppConfig {
             inactive_threshold_hours: 8,
             quiet_hours: QuietHours::default(),
             api: ApiCredentials::default(),
+            profiles: vec![],
         }
     }
+}
+
+struct ProviderSpec<'a> {
+    id: &'a str,
+    label: &'a str,
+    env_prefix: &'a str,
+    api_key: Option<String>,
+    endpoint: Option<String>,
+    default_endpoint: Option<&'a str>,
+    auth_header: &'a str,
+    extra_headers: Vec<(&'a str, String)>,
+    usage_log_env: Option<&'a str>,
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -162,13 +201,190 @@ pub fn should_notify(alerts: &[Alert], now: DateTime<Local>, cfg: &AppConfig) ->
 }
 
 pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
-    let mut items = Vec::new();
+    let builtins = vec![
+        ProviderSpec {
+            id: "openai",
+            label: "OpenAI",
+            env_prefix: "OPENAI",
+            api_key: cfg
+                .api
+                .openai_api_key
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .openai_costs_endpoint
+                .clone()
+                .or_else(|| std::env::var("OPENAI_COSTS_ENDPOINT").ok()),
+            default_endpoint: Some("https://api.openai.com/v1/organization/costs"),
+            auth_header: "Authorization",
+            extra_headers: vec![],
+            usage_log_env: Some("OPENAI_USAGE_LOG"),
+        },
+        ProviderSpec {
+            id: "anthropic",
+            label: "Anthropic",
+            env_prefix: "ANTHROPIC",
+            api_key: cfg
+                .api
+                .anthropic_api_key
+                .clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .anthropic_costs_endpoint
+                .clone()
+                .or_else(|| std::env::var("ANTHROPIC_COSTS_ENDPOINT").ok()),
+            default_endpoint: Some("https://api.anthropic.com/v1/organizations/usage"),
+            auth_header: "x-api-key",
+            extra_headers: vec![("anthropic-version", "2023-06-01".to_string())],
+            usage_log_env: Some("ANTHROPIC_USAGE_LOG"),
+        },
+        ProviderSpec {
+            id: "gemini",
+            label: "Gemini",
+            env_prefix: "GEMINI",
+            api_key: cfg
+                .api
+                .gemini_api_key
+                .clone()
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .gemini_costs_endpoint
+                .clone()
+                .or_else(|| std::env::var("GEMINI_COSTS_ENDPOINT").ok()),
+            default_endpoint: None,
+            auth_header: "Authorization",
+            extra_headers: vec![],
+            usage_log_env: Some("GEMINI_USAGE_LOG"),
+        },
+        ProviderSpec {
+            id: "mistral",
+            label: "Mistral",
+            env_prefix: "MISTRAL",
+            api_key: cfg
+                .api
+                .mistral_api_key
+                .clone()
+                .or_else(|| std::env::var("MISTRAL_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .mistral_costs_endpoint
+                .clone()
+                .or_else(|| std::env::var("MISTRAL_COSTS_ENDPOINT").ok()),
+            default_endpoint: None,
+            auth_header: "Authorization",
+            extra_headers: vec![],
+            usage_log_env: Some("MISTRAL_USAGE_LOG"),
+        },
+        ProviderSpec {
+            id: "groq",
+            label: "Groq",
+            env_prefix: "GROQ",
+            api_key: cfg
+                .api
+                .groq_api_key
+                .clone()
+                .or_else(|| std::env::var("GROQ_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .groq_costs_endpoint
+                .clone()
+                .or_else(|| std::env::var("GROQ_COSTS_ENDPOINT").ok()),
+            default_endpoint: None,
+            auth_header: "Authorization",
+            extra_headers: vec![],
+            usage_log_env: Some("GROQ_USAGE_LOG"),
+        },
+        ProviderSpec {
+            id: "together",
+            label: "Together",
+            env_prefix: "TOGETHER",
+            api_key: cfg
+                .api
+                .together_api_key
+                .clone()
+                .or_else(|| std::env::var("TOGETHER_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .together_costs_endpoint
+                .clone()
+                .or_else(|| std::env::var("TOGETHER_COSTS_ENDPOINT").ok()),
+            default_endpoint: None,
+            auth_header: "Authorization",
+            extra_headers: vec![],
+            usage_log_env: Some("TOGETHER_USAGE_LOG"),
+        },
+        ProviderSpec {
+            id: "openrouter",
+            label: "OpenRouter",
+            env_prefix: "OPENROUTER",
+            api_key: cfg
+                .api
+                .openrouter_api_key
+                .clone()
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .openrouter_costs_endpoint
+                .clone()
+                .or_else(|| std::env::var("OPENROUTER_COSTS_ENDPOINT").ok()),
+            default_endpoint: None,
+            auth_header: "Authorization",
+            extra_headers: vec![],
+            usage_log_env: Some("OPENROUTER_USAGE_LOG"),
+        },
+        ProviderSpec {
+            id: "azure_openai",
+            label: "Azure OpenAI",
+            env_prefix: "AZURE_OPENAI",
+            api_key: cfg
+                .api
+                .azure_openai_api_key
+                .clone()
+                .or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .azure_openai_costs_endpoint
+                .clone()
+                .or_else(|| std::env::var("AZURE_OPENAI_COSTS_ENDPOINT").ok()),
+            default_endpoint: None,
+            auth_header: "api-key",
+            extra_headers: vec![],
+            usage_log_env: Some("AZURE_OPENAI_USAGE_LOG"),
+        },
+        ProviderSpec {
+            id: "ollama",
+            label: "Ollama",
+            env_prefix: "OLLAMA",
+            api_key: cfg
+                .api
+                .ollama_api_key
+                .clone()
+                .or_else(|| std::env::var("OLLAMA_API_KEY").ok()),
+            endpoint: cfg
+                .api
+                .ollama_usage_endpoint
+                .clone()
+                .or_else(|| std::env::var("OLLAMA_USAGE_ENDPOINT").ok()),
+            default_endpoint: None,
+            auth_header: "Authorization",
+            extra_headers: vec![],
+            usage_log_env: Some("OLLAMA_USAGE_LOG"),
+        },
+    ];
 
-    if let Some(s) = get_openai_snapshot(cfg) {
-        items.push(s);
-    }
-    if let Some(s) = get_anthropic_snapshot(cfg) {
-        items.push(s);
+    let mut items: Vec<UsageSnapshot> = builtins
+        .into_iter()
+        .filter_map(fetch_provider_snapshot)
+        .collect();
+
+    for profile in &cfg.profiles {
+        let snapshot = fetch_custom_profile(profile);
+        if let Some(s) = snapshot {
+            items.push(s);
+        }
     }
 
     if items.is_empty() {
@@ -178,101 +394,108 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
     }
 }
 
-fn get_openai_snapshot(cfg: &AppConfig) -> Option<UsageSnapshot> {
-    if let Ok(path) = std::env::var("OPENAI_USAGE_LOG") {
-        if let Ok(s) = snapshot_from_ndjson(&path, "openai", "OpenAI") {
-            return Some(s);
+fn fetch_custom_profile(profile: &ProviderProfile) -> Option<UsageSnapshot> {
+    if profile.endpoint.trim().is_empty() {
+        return None;
+    }
+
+    let mut headers = vec![];
+    if let (Some(name), Some(key)) = (&profile.auth_header, &profile.api_key) {
+        if name.eq_ignore_ascii_case("authorization") {
+            headers.push((name.as_str(), format!("Bearer {key}")));
+        } else {
+            headers.push((name.as_str(), key.clone()));
         }
     }
 
-    let endpoint = cfg
-        .api
-        .openai_costs_endpoint
-        .clone()
-        .or_else(|| std::env::var("OPENAI_COSTS_ENDPOINT").ok())
-        .unwrap_or_else(|| "https://api.openai.com/v1/organization/costs".to_string());
-    let api_key = cfg
-        .api
-        .openai_api_key
-        .clone()
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+    match snapshot_from_http_json(
+        &profile.endpoint,
+        &headers,
+        &profile.id,
+        &profile.label,
+        "profile-api",
+    ) {
+        Ok(s) => Some(s),
+        Err(e) => Some(error_snapshot(
+            &profile.id,
+            &profile.label,
+            format!("api-error:{e}"),
+        )),
+    }
+}
 
-    if let Some(key) = api_key {
-        match snapshot_from_openai_api(&endpoint, &key) {
-            Ok(s) => return Some(s),
-            Err(e) => {
-                return Some(error_snapshot("openai", "OpenAI", format!("api-error:{e}")));
+fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
+    if let Some(log_env) = spec.usage_log_env {
+        if let Ok(path) = std::env::var(log_env) {
+            if let Ok(s) = snapshot_from_ndjson(&path, spec.id, spec.label) {
+                return Some(s);
             }
         }
     }
 
-    env_fallback_snapshot("openai", "OpenAI", "OPENAI")
-}
+    let endpoint = spec
+        .endpoint
+        .or_else(|| spec.default_endpoint.map(|v| v.to_string()));
 
-fn get_anthropic_snapshot(cfg: &AppConfig) -> Option<UsageSnapshot> {
-    if let Ok(path) = std::env::var("ANTHROPIC_USAGE_LOG") {
-        if let Ok(s) = snapshot_from_ndjson(&path, "anthropic", "Anthropic") {
-            return Some(s);
+    if let (Some(url), Some(key)) = (endpoint, spec.api_key) {
+        let auth_value = if spec.auth_header.eq_ignore_ascii_case("authorization") {
+            format!("Bearer {key}")
+        } else {
+            key
+        };
+
+        let mut headers = vec![(spec.auth_header, auth_value)];
+        for h in spec.extra_headers {
+            headers.push(h);
         }
-    }
 
-    let endpoint = cfg
-        .api
-        .anthropic_costs_endpoint
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_COSTS_ENDPOINT").ok())
-        .unwrap_or_else(|| "https://api.anthropic.com/v1/organizations/usage".to_string());
-    let api_key = cfg
-        .api
-        .anthropic_api_key
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
-
-    if let Some(key) = api_key {
-        match snapshot_from_anthropic_api(&endpoint, &key) {
+        match snapshot_from_http_json(&url, &headers, spec.id, spec.label, "api") {
             Ok(s) => return Some(s),
             Err(e) => {
                 return Some(error_snapshot(
-                    "anthropic",
-                    "Anthropic",
+                    spec.id,
+                    spec.label,
                     format!("api-error:{e}"),
                 ));
             }
         }
     }
 
-    env_fallback_snapshot("anthropic", "Anthropic", "ANTHROPIC")
+    env_fallback_snapshot(spec.id, spec.label, spec.env_prefix)
 }
 
-fn snapshot_from_openai_api(url: &str, api_key: &str) -> Result<UsageSnapshot> {
+fn snapshot_from_http_json(
+    url: &str,
+    headers: &[(&str, String)],
+    provider: &str,
+    label: &str,
+    source: &str,
+) -> Result<UsageSnapshot> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()?;
 
-    let res = client
-        .get(url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()?
-        .error_for_status()?;
+    let mut req = client.get(url);
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
 
+    let res = req.send()?.error_for_status()?;
     let value: Value = res.json()?;
-    parse_openai_costs_response(&value)
-}
 
-fn snapshot_from_anthropic_api(url: &str, api_key: &str) -> Result<UsageSnapshot> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .build()?;
+    // strict-ish known responses first
+    if provider == "openai" {
+        if let Ok(s) = parse_openai_costs_response(&value) {
+            return Ok(s);
+        }
+    }
+    if provider == "anthropic" {
+        if let Ok(s) = parse_anthropic_usage_response(&value) {
+            return Ok(s);
+        }
+    }
 
-    let res = client
-        .get(url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .send()?
-        .error_for_status()?;
-
-    let value: Value = res.json()?;
-    parse_anthropic_usage_response(&value)
+    snapshot_from_value(&value, provider, label, source)
 }
 
 fn parse_openai_costs_response(value: &Value) -> Result<UsageSnapshot> {
@@ -294,31 +517,19 @@ fn parse_openai_costs_response(value: &Value) -> Result<UsageSnapshot> {
     })
     .unwrap_or(0.0);
 
-    let limit_usd = pick_f64(value, &["limit_usd", "budget_usd", "hard_limit_usd"]).unwrap_or(0.0);
-    let tokens_in =
-        pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"]).unwrap_or(0);
-    let tokens_out = pick_u64(
-        value,
-        &["tokens_out", "output_tokens", "total_output_tokens"],
-    )
-    .unwrap_or(0);
-
-    let inactive_hours = if let Some(h) = pick_u64(value, &["inactive_hours"]) {
-        h as u32
-    } else if let Some(ts) = pick_str(value, &["last_activity_iso", "last_activity"]) {
-        inactive_hours_from_iso(ts).unwrap_or(0)
-    } else {
-        0
-    };
-
     Ok(UsageSnapshot {
         provider: "openai".into(),
         account_label: "OpenAI".into(),
         spent_usd,
-        limit_usd,
-        tokens_in,
-        tokens_out,
-        inactive_hours,
+        limit_usd: pick_f64(value, &["limit_usd", "budget_usd", "hard_limit_usd"]).unwrap_or(0.0),
+        tokens_in: pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"])
+            .unwrap_or(0),
+        tokens_out: pick_u64(
+            value,
+            &["tokens_out", "output_tokens", "total_output_tokens"],
+        )
+        .unwrap_or(0),
+        inactive_hours: derive_inactive_hours(value),
         source: "openai-api".into(),
     })
 }
@@ -338,41 +549,27 @@ fn parse_anthropic_usage_response(value: &Value) -> Result<UsageSnapshot> {
     let spent_usd =
         pick_f64(value, &["total_cost_usd", "spent_usd", "cost_usd"]).unwrap_or(spent_rows_sum);
 
-    let tokens_in = pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"])
-        .unwrap_or_else(|| {
-            rows.iter()
-                .filter_map(|r| pick_u64(r, &["input_tokens", "tokens_in"]))
-                .sum()
-        });
-
-    let tokens_out = pick_u64(
-        value,
-        &["tokens_out", "output_tokens", "total_output_tokens"],
-    )
-    .unwrap_or_else(|| {
-        rows.iter()
-            .filter_map(|r| pick_u64(r, &["output_tokens", "tokens_out"]))
-            .sum()
-    });
-
-    let limit_usd = pick_f64(value, &["limit_usd", "budget_usd"]).unwrap_or(0.0);
-    let inactive_hours = if let Some(h) = pick_u64(value, &["inactive_hours"]) {
-        h as u32
-    } else {
-        rows.last()
-            .and_then(|r| pick_str(r, &["timestamp", "time", "last_activity_iso"]))
-            .and_then(inactive_hours_from_iso)
-            .unwrap_or(0)
-    };
-
     Ok(UsageSnapshot {
         provider: "anthropic".into(),
         account_label: "Anthropic".into(),
         spent_usd,
-        limit_usd,
-        tokens_in,
-        tokens_out,
-        inactive_hours,
+        limit_usd: pick_f64(value, &["limit_usd", "budget_usd"]).unwrap_or(0.0),
+        tokens_in: pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"])
+            .unwrap_or_else(|| {
+                rows.iter()
+                    .filter_map(|r| pick_u64(r, &["input_tokens", "tokens_in"]))
+                    .sum()
+            }),
+        tokens_out: pick_u64(
+            value,
+            &["tokens_out", "output_tokens", "total_output_tokens"],
+        )
+        .unwrap_or_else(|| {
+            rows.iter()
+                .filter_map(|r| pick_u64(r, &["output_tokens", "tokens_out"]))
+                .sum()
+        }),
+        inactive_hours: derive_inactive_hours(value),
         source: "anthropic-api".into(),
     })
 }
@@ -400,29 +597,36 @@ fn snapshot_from_value(
     label: &str,
     source: &str,
 ) -> Result<UsageSnapshot> {
-    let spent_usd = pick_f64(value, &["spent_usd", "spent", "cost_usd"]).unwrap_or(0.0);
-    let limit_usd = pick_f64(value, &["limit_usd", "budget_usd", "limit"]).unwrap_or(0.0);
-    let tokens_in = pick_u64(value, &["tokens_in", "input_tokens"]).unwrap_or(0);
-    let tokens_out = pick_u64(value, &["tokens_out", "output_tokens"]).unwrap_or(0);
-
-    let inactive_hours = if let Some(h) = pick_u64(value, &["inactive_hours"]) {
-        h as u32
-    } else if let Some(ts) = pick_str(value, &["last_activity_iso", "last_activity"]) {
-        inactive_hours_from_iso(ts).unwrap_or(0)
-    } else {
-        0
-    };
-
     Ok(UsageSnapshot {
         provider: provider.to_string(),
         account_label: label.to_string(),
-        spent_usd,
-        limit_usd,
-        tokens_in,
-        tokens_out,
-        inactive_hours,
+        spent_usd: pick_f64(value, &["spent_usd", "spent", "cost_usd", "total_cost_usd"])
+            .unwrap_or(0.0),
+        limit_usd: pick_f64(
+            value,
+            &["limit_usd", "budget_usd", "limit", "hard_limit_usd"],
+        )
+        .unwrap_or(0.0),
+        tokens_in: pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"])
+            .unwrap_or(0),
+        tokens_out: pick_u64(
+            value,
+            &["tokens_out", "output_tokens", "total_output_tokens"],
+        )
+        .unwrap_or(0),
+        inactive_hours: derive_inactive_hours(value),
         source: source.to_string(),
     })
+}
+
+fn derive_inactive_hours(value: &Value) -> u32 {
+    if let Some(h) = pick_u64(value, &["inactive_hours"]) {
+        h as u32
+    } else if let Some(ts) = pick_str(value, &["last_activity_iso", "last_activity", "timestamp"]) {
+        inactive_hours_from_iso(ts).unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 fn env_fallback_snapshot(provider: &str, label: &str, prefix: &str) -> Option<UsageSnapshot> {

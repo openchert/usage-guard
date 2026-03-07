@@ -114,6 +114,22 @@ usageguard config --anthropic-endpoint "https://api.anthropic.com/v1/organizatio
 usageguard demo
 ```
 
+## Provider support
+UsageGuard now includes built-in adapters for:
+- OpenAI
+- Anthropic
+- Gemini
+- Mistral
+- Groq
+- Together
+- OpenRouter
+- Azure OpenAI
+- Ollama
+
+Plus custom provider profiles via config.
+
+See `docs/INTERFACES.md` for exact environment variables, headers, endpoint contracts, and normalized schema.
+
 ## Troubleshooting
 - If install command succeeds but command not found, restart terminal (PATH refresh).
 - If API shows `source: api-error:...`, verify key permissions and endpoint URL.
