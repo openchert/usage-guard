@@ -20,7 +20,57 @@ cargo run -p usageguard-cli -- demo
 cargo run -p usageguard-desktop
 ```
 
-## Downloadable builds (no Rust required for users)
+## Installation (end users — no Rust required)
+Download the latest release from GitHub Releases and use the package for your OS.
+
+### Windows (x64)
+1. Download: `usage-guard-windows-x64.zip`
+2. Extract the zip.
+3. Run:
+   - `usageguard-desktop.exe` (desktop app)
+   - `usageguard.exe` (CLI)
+
+PowerShell example:
+```powershell
+./usageguard.exe demo
+./usageguard.exe config --show
+```
+
+### macOS (Apple Silicon / arm64)
+1. Download: `usage-guard-macos-arm64.tar.gz`
+2. Extract:
+```bash
+tar -xzf usage-guard-macos-arm64.tar.gz
+```
+3. Run:
+```bash
+chmod +x usageguard usageguard-desktop
+./usageguard-desktop
+```
+CLI example:
+```bash
+./usageguard demo
+./usageguard config --show
+```
+
+### Linux (x64)
+1. Download: `usage-guard-linux-x64.tar.gz`
+2. Extract:
+```bash
+tar -xzf usage-guard-linux-x64.tar.gz
+```
+3. Run:
+```bash
+chmod +x usageguard usageguard-desktop
+./usageguard-desktop
+```
+CLI example:
+```bash
+./usageguard demo
+./usageguard config --show
+```
+
+## Release build automation
 - GitHub Actions builds binaries on tag push (`v*`) for:
   - Linux (x64)
   - Windows (x64)
