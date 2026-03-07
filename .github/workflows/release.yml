@@ -99,6 +99,12 @@ jobs:
           find dist -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release-assets/ \;
           ls -lah release-assets
 
+      - name: Generate SHA256 checksums
+        run: |
+          cd release-assets
+          sha256sum *.zip *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create release and upload assets
         uses: softprops/action-gh-release@v2
         with:
@@ -106,3 +112,4 @@ jobs:
           files: |
             release-assets/*.zip
             release-assets/*.tar.gz
+            release-assets/SHA256SUMS

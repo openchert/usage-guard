@@ -189,20 +189,16 @@ fn get_openai_snapshot(cfg: &AppConfig) -> Option<UsageSnapshot> {
         .api
         .openai_costs_endpoint
         .clone()
-        .or_else(|| std::env::var("OPENAI_COSTS_ENDPOINT").ok());
+        .or_else(|| std::env::var("OPENAI_COSTS_ENDPOINT").ok())
+        .unwrap_or_else(|| "https://api.openai.com/v1/organization/costs".to_string());
     let api_key = cfg
         .api
         .openai_api_key
         .clone()
         .or_else(|| std::env::var("OPENAI_API_KEY").ok());
 
-    if let (Some(url), Some(key)) = (endpoint, api_key) {
-        match snapshot_from_http_json(
-            &url,
-            &[(&"Authorization", format!("Bearer {key}"))],
-            "openai",
-            "OpenAI",
-        ) {
+    if let Some(key) = api_key {
+        match snapshot_from_openai_api(&endpoint, &key) {
             Ok(s) => return Some(s),
             Err(e) => {
                 return Some(error_snapshot("openai", "OpenAI", format!("api-error:{e}")));
@@ -224,23 +220,16 @@ fn get_anthropic_snapshot(cfg: &AppConfig) -> Option<UsageSnapshot> {
         .api
         .anthropic_costs_endpoint
         .clone()
-        .or_else(|| std::env::var("ANTHROPIC_COSTS_ENDPOINT").ok());
+        .or_else(|| std::env::var("ANTHROPIC_COSTS_ENDPOINT").ok())
+        .unwrap_or_else(|| "https://api.anthropic.com/v1/organizations/usage".to_string());
     let api_key = cfg
         .api
         .anthropic_api_key
         .clone()
         .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
 
-    if let (Some(url), Some(key)) = (endpoint, api_key) {
-        match snapshot_from_http_json(
-            &url,
-            &[
-                ("x-api-key", key),
-                ("anthropic-version", "2023-06-01".to_string()),
-            ],
-            "anthropic",
-            "Anthropic",
-        ) {
+    if let Some(key) = api_key {
+        match snapshot_from_anthropic_api(&endpoint, &key) {
             Ok(s) => return Some(s),
             Err(e) => {
                 return Some(error_snapshot(
@@ -255,25 +244,137 @@ fn get_anthropic_snapshot(cfg: &AppConfig) -> Option<UsageSnapshot> {
     env_fallback_snapshot("anthropic", "Anthropic", "ANTHROPIC")
 }
 
-fn snapshot_from_http_json(
-    url: &str,
-    headers: &[(&str, String)],
-    provider: &str,
-    label: &str,
-) -> Result<UsageSnapshot> {
+fn snapshot_from_openai_api(url: &str, api_key: &str) -> Result<UsageSnapshot> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()?;
 
-    let mut req = client.get(url);
-    for (k, v) in headers {
-        req = req.header(*k, v);
-    }
+    let res = client
+        .get(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()?
+        .error_for_status()?;
 
-    let res = req.send()?.error_for_status()?;
     let value: Value = res.json()?;
+    parse_openai_costs_response(&value)
+}
 
-    snapshot_from_value(&value, provider, label, "api")
+fn snapshot_from_anthropic_api(url: &str, api_key: &str) -> Result<UsageSnapshot> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()?;
+
+    let res = client
+        .get(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .send()?
+        .error_for_status()?;
+
+    let value: Value = res.json()?;
+    parse_anthropic_usage_response(&value)
+}
+
+fn parse_openai_costs_response(value: &Value) -> Result<UsageSnapshot> {
+    let spent_usd = pick_f64(
+        value,
+        &["total_spent_usd", "spent_usd", "spent", "cost_usd"],
+    )
+    .or_else(|| {
+        value.get("data").and_then(|d| d.as_array()).map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    r.get("amount")
+                        .and_then(|a| a.get("value"))
+                        .and_then(|v| v.as_f64())
+                        .or_else(|| pick_f64(r, &["cost_usd", "spent_usd", "amount_usd"]))
+                })
+                .sum::<f64>()
+        })
+    })
+    .unwrap_or(0.0);
+
+    let limit_usd = pick_f64(value, &["limit_usd", "budget_usd", "hard_limit_usd"]).unwrap_or(0.0);
+    let tokens_in =
+        pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"]).unwrap_or(0);
+    let tokens_out = pick_u64(
+        value,
+        &["tokens_out", "output_tokens", "total_output_tokens"],
+    )
+    .unwrap_or(0);
+
+    let inactive_hours = if let Some(h) = pick_u64(value, &["inactive_hours"]) {
+        h as u32
+    } else if let Some(ts) = pick_str(value, &["last_activity_iso", "last_activity"]) {
+        inactive_hours_from_iso(ts).unwrap_or(0)
+    } else {
+        0
+    };
+
+    Ok(UsageSnapshot {
+        provider: "openai".into(),
+        account_label: "OpenAI".into(),
+        spent_usd,
+        limit_usd,
+        tokens_in,
+        tokens_out,
+        inactive_hours,
+        source: "openai-api".into(),
+    })
+}
+
+fn parse_anthropic_usage_response(value: &Value) -> Result<UsageSnapshot> {
+    let rows = value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let spent_rows_sum = rows
+        .iter()
+        .filter_map(|r| pick_f64(r, &["cost_usd", "amount_usd", "spent_usd"]))
+        .sum::<f64>();
+
+    let spent_usd =
+        pick_f64(value, &["total_cost_usd", "spent_usd", "cost_usd"]).unwrap_or(spent_rows_sum);
+
+    let tokens_in = pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"])
+        .unwrap_or_else(|| {
+            rows.iter()
+                .filter_map(|r| pick_u64(r, &["input_tokens", "tokens_in"]))
+                .sum()
+        });
+
+    let tokens_out = pick_u64(
+        value,
+        &["tokens_out", "output_tokens", "total_output_tokens"],
+    )
+    .unwrap_or_else(|| {
+        rows.iter()
+            .filter_map(|r| pick_u64(r, &["output_tokens", "tokens_out"]))
+            .sum()
+    });
+
+    let limit_usd = pick_f64(value, &["limit_usd", "budget_usd"]).unwrap_or(0.0);
+    let inactive_hours = if let Some(h) = pick_u64(value, &["inactive_hours"]) {
+        h as u32
+    } else {
+        rows.last()
+            .and_then(|r| pick_str(r, &["timestamp", "time", "last_activity_iso"]))
+            .and_then(inactive_hours_from_iso)
+            .unwrap_or(0)
+    };
+
+    Ok(UsageSnapshot {
+        provider: "anthropic".into(),
+        account_label: "Anthropic".into(),
+        spent_usd,
+        limit_usd,
+        tokens_in,
+        tokens_out,
+        inactive_hours,
+        source: "anthropic-api".into(),
+    })
 }
 
 fn snapshot_from_ndjson(path: &str, provider: &str, label: &str) -> Result<UsageSnapshot> {

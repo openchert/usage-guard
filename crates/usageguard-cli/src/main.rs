@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use usageguard_core::{
-    demo_snapshots, evaluate_alerts, load_config, save_config, AppConfig, UsageSnapshot,
+    evaluate_alerts, load_config, provider_snapshots, save_config, AppConfig, UsageSnapshot,
 };
 
 #[derive(Parser)]
@@ -28,6 +28,10 @@ enum Command {
         openai_key: Option<String>,
         #[arg(long)]
         anthropic_key: Option<String>,
+        #[arg(long)]
+        openai_endpoint: Option<String>,
+        #[arg(long)]
+        anthropic_endpoint: Option<String>,
     },
 }
 
@@ -54,7 +58,7 @@ fn main() {
     match cli.command {
         Command::Demo => {
             let cfg = load_config().unwrap_or_default();
-            for s in demo_snapshots() {
+            for s in provider_snapshots(&cfg) {
                 print_snapshot(&s, &cfg);
             }
         }
@@ -80,10 +84,14 @@ fn main() {
             show,
             openai_key,
             anthropic_key,
+            openai_endpoint,
+            anthropic_endpoint,
         } => {
             let mut cfg = load_config().unwrap_or_default();
             let has_openai_arg = openai_key.is_some();
             let has_anthropic_arg = anthropic_key.is_some();
+            let has_openai_ep = openai_endpoint.is_some();
+            let has_anthropic_ep = anthropic_endpoint.is_some();
 
             if let Some(k) = openai_key {
                 cfg.api.openai_api_key = if k.trim().is_empty() { None } else { Some(k) };
@@ -91,8 +99,14 @@ fn main() {
             if let Some(k) = anthropic_key {
                 cfg.api.anthropic_api_key = if k.trim().is_empty() { None } else { Some(k) };
             }
+            if let Some(v) = openai_endpoint {
+                cfg.api.openai_costs_endpoint = if v.trim().is_empty() { None } else { Some(v) };
+            }
+            if let Some(v) = anthropic_endpoint {
+                cfg.api.anthropic_costs_endpoint = if v.trim().is_empty() { None } else { Some(v) };
+            }
 
-            if has_openai_arg || has_anthropic_arg {
+            if has_openai_arg || has_anthropic_arg || has_openai_ep || has_anthropic_ep {
                 if let Err(e) = save_config(&cfg) {
                     eprintln!("Failed to save config: {e}");
                     std::process::exit(1);
@@ -100,11 +114,15 @@ fn main() {
                 println!("Config saved.");
             }
 
-            if show || (!has_openai_arg && !has_anthropic_arg) {
+            if show
+                || (!has_openai_arg && !has_anthropic_arg && !has_openai_ep && !has_anthropic_ep)
+            {
                 println!(
-                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
+                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"openai_endpoint\": {:?},\n  \"anthropic_endpoint\": {:?},\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
                     cfg.api.openai_api_key.is_some(),
                     cfg.api.anthropic_api_key.is_some(),
+                    cfg.api.openai_costs_endpoint,
+                    cfg.api.anthropic_costs_endpoint,
                     cfg.near_limit_ratio,
                     cfg.inactive_threshold_hours
                 );

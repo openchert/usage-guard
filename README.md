@@ -24,6 +24,7 @@ cargo run -p usageguard-desktop
 Download the latest release from GitHub Releases and use the package for your OS.
 
 ### One-command install
+(Installs latest GitHub Release binaries)
 
 #### Windows (PowerShell)
 ```powershell
@@ -81,6 +82,42 @@ CLI example:
 ./usageguard demo
 ./usageguard config --show
 ```
+
+## Verify release integrity (recommended)
+Each release includes `SHA256SUMS`.
+
+### macOS/Linux
+```bash
+sha256sum -c SHA256SUMS
+```
+
+### Windows (PowerShell)
+```powershell
+Get-FileHash .\usage-guard-windows-x64.zip -Algorithm SHA256
+```
+Compare with the hash in `SHA256SUMS`.
+
+## API setup quickstart
+Desktop:
+1. Open `usageguard-desktop`
+2. Click **Connect API**
+3. Paste API key(s)
+4. (Optional) set custom endpoint URL(s)
+5. Save and click **Refresh**
+
+CLI:
+```bash
+usageguard config --openai-key "sk-..."
+usageguard config --anthropic-key "sk-ant-..."
+usageguard config --openai-endpoint "https://api.openai.com/v1/organization/costs"
+usageguard config --anthropic-endpoint "https://api.anthropic.com/v1/organizations/usage"
+usageguard demo
+```
+
+## Troubleshooting
+- If install command succeeds but command not found, restart terminal (PATH refresh).
+- If API shows `source: api-error:...`, verify key permissions and endpoint URL.
+- If no API/log/env source is available, app falls back to demo data by design.
 
 ## Release build automation
 - GitHub Actions builds binaries on tag push (`v*`) for:
