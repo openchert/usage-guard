@@ -142,6 +142,7 @@ UsageGuard now includes built-in adapters for:
 Plus custom provider profiles via config.
 
 See `docs/INTERFACES.md` for exact environment variables, headers, endpoint contracts, and normalized schema.
+See `docs/NEXT_STEPS.md` for the public short roadmap.
 
 ## Troubleshooting
 - If install command succeeds but command not found, restart terminal (PATH refresh).
