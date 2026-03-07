@@ -1,0 +1,16 @@
+[package]
+name = "usageguard-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+serde_json.workspace = true
+usageguard-core = { path = "../usageguard-core" }
+
+[[bin]]
+name = "usageguard"
+path = "src/main.rs"
