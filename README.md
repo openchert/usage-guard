@@ -9,6 +9,13 @@ UsageGuard is a calm, local-first AI usage monitor with:
 
 > Minimal UI. Meaningful alerts. Local control.
 
+## Suggested GitHub metadata
+**About blurb:**
+> Calm, local-first AI usage monitor with a minimal desktop UI + CLI. Track spend, quotas, and limits across multiple providers without dashboard noise.
+
+**Topics:**
+`ai` `usage-tracking` `quota-tracker` `cost-monitoring` `developer-tools` `rust` `egui` `desktop-app` `cli` `open-source` `local-first` `openai` `anthropic`
+
 ## Stack
 - Rust workspace
 - Desktop: `eframe/egui` (frameless mini window)
