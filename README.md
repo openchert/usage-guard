@@ -1,9 +1,13 @@
-# usage-guard (Rust Edition)
+# UsageGuard
 
-A small, local-first AI usage monitor with:
+**Know your AI usage in 5 seconds, without getting distracted.**
+
+UsageGuard is a calm, local-first AI usage monitor with:
 - **Desktop mini app** (frameless, low-distraction)
 - **CLI** for terminal workflows
 - Cross-platform target: Windows / macOS / Linux
+
+> Minimal UI. Meaningful alerts. Local control.
 
 ## Stack
 - Rust workspace
@@ -168,5 +172,5 @@ cargo run -p usageguard-cli -- config --anthropic-key "sk-ant-..."
 ```
 
 ## Note
-This milestone keeps the app intentionally minimal and non-distracting.
-Next step is replacing placeholder connected-state snapshots with full provider usage API adapters.
+UsageGuard is intentionally minimal and non-distracting.
+Current roadmap focus: provider parity hardening, native notification parity (Windows/macOS), and signed/notarized releases.
