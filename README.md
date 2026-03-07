@@ -37,8 +37,15 @@ git push origin v0.4.1
 - No top bar/window decorations
 - Compact information-focused panel
 - Usage visualization + alert text
-- "Connect API" button placeholder for local key setup
+- "Connect API" opens a tiny local key form and saves to local config
+
+## CLI config helpers
+```bash
+cargo run -p usageguard-cli -- config --show
+cargo run -p usageguard-cli -- config --openai-key "sk-..."
+cargo run -p usageguard-cli -- config --anthropic-key "sk-ant-..."
+```
 
 ## Note
-This milestone pivots to Rust and keeps the app intentionally minimal.
-Next step is wiring real provider adapters + local encrypted config file.
+This milestone keeps the app intentionally minimal and non-distracting.
+Next step is replacing placeholder connected-state snapshots with full provider usage API adapters.

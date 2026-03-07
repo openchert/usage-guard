@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
-use usageguard_core::{demo_snapshots, evaluate_alerts, AppConfig, UsageSnapshot};
+use usageguard_core::{
+    demo_snapshots, evaluate_alerts, load_config, save_config, AppConfig, UsageSnapshot,
+};
 
 #[derive(Parser)]
 #[command(name = "usageguard", about = "UsageGuard CLI")]
@@ -18,6 +20,14 @@ enum Command {
         limit: f64,
         #[arg(long, default_value_t = 0)]
         inactive_hours: u32,
+    },
+    Config {
+        #[arg(long)]
+        show: bool,
+        #[arg(long)]
+        openai_key: Option<String>,
+        #[arg(long)]
+        anthropic_key: Option<String>,
     },
 }
 
@@ -40,10 +50,10 @@ fn print_snapshot(s: &UsageSnapshot, cfg: &AppConfig) {
 
 fn main() {
     let cli = Cli::parse();
-    let cfg = AppConfig::default();
 
     match cli.command {
         Command::Demo => {
+            let cfg = load_config().unwrap_or_default();
             for s in demo_snapshots() {
                 print_snapshot(&s, &cfg);
             }
@@ -53,6 +63,7 @@ fn main() {
             limit,
             inactive_hours,
         } => {
+            let cfg = load_config().unwrap_or_default();
             let s = UsageSnapshot {
                 provider: "custom".into(),
                 account_label: "local".into(),
@@ -64,6 +75,40 @@ fn main() {
                 source: "cli".into(),
             };
             print_snapshot(&s, &cfg);
+        }
+        Command::Config {
+            show,
+            openai_key,
+            anthropic_key,
+        } => {
+            let mut cfg = load_config().unwrap_or_default();
+            let has_openai_arg = openai_key.is_some();
+            let has_anthropic_arg = anthropic_key.is_some();
+
+            if let Some(k) = openai_key {
+                cfg.api.openai_api_key = if k.trim().is_empty() { None } else { Some(k) };
+            }
+            if let Some(k) = anthropic_key {
+                cfg.api.anthropic_api_key = if k.trim().is_empty() { None } else { Some(k) };
+            }
+
+            if has_openai_arg || has_anthropic_arg {
+                if let Err(e) = save_config(&cfg) {
+                    eprintln!("Failed to save config: {e}");
+                    std::process::exit(1);
+                }
+                println!("Config saved.");
+            }
+
+            if show || (!has_openai_arg && !has_anthropic_arg) {
+                println!(
+                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
+                    cfg.api.openai_api_key.is_some(),
+                    cfg.api.anthropic_api_key.is_some(),
+                    cfg.near_limit_ratio,
+                    cfg.inactive_threshold_hours
+                );
+            }
         }
     }
 }

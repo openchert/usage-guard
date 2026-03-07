@@ -1,5 +1,8 @@
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSnapshot {
@@ -37,11 +40,18 @@ impl Default for QuietHours {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApiCredentials {
+    pub openai_api_key: Option<String>,
+    pub anthropic_api_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub near_limit_ratio: f64,
     pub inactive_threshold_hours: u32,
     pub quiet_hours: QuietHours,
+    pub api: ApiCredentials,
 }
 
 impl Default for AppConfig {
@@ -50,8 +60,40 @@ impl Default for AppConfig {
             near_limit_ratio: 0.85,
             inactive_threshold_hours: 8,
             quiet_hours: QuietHours::default(),
+            api: ApiCredentials::default(),
         }
     }
+}
+
+pub fn config_path() -> Result<PathBuf> {
+    let base = dirs::config_dir().context("Unable to resolve config directory")?;
+    Ok(base.join("usage-guard").join("config.json"))
+}
+
+pub fn load_config() -> Result<AppConfig> {
+    let path = config_path()?;
+    if !path.exists() {
+        return Ok(AppConfig::default());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("Unable to read config file: {}", path.display()))?;
+    let cfg = serde_json::from_str::<AppConfig>(&raw)
+        .with_context(|| format!("Invalid config JSON: {}", path.display()))?;
+    Ok(cfg)
+}
+
+pub fn save_config(cfg: &AppConfig) -> Result<()> {
+    let path = config_path()?;
+    let dir = path
+        .parent()
+        .context("Config parent directory missing")?
+        .to_path_buf();
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("Unable to create config dir: {}", dir.display()))?;
+    let raw = serde_json::to_string_pretty(cfg)?;
+    fs::write(&path, raw)
+        .with_context(|| format!("Unable to write config file: {}", path.display()))?;
+    Ok(())
 }
 
 pub fn evaluate_alerts(snapshot: &UsageSnapshot, cfg: &AppConfig) -> Vec<Alert> {
@@ -114,6 +156,42 @@ pub fn should_notify(alerts: &[Alert], now: DateTime<Local>, cfg: &AppConfig) ->
     }
     let has_critical = alerts.iter().any(|a| a.level == "critical");
     has_critical || !is_quiet_hour(now, &cfg.quiet_hours)
+}
+
+pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
+    let mut items = Vec::new();
+
+    if cfg.api.openai_api_key.is_some() {
+        items.push(UsageSnapshot {
+            provider: "openai".into(),
+            account_label: "OpenAI (connected)".into(),
+            spent_usd: 0.0,
+            limit_usd: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+            inactive_hours: 0,
+            source: "api-connected".into(),
+        });
+    }
+
+    if cfg.api.anthropic_api_key.is_some() {
+        items.push(UsageSnapshot {
+            provider: "anthropic".into(),
+            account_label: "Anthropic (connected)".into(),
+            spent_usd: 0.0,
+            limit_usd: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+            inactive_hours: 0,
+            source: "api-connected".into(),
+        });
+    }
+
+    if items.is_empty() {
+        demo_snapshots()
+    } else {
+        items
+    }
 }
 
 pub fn demo_snapshots() -> Vec<UsageSnapshot> {
