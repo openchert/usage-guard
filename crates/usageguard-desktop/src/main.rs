@@ -2,8 +2,8 @@ use chrono::Local;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use usageguard_core::{
-    evaluate_alerts, load_config, provider_snapshots, save_config, should_notify, Alert, AppConfig,
-    UsageSnapshot,
+    evaluate_alerts, load_config, provider_snapshots, save_config, set_provider_api_key,
+    should_notify, Alert, AppConfig, UsageSnapshot,
 };
 
 struct UsageGuardApp {
@@ -70,7 +70,9 @@ impl UsageGuardApp {
 
             if changed {
                 self.last_notified_signature.insert(key, signature);
-                lines.push(format!("{}: {}", s.provider, alerts[0].message));
+                let msg = format!("{}: {}", s.provider, alerts[0].message);
+                emit_native_notification("UsageGuard alert", &msg);
+                lines.push(msg);
             }
         }
 
@@ -99,6 +101,17 @@ fn alert_signature(alerts: &[Alert]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
+
+#[cfg(target_os = "linux")]
+fn emit_native_notification(title: &str, body: &str) {
+    let _ = notify_rust::Notification::new()
+        .summary(title)
+        .body(body)
+        .show();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn emit_native_notification(_title: &str, _body: &str) {}
 
 impl eframe::App for UsageGuardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -206,18 +219,22 @@ impl eframe::App for UsageGuardApp {
                     if ui.button("Save locally").clicked() {
                         match self.validate_inputs() {
                             Ok(_) => {
-                                self.cfg.api.openai_api_key =
-                                    if self.openai_key_input.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(self.openai_key_input.trim().to_string())
-                                    };
-                                self.cfg.api.anthropic_api_key =
-                                    if self.anthropic_key_input.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(self.anthropic_key_input.trim().to_string())
-                                    };
+                                if let Err(e) = set_provider_api_key(
+                                    "openai",
+                                    Some(self.openai_key_input.trim()),
+                                ) {
+                                    self.status = format!("Keyring save failed (OpenAI): {e}");
+                                    return;
+                                }
+                                if let Err(e) = set_provider_api_key(
+                                    "anthropic",
+                                    Some(self.anthropic_key_input.trim()),
+                                ) {
+                                    self.status = format!("Keyring save failed (Anthropic): {e}");
+                                    return;
+                                }
+                                self.cfg.api.openai_api_key = None;
+                                self.cfg.api.anthropic_api_key = None;
                                 self.cfg.api.openai_costs_endpoint =
                                     if self.openai_endpoint_input.trim().is_empty() {
                                         None

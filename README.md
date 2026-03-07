@@ -105,6 +105,8 @@ Desktop:
 4. (Optional) set custom endpoint URL(s)
 5. Save and click **Refresh**
 
+API keys are now stored in the OS keyring when available (instead of plain config JSON).
+
 CLI:
 ```bash
 usageguard config --openai-key "sk-..."
@@ -154,7 +156,8 @@ git push origin v0.4.1
 - **Idle mode by default:** usage bars only
 - Click provider row to expand exact numbers/details
 - In-app alert line for meaningful events
-- "Connect API" opens a tiny local key form and saves to local config
+- Linux native desktop notifications for newly triggered alerts (deduped)
+- "Connect API" opens a tiny local key form and saves config (keys in keyring)
 
 ## CLI config helpers
 ```bash

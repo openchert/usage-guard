@@ -12,3 +12,4 @@ chrono.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 reqwest.workspace = true
+keyring.workspace = true

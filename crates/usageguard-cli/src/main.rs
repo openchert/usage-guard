@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use usageguard_core::{
-    evaluate_alerts, load_config, provider_snapshots, save_config, AppConfig, UsageSnapshot,
+    evaluate_alerts, has_provider_api_key, load_config, provider_snapshots, save_config,
+    set_provider_api_key, AppConfig, UsageSnapshot,
 };
 
 #[derive(Parser)]
@@ -94,10 +95,18 @@ fn main() {
             let has_anthropic_ep = anthropic_endpoint.is_some();
 
             if let Some(k) = openai_key {
-                cfg.api.openai_api_key = if k.trim().is_empty() { None } else { Some(k) };
+                if let Err(e) = set_provider_api_key("openai", Some(&k)) {
+                    eprintln!("Failed to store OpenAI key in keyring: {e}");
+                    std::process::exit(1);
+                }
+                cfg.api.openai_api_key = None;
             }
             if let Some(k) = anthropic_key {
-                cfg.api.anthropic_api_key = if k.trim().is_empty() { None } else { Some(k) };
+                if let Err(e) = set_provider_api_key("anthropic", Some(&k)) {
+                    eprintln!("Failed to store Anthropic key in keyring: {e}");
+                    std::process::exit(1);
+                }
+                cfg.api.anthropic_api_key = None;
             }
             if let Some(v) = openai_endpoint {
                 cfg.api.openai_costs_endpoint = if v.trim().is_empty() { None } else { Some(v) };
@@ -119,8 +128,8 @@ fn main() {
             {
                 println!(
                     "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"openai_endpoint\": {:?},\n  \"anthropic_endpoint\": {:?},\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
-                    cfg.api.openai_api_key.is_some(),
-                    cfg.api.anthropic_api_key.is_some(),
+                    has_provider_api_key("openai") || cfg.api.openai_api_key.is_some(),
+                    has_provider_api_key("anthropic") || cfg.api.anthropic_api_key.is_some(),
                     cfg.api.openai_costs_endpoint,
                     cfg.api.anthropic_costs_endpoint,
                     cfg.near_limit_ratio,

@@ -28,6 +28,11 @@ UsageGuard normalizes every provider into this internal snapshot:
 - Output tokens: `tokens_out`, `output_tokens`, `total_output_tokens`
 - Inactivity: `inactive_hours` OR `last_activity_iso`/`last_activity`/`timestamp` (RFC3339)
 
+## Secret storage interface
+- `set_provider_api_key(provider_id, key)` stores keys in OS keyring when available.
+- `get_provider_api_key(provider_id)` resolves keys from keyring.
+- Config JSON may still hold legacy keys; UsageGuard migrates them to keyring on load when possible.
+
 ## Built-in providers
 
 ### OpenAI

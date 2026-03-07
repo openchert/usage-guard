@@ -11,6 +11,9 @@ egui = "0.33"
 chrono.workspace = true
 usageguard-core = { path = "../usageguard-core" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = "4"
+
 [[bin]]
 name = "usageguard-desktop"
 path = "src/main.rs"

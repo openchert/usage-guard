@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 
+const KEYRING_SERVICE: &str = "usage-guard";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub provider: String,
@@ -95,6 +97,46 @@ impl Default for AppConfig {
     }
 }
 
+fn keyring_entry(provider_id: &str) -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(
+        KEYRING_SERVICE,
+        &format!("provider.{provider_id}.api_key"),
+    )?)
+}
+
+pub fn set_provider_api_key(provider_id: &str, key: Option<&str>) -> Result<()> {
+    let entry = keyring_entry(provider_id)?;
+    match key {
+        Some(v) if !v.trim().is_empty() => entry.set_password(v.trim())?,
+        _ => {
+            let _ = entry.delete_credential();
+        }
+    }
+    Ok(())
+}
+
+pub fn get_provider_api_key(provider_id: &str) -> Option<String> {
+    let entry = keyring_entry(provider_id).ok()?;
+    match entry.get_password() {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
+
+pub fn has_provider_api_key(provider_id: &str) -> bool {
+    get_provider_api_key(provider_id).is_some()
+}
+
+fn resolve_provider_api_key(
+    provider_id: &str,
+    config_value: Option<String>,
+    env_var: &str,
+) -> Option<String> {
+    get_provider_api_key(provider_id)
+        .or(config_value)
+        .or_else(|| std::env::var(env_var).ok())
+}
+
 struct ProviderSpec<'a> {
     id: &'a str,
     label: &'a str,
@@ -119,8 +161,52 @@ pub fn load_config() -> Result<AppConfig> {
     }
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("Unable to read config file: {}", path.display()))?;
-    let cfg = serde_json::from_str::<AppConfig>(&raw)
+    let mut cfg = serde_json::from_str::<AppConfig>(&raw)
         .with_context(|| format!("Invalid config JSON: {}", path.display()))?;
+
+    // migrate plaintext keys to keyring when present
+    let mut migrated = false;
+    if let Some(v) = cfg.api.openai_api_key.take() {
+        let _ = set_provider_api_key("openai", Some(&v));
+        migrated = true;
+    }
+    if let Some(v) = cfg.api.anthropic_api_key.take() {
+        let _ = set_provider_api_key("anthropic", Some(&v));
+        migrated = true;
+    }
+    if let Some(v) = cfg.api.gemini_api_key.take() {
+        let _ = set_provider_api_key("gemini", Some(&v));
+        migrated = true;
+    }
+    if let Some(v) = cfg.api.mistral_api_key.take() {
+        let _ = set_provider_api_key("mistral", Some(&v));
+        migrated = true;
+    }
+    if let Some(v) = cfg.api.groq_api_key.take() {
+        let _ = set_provider_api_key("groq", Some(&v));
+        migrated = true;
+    }
+    if let Some(v) = cfg.api.together_api_key.take() {
+        let _ = set_provider_api_key("together", Some(&v));
+        migrated = true;
+    }
+    if let Some(v) = cfg.api.openrouter_api_key.take() {
+        let _ = set_provider_api_key("openrouter", Some(&v));
+        migrated = true;
+    }
+    if let Some(v) = cfg.api.azure_openai_api_key.take() {
+        let _ = set_provider_api_key("azure_openai", Some(&v));
+        migrated = true;
+    }
+    if let Some(v) = cfg.api.ollama_api_key.take() {
+        let _ = set_provider_api_key("ollama", Some(&v));
+        migrated = true;
+    }
+
+    if migrated {
+        let _ = save_config(&cfg);
+    }
+
     Ok(cfg)
 }
 
@@ -206,11 +292,11 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "openai",
             label: "OpenAI",
             env_prefix: "OPENAI",
-            api_key: cfg
-                .api
-                .openai_api_key
-                .clone()
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+            api_key: resolve_provider_api_key(
+                "openai",
+                cfg.api.openai_api_key.clone(),
+                "OPENAI_API_KEY",
+            ),
             endpoint: cfg
                 .api
                 .openai_costs_endpoint
@@ -225,11 +311,11 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "anthropic",
             label: "Anthropic",
             env_prefix: "ANTHROPIC",
-            api_key: cfg
-                .api
-                .anthropic_api_key
-                .clone()
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
+            api_key: resolve_provider_api_key(
+                "anthropic",
+                cfg.api.anthropic_api_key.clone(),
+                "ANTHROPIC_API_KEY",
+            ),
             endpoint: cfg
                 .api
                 .anthropic_costs_endpoint
@@ -244,11 +330,11 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "gemini",
             label: "Gemini",
             env_prefix: "GEMINI",
-            api_key: cfg
-                .api
-                .gemini_api_key
-                .clone()
-                .or_else(|| std::env::var("GEMINI_API_KEY").ok()),
+            api_key: resolve_provider_api_key(
+                "gemini",
+                cfg.api.gemini_api_key.clone(),
+                "GEMINI_API_KEY",
+            ),
             endpoint: cfg
                 .api
                 .gemini_costs_endpoint
@@ -263,11 +349,11 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "mistral",
             label: "Mistral",
             env_prefix: "MISTRAL",
-            api_key: cfg
-                .api
-                .mistral_api_key
-                .clone()
-                .or_else(|| std::env::var("MISTRAL_API_KEY").ok()),
+            api_key: resolve_provider_api_key(
+                "mistral",
+                cfg.api.mistral_api_key.clone(),
+                "MISTRAL_API_KEY",
+            ),
             endpoint: cfg
                 .api
                 .mistral_costs_endpoint
@@ -282,11 +368,7 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "groq",
             label: "Groq",
             env_prefix: "GROQ",
-            api_key: cfg
-                .api
-                .groq_api_key
-                .clone()
-                .or_else(|| std::env::var("GROQ_API_KEY").ok()),
+            api_key: resolve_provider_api_key("groq", cfg.api.groq_api_key.clone(), "GROQ_API_KEY"),
             endpoint: cfg
                 .api
                 .groq_costs_endpoint
@@ -301,11 +383,11 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "together",
             label: "Together",
             env_prefix: "TOGETHER",
-            api_key: cfg
-                .api
-                .together_api_key
-                .clone()
-                .or_else(|| std::env::var("TOGETHER_API_KEY").ok()),
+            api_key: resolve_provider_api_key(
+                "together",
+                cfg.api.together_api_key.clone(),
+                "TOGETHER_API_KEY",
+            ),
             endpoint: cfg
                 .api
                 .together_costs_endpoint
@@ -320,11 +402,11 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "openrouter",
             label: "OpenRouter",
             env_prefix: "OPENROUTER",
-            api_key: cfg
-                .api
-                .openrouter_api_key
-                .clone()
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok()),
+            api_key: resolve_provider_api_key(
+                "openrouter",
+                cfg.api.openrouter_api_key.clone(),
+                "OPENROUTER_API_KEY",
+            ),
             endpoint: cfg
                 .api
                 .openrouter_costs_endpoint
@@ -339,11 +421,11 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "azure_openai",
             label: "Azure OpenAI",
             env_prefix: "AZURE_OPENAI",
-            api_key: cfg
-                .api
-                .azure_openai_api_key
-                .clone()
-                .or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok()),
+            api_key: resolve_provider_api_key(
+                "azure_openai",
+                cfg.api.azure_openai_api_key.clone(),
+                "AZURE_OPENAI_API_KEY",
+            ),
             endpoint: cfg
                 .api
                 .azure_openai_costs_endpoint
@@ -358,11 +440,11 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             id: "ollama",
             label: "Ollama",
             env_prefix: "OLLAMA",
-            api_key: cfg
-                .api
-                .ollama_api_key
-                .clone()
-                .or_else(|| std::env::var("OLLAMA_API_KEY").ok()),
+            api_key: resolve_provider_api_key(
+                "ollama",
+                cfg.api.ollama_api_key.clone(),
+                "OLLAMA_API_KEY",
+            ),
             endpoint: cfg
                 .api
                 .ollama_usage_endpoint
