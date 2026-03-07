@@ -1,13 +1,15 @@
 use chrono::Local;
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 use usageguard_core::{
-    evaluate_alerts, load_config, provider_snapshots, save_config, should_notify, AppConfig,
+    evaluate_alerts, load_config, provider_snapshots, save_config, should_notify, Alert, AppConfig,
     UsageSnapshot,
 };
 
 struct UsageGuardApp {
     cfg: AppConfig,
     snapshots: Vec<UsageSnapshot>,
+    expanded: HashSet<String>,
     show_connect: bool,
     openai_key_input: String,
     anthropic_key_input: String,
@@ -15,6 +17,8 @@ struct UsageGuardApp {
     anthropic_endpoint_input: String,
     status: String,
     last_updated: String,
+    last_notified_signature: HashMap<String, String>,
+    notification_line: String,
 }
 
 impl Default for UsageGuardApp {
@@ -27,9 +31,12 @@ impl Default for UsageGuardApp {
             anthropic_endpoint_input: cfg.api.anthropic_costs_endpoint.clone().unwrap_or_default(),
             cfg,
             snapshots: Vec::new(),
+            expanded: HashSet::new(),
             show_connect: false,
             status: String::new(),
             last_updated: "never".to_string(),
+            last_notified_signature: HashMap::new(),
+            notification_line: String::new(),
         };
         app.refresh();
         app
@@ -40,6 +47,34 @@ impl UsageGuardApp {
     fn refresh(&mut self) {
         self.snapshots = provider_snapshots(&self.cfg);
         self.last_updated = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        self.evaluate_notification_state();
+    }
+
+    fn evaluate_notification_state(&mut self) {
+        let mut lines = Vec::new();
+
+        for s in &self.snapshots {
+            let alerts = evaluate_alerts(s, &self.cfg);
+            let should = should_notify(&alerts, Local::now(), &self.cfg);
+            if !should || alerts.is_empty() {
+                continue;
+            }
+
+            let signature = alert_signature(&alerts);
+            let key = s.provider.clone();
+            let changed = self
+                .last_notified_signature
+                .get(&key)
+                .map(|x| x != &signature)
+                .unwrap_or(true);
+
+            if changed {
+                self.last_notified_signature.insert(key, signature);
+                lines.push(format!("{}: {}", s.provider, alerts[0].message));
+            }
+        }
+
+        self.notification_line = lines.join(" | ");
     }
 
     fn validate_inputs(&self) -> Result<(), String> {
@@ -57,12 +92,19 @@ impl UsageGuardApp {
     }
 }
 
+fn alert_signature(alerts: &[Alert]) -> String {
+    alerts
+        .iter()
+        .map(|a| format!("{}:{}", a.level, a.code))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl eframe::App for UsageGuardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
             ui.heading("UsageGuard");
-            ui.label("Calm local usage monitor");
 
             ui.horizontal(|ui| {
                 if ui.button("Refresh").clicked() {
@@ -70,6 +112,15 @@ impl eframe::App for UsageGuardApp {
                 }
                 ui.small(format!("Last updated: {}", self.last_updated));
             });
+
+            if !self.notification_line.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 180, 90),
+                    format!("Alert: {}", self.notification_line),
+                );
+            }
+
+            ui.small("Idle mode: bars only. Click a provider row to show details.");
 
             for s in &self.snapshots {
                 let alerts = evaluate_alerts(s, &self.cfg);
@@ -79,27 +130,43 @@ impl eframe::App for UsageGuardApp {
                     0.0
                 };
 
+                let is_expanded = self.expanded.contains(&s.provider);
+
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.strong(&s.provider);
-                        ui.label(format!("${:.2}/${:.2}", s.spent_usd, s.limit_usd));
+                        let label = if is_expanded {
+                            format!("▼ {}", s.provider)
+                        } else {
+                            format!("▶ {}", s.provider)
+                        };
+                        if ui.button(label).clicked() {
+                            if is_expanded {
+                                self.expanded.remove(&s.provider);
+                            } else {
+                                self.expanded.insert(s.provider.clone());
+                            }
+                        }
                         if s.source.starts_with("api-error:") {
                             ui.colored_label(egui::Color32::from_rgb(220, 130, 80), "API error");
                         }
                     });
-                    ui.add(egui::ProgressBar::new(percent as f32).show_percentage());
-                    ui.label(format!("inactive {}h", s.inactive_hours));
-                    ui.small(format!("source: {}", s.source));
 
-                    if alerts.is_empty() {
-                        ui.label("status: ok");
-                    } else {
-                        for a in &alerts {
-                            ui.label(format!("{}: {}", a.level, a.message));
+                    ui.add(egui::ProgressBar::new(percent as f32).show_percentage());
+
+                    if is_expanded {
+                        ui.label(format!("${:.2}/${:.2}", s.spent_usd, s.limit_usd));
+                        ui.label(format!("tokens in={} out={}", s.tokens_in, s.tokens_out));
+                        ui.label(format!("inactive {}h", s.inactive_hours));
+                        ui.small(format!("source: {}", s.source));
+
+                        if alerts.is_empty() {
+                            ui.label("status: ok");
+                        } else {
+                            for a in &alerts {
+                                ui.label(format!("{}: {}", a.level, a.message));
+                            }
                         }
                     }
-
-                    let _ = should_notify(&alerts, Local::now(), &self.cfg);
                 });
             }
 

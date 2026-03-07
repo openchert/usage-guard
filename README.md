@@ -135,7 +135,9 @@ git push origin v0.4.1
 ## Current UI behavior
 - No top bar/window decorations
 - Compact information-focused panel
-- Usage visualization + alert text
+- **Idle mode by default:** usage bars only
+- Click provider row to expand exact numbers/details
+- In-app alert line for meaningful events
 - "Connect API" opens a tiny local key form and saves to local config
 
 ## CLI config helpers
