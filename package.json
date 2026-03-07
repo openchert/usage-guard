@@ -3,6 +3,10 @@
   "version": "0.3.0",
   "private": false,
   "description": "Local-first AI usage monitor with cross-platform desktop app and CLI",
+  "author": {
+    "name": "Lukas",
+    "email": "lukas@usage-guard.local"
+  },
   "license": "MIT",
   "type": "module",
   "main": "apps/desktop/src/main.js",
@@ -24,7 +28,7 @@
   },
   "devDependencies": {
     "electron": "^35.1.5",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^26.8.1"
   },
   "build": {
     "appId": "ai.usageguard.app",
@@ -48,6 +52,8 @@
       ]
     },
     "linux": {
+      "category": "Utility",
+      "maintainer": "Lukas <lukas@usage-guard.local>",
       "target": [
         "AppImage",
         "deb"

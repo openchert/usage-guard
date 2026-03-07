@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, Notification } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { evaluateAlerts } from '../../../core/alerts.js';
-import { loadConfig } from '../../../core/config.js';
+import { loadConfig, saveConfig } from '../../../core/config.js';
 import { shouldNotifyNow } from '../../../core/notifications.js';
 import { getOpenAISnapshot, getAnthropicSnapshot } from '../../../core/providers.js';
 
@@ -54,6 +54,24 @@ ipcMain.handle('demo-snapshots', async () => {
   });
 
   return { snapshots, config: cfg };
+});
+
+ipcMain.handle('get-config', async () => {
+  return loadConfig();
+});
+
+ipcMain.handle('set-config', async (_, patch) => {
+  const cfg = loadConfig();
+  const next = {
+    ...cfg,
+    ...patch,
+    quietHours: {
+      ...cfg.quietHours,
+      ...(patch?.quietHours || {})
+    }
+  };
+  saveConfig(next);
+  return next;
 });
 
 app.whenReady().then(() => {

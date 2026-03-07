@@ -41,6 +41,18 @@
       <div id="demoOut"></div>
     </div>
 
+    <div class="card">
+      <h3>Settings</h3>
+      <div class="row">
+        <div><label>Near-limit ratio</label><input id="cfgNearLimit" type="number" step="0.01" min="0" max="1" /></div>
+        <div><label>Inactive threshold (hours)</label><input id="cfgInactiveThreshold" type="number" step="1" min="1" /></div>
+        <div><label>Quiet start hour</label><input id="cfgQuietStart" type="number" step="1" min="0" max="23" /></div>
+        <div><label>Quiet end hour</label><input id="cfgQuietEnd" type="number" step="1" min="0" max="23" /></div>
+      </div>
+      <button id="saveCfgBtn">Save settings</button>
+      <p id="saveCfgOut" class="small muted"></p>
+    </div>
+
     <div class="card small">
       <h3>Real data wiring</h3>
       <p>Set env vars before launching:</p>
@@ -56,6 +68,17 @@
       const alertsEl = document.getElementById('alerts');
       const demoOut = document.getElementById('demoOut');
       const configOut = document.getElementById('configOut');
+      const saveCfgOut = document.getElementById('saveCfgOut');
+
+      async function loadConfigIntoForm() {
+        const cfg = await window.usageGuard.getConfig();
+        document.getElementById('cfgNearLimit').value = cfg.nearLimitRatio;
+        document.getElementById('cfgInactiveThreshold').value = cfg.inactiveThresholdHours;
+        document.getElementById('cfgQuietStart').value = cfg.quietHours.startHour;
+        document.getElementById('cfgQuietEnd').value = cfg.quietHours.endHour;
+      }
+
+      loadConfigIntoForm();
 
       document.getElementById('checkBtn').addEventListener('click', async () => {
         const payload = {
@@ -90,6 +113,19 @@
             Alerts: ${s.alerts.length ? s.alerts.map(a => `[${a.level}] ${a.code}`).join(', ') : 'none'}
           </div>
         `).join('');
+      });
+
+      document.getElementById('saveCfgBtn').addEventListener('click', async () => {
+        const patch = {
+          nearLimitRatio: Number(document.getElementById('cfgNearLimit').value),
+          inactiveThresholdHours: Number(document.getElementById('cfgInactiveThreshold').value),
+          quietHours: {
+            startHour: Number(document.getElementById('cfgQuietStart').value),
+            endHour: Number(document.getElementById('cfgQuietEnd').value)
+          }
+        };
+        const next = await window.usageGuard.setConfig(patch);
+        saveCfgOut.textContent = `Saved. Quiet hours ${next.quietHours.startHour}:00-${next.quietHours.endHour}:00, nearLimitRatio=${next.nearLimitRatio}`;
       });
     </script>
   </body>

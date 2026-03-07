@@ -63,7 +63,9 @@ npm run build:linux
 - `core/` shared monitoring + alert + provider logic
 - `apps/cli/` command-line tool
 - `apps/desktop/` Electron desktop app
-- `docs/` architecture + stack + plan
+- `docs/` architecture + stack + setup + plan
+
+See `docs/SETUP.md` for platform-specific run/build steps.
 
 ## Local-first privacy
 - Runs locally on user machine
