@@ -126,10 +126,16 @@ fn main() {
             if show
                 || (!has_openai_arg && !has_anthropic_arg && !has_openai_ep && !has_anthropic_ep)
             {
-                let openai_ep = cfg.api.openai_costs_endpoint.as_deref()
+                let openai_ep = cfg
+                    .api
+                    .openai_costs_endpoint
+                    .as_deref()
                     .map(|s| format!("\"{}\"", s))
                     .unwrap_or_else(|| "null".to_string());
-                let anthropic_ep = cfg.api.anthropic_costs_endpoint.as_deref()
+                let anthropic_ep = cfg
+                    .api
+                    .anthropic_costs_endpoint
+                    .as_deref()
                     .map(|s| format!("\"{}\"", s))
                     .unwrap_or_else(|| "null".to_string());
                 println!(

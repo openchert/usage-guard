@@ -50,20 +50,16 @@ pub struct ApiCredentials {
     pub gemini_api_key: Option<String>,
     pub mistral_api_key: Option<String>,
     pub groq_api_key: Option<String>,
-    pub together_api_key: Option<String>,
-    pub openrouter_api_key: Option<String>,
-    pub azure_openai_api_key: Option<String>,
-    pub ollama_api_key: Option<String>,
+    pub copilot_api_key: Option<String>,
+    pub cursor_api_key: Option<String>,
 
     pub openai_costs_endpoint: Option<String>,
     pub anthropic_costs_endpoint: Option<String>,
     pub gemini_costs_endpoint: Option<String>,
     pub mistral_costs_endpoint: Option<String>,
     pub groq_costs_endpoint: Option<String>,
-    pub together_costs_endpoint: Option<String>,
-    pub openrouter_costs_endpoint: Option<String>,
-    pub azure_openai_costs_endpoint: Option<String>,
-    pub ollama_usage_endpoint: Option<String>,
+    pub copilot_costs_endpoint: Option<String>,
+    pub cursor_costs_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,11 +72,30 @@ pub struct ProviderProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccount {
+    pub id: String,
+    pub provider: String,
+    pub label: String,
+    pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCatalogEntry {
+    pub id: String,
+    pub label: String,
+    pub default_endpoint: Option<String>,
+    pub endpoint_required: bool,
+    pub endpoint_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub near_limit_ratio: f64,
     pub inactive_threshold_hours: u32,
     pub quiet_hours: QuietHours,
     pub api: ApiCredentials,
+    #[serde(default)]
+    pub provider_accounts: Vec<ProviderAccount>,
     #[serde(default)]
     pub profiles: Vec<ProviderProfile>,
 }
@@ -92,9 +107,156 @@ impl Default for AppConfig {
             inactive_threshold_hours: 8,
             quiet_hours: QuietHours::default(),
             api: ApiCredentials::default(),
+            provider_accounts: vec![],
             profiles: vec![],
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum HttpMethod {
+    Get,
+    Post,
+}
+
+#[derive(Clone, Copy)]
+enum AuthMode {
+    Bearer,
+    Raw,
+    Basic,
+}
+
+#[derive(Clone)]
+struct ProviderTemplate {
+    id: &'static str,
+    label: &'static str,
+    env_prefix: &'static str,
+    default_endpoint: Option<&'static str>,
+    method: HttpMethod,
+    auth_header: &'static str,
+    auth_mode: AuthMode,
+    extra_headers: Vec<(&'static str, &'static str)>,
+    request_body: Option<Value>,
+    usage_log_env: Option<&'static str>,
+    endpoint_hint: &'static str,
+}
+
+fn builtin_provider_templates() -> Vec<ProviderTemplate> {
+    vec![
+        ProviderTemplate {
+            id: "openai",
+            label: "OpenAI",
+            env_prefix: "OPENAI",
+            default_endpoint: Some("https://api.openai.com/v1/organization/costs"),
+            method: HttpMethod::Get,
+            auth_header: "Authorization",
+            auth_mode: AuthMode::Bearer,
+            extra_headers: vec![],
+            request_body: None,
+            usage_log_env: Some("OPENAI_USAGE_LOG"),
+            endpoint_hint: "Organization costs endpoint (optional override)",
+        },
+        ProviderTemplate {
+            id: "anthropic",
+            label: "Anthropic",
+            env_prefix: "ANTHROPIC",
+            default_endpoint: Some("https://api.anthropic.com/v1/organizations/usage"),
+            method: HttpMethod::Get,
+            auth_header: "x-api-key",
+            auth_mode: AuthMode::Raw,
+            extra_headers: vec![("anthropic-version", "2023-06-01")],
+            request_body: None,
+            usage_log_env: Some("ANTHROPIC_USAGE_LOG"),
+            endpoint_hint: "Organization usage endpoint (optional override)",
+        },
+        ProviderTemplate {
+            id: "gemini",
+            label: "Gemini",
+            env_prefix: "GEMINI",
+            default_endpoint: None,
+            method: HttpMethod::Get,
+            auth_header: "Authorization",
+            auth_mode: AuthMode::Bearer,
+            extra_headers: vec![],
+            request_body: None,
+            usage_log_env: Some("GEMINI_USAGE_LOG"),
+            endpoint_hint: "Usage endpoint URL",
+        },
+        ProviderTemplate {
+            id: "mistral",
+            label: "Mistral",
+            env_prefix: "MISTRAL",
+            default_endpoint: None,
+            method: HttpMethod::Get,
+            auth_header: "Authorization",
+            auth_mode: AuthMode::Bearer,
+            extra_headers: vec![],
+            request_body: None,
+            usage_log_env: Some("MISTRAL_USAGE_LOG"),
+            endpoint_hint: "Usage endpoint URL",
+        },
+        ProviderTemplate {
+            id: "groq",
+            label: "Groq",
+            env_prefix: "GROQ",
+            default_endpoint: None,
+            method: HttpMethod::Get,
+            auth_header: "Authorization",
+            auth_mode: AuthMode::Bearer,
+            extra_headers: vec![],
+            request_body: None,
+            usage_log_env: Some("GROQ_USAGE_LOG"),
+            endpoint_hint: "Usage endpoint URL",
+        },
+        ProviderTemplate {
+            id: "copilot",
+            label: "Copilot",
+            env_prefix: "COPILOT",
+            default_endpoint: None,
+            method: HttpMethod::Get,
+            auth_header: "Authorization",
+            auth_mode: AuthMode::Bearer,
+            extra_headers: vec![
+                ("Accept", "application/vnd.github+json"),
+                ("X-GitHub-Api-Version", "2022-11-28"),
+            ],
+            request_body: None,
+            usage_log_env: Some("COPILOT_USAGE_LOG"),
+            endpoint_hint: "GitHub organization premium request usage endpoint URL",
+        },
+        ProviderTemplate {
+            id: "cursor",
+            label: "Cursor",
+            env_prefix: "CURSOR",
+            default_endpoint: Some("https://api.cursor.com/teams/spend"),
+            method: HttpMethod::Post,
+            auth_header: "Authorization",
+            auth_mode: AuthMode::Basic,
+            extra_headers: vec![],
+            request_body: Some(serde_json::json!({})),
+            usage_log_env: Some("CURSOR_USAGE_LOG"),
+            endpoint_hint: "Team spend endpoint (optional override)",
+        },
+    ]
+}
+
+fn provider_template(provider_id: &str) -> Option<ProviderTemplate> {
+    builtin_provider_templates()
+        .into_iter()
+        .find(|template| template.id == provider_id)
+}
+
+pub fn provider_catalog() -> Vec<ProviderCatalogEntry> {
+    builtin_provider_templates()
+        .into_iter()
+        .map(|template| ProviderCatalogEntry {
+            id: template.id.to_string(),
+            label: template.label.to_string(),
+            default_endpoint: template.default_endpoint.map(str::to_string),
+            endpoint_required: template.default_endpoint.is_none(),
+            endpoint_hint: template.endpoint_hint.to_string(),
+        })
+        .collect()
 }
 
 fn keyring_entry(provider_id: &str) -> Result<keyring::Entry> {
@@ -127,6 +289,29 @@ pub fn has_provider_api_key(provider_id: &str) -> bool {
     get_provider_api_key(provider_id).is_some()
 }
 
+pub fn set_provider_account_api_key(account_id: &str, key: Option<&str>) -> Result<()> {
+    let entry = keyring_entry(account_id)?;
+    match key {
+        Some(v) if !v.trim().is_empty() => entry.set_password(v.trim())?,
+        _ => {
+            let _ = entry.delete_credential();
+        }
+    }
+    Ok(())
+}
+
+pub fn get_provider_account_api_key(account_id: &str) -> Option<String> {
+    let entry = keyring_entry(account_id).ok()?;
+    match entry.get_password() {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
+
+pub fn has_provider_account_api_key(account_id: &str) -> bool {
+    get_provider_account_api_key(account_id).is_some()
+}
+
 fn resolve_provider_api_key(
     provider_id: &str,
     config_value: Option<String>,
@@ -144,14 +329,75 @@ struct ProviderSpec<'a> {
     api_key: Option<String>,
     endpoint: Option<String>,
     default_endpoint: Option<&'a str>,
+    method: HttpMethod,
     auth_header: &'a str,
+    auth_mode: AuthMode,
     extra_headers: Vec<(&'a str, String)>,
+    request_body: Option<Value>,
     usage_log_env: Option<&'a str>,
 }
 
 pub fn config_path() -> Result<PathBuf> {
     let base = dirs::config_dir().context("Unable to resolve config directory")?;
     Ok(base.join("usage-guard").join("config.json"))
+}
+
+fn legacy_endpoint(cfg: &ApiCredentials, provider_id: &str) -> Option<String> {
+    match provider_id {
+        "openai" => cfg.openai_costs_endpoint.clone(),
+        "anthropic" => cfg.anthropic_costs_endpoint.clone(),
+        "gemini" => cfg.gemini_costs_endpoint.clone(),
+        "mistral" => cfg.mistral_costs_endpoint.clone(),
+        "groq" => cfg.groq_costs_endpoint.clone(),
+        "copilot" => cfg.copilot_costs_endpoint.clone(),
+        "cursor" => cfg.cursor_costs_endpoint.clone(),
+        _ => None,
+    }
+}
+
+fn clear_legacy_endpoint(cfg: &mut ApiCredentials, provider_id: &str) {
+    match provider_id {
+        "openai" => cfg.openai_costs_endpoint = None,
+        "anthropic" => cfg.anthropic_costs_endpoint = None,
+        "gemini" => cfg.gemini_costs_endpoint = None,
+        "mistral" => cfg.mistral_costs_endpoint = None,
+        "groq" => cfg.groq_costs_endpoint = None,
+        "copilot" => cfg.copilot_costs_endpoint = None,
+        "cursor" => cfg.cursor_costs_endpoint = None,
+        _ => {}
+    }
+}
+
+fn migrate_legacy_provider_accounts(cfg: &mut AppConfig) -> bool {
+    if !cfg.provider_accounts.is_empty() {
+        return false;
+    }
+
+    let mut migrated = false;
+    for template in builtin_provider_templates() {
+        let endpoint = legacy_endpoint(&cfg.api, template.id);
+        let legacy_key = get_provider_api_key(template.id);
+        if endpoint.is_none() && legacy_key.is_none() {
+            continue;
+        }
+
+        let account_id = format!("acct_{}_default", template.id);
+        if let Some(key) = legacy_key {
+            let _ = set_provider_account_api_key(&account_id, Some(&key));
+            let _ = set_provider_api_key(template.id, None);
+        }
+
+        cfg.provider_accounts.push(ProviderAccount {
+            id: account_id,
+            provider: template.id.to_string(),
+            label: template.label.to_string(),
+            endpoint,
+        });
+        clear_legacy_endpoint(&mut cfg.api, template.id);
+        migrated = true;
+    }
+
+    migrated
 }
 
 pub fn load_config() -> Result<AppConfig> {
@@ -186,24 +432,20 @@ pub fn load_config() -> Result<AppConfig> {
         let _ = set_provider_api_key("groq", Some(&v));
         migrated = true;
     }
-    if let Some(v) = cfg.api.together_api_key.take() {
-        let _ = set_provider_api_key("together", Some(&v));
+    if let Some(v) = cfg.api.copilot_api_key.take() {
+        let _ = set_provider_api_key("copilot", Some(&v));
         migrated = true;
     }
-    if let Some(v) = cfg.api.openrouter_api_key.take() {
-        let _ = set_provider_api_key("openrouter", Some(&v));
-        migrated = true;
-    }
-    if let Some(v) = cfg.api.azure_openai_api_key.take() {
-        let _ = set_provider_api_key("azure_openai", Some(&v));
-        migrated = true;
-    }
-    if let Some(v) = cfg.api.ollama_api_key.take() {
-        let _ = set_provider_api_key("ollama", Some(&v));
+    if let Some(v) = cfg.api.cursor_api_key.take() {
+        let _ = set_provider_api_key("cursor", Some(&v));
         migrated = true;
     }
 
     if migrated {
+        let _ = save_config(&cfg);
+    }
+
+    if migrate_legacy_provider_accounts(&mut cfg) {
         let _ = save_config(&cfg);
     }
 
@@ -286,181 +528,101 @@ pub fn should_notify(alerts: &[Alert], now: DateTime<Local>, cfg: &AppConfig) ->
     has_critical || !is_quiet_hour(now, &cfg.quiet_hours)
 }
 
-pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
-    let builtins = vec![
-        ProviderSpec {
-            id: "openai",
-            label: "OpenAI",
-            env_prefix: "OPENAI",
-            api_key: resolve_provider_api_key(
-                "openai",
-                cfg.api.openai_api_key.clone(),
-                "OPENAI_API_KEY",
-            ),
-            endpoint: cfg
-                .api
-                .openai_costs_endpoint
-                .clone()
-                .or_else(|| std::env::var("OPENAI_COSTS_ENDPOINT").ok()),
-            default_endpoint: Some("https://api.openai.com/v1/organization/costs"),
-            auth_header: "Authorization",
-            extra_headers: vec![],
-            usage_log_env: Some("OPENAI_USAGE_LOG"),
-        },
-        ProviderSpec {
-            id: "anthropic",
-            label: "Anthropic",
-            env_prefix: "ANTHROPIC",
-            api_key: resolve_provider_api_key(
-                "anthropic",
-                cfg.api.anthropic_api_key.clone(),
-                "ANTHROPIC_API_KEY",
-            ),
-            endpoint: cfg
-                .api
-                .anthropic_costs_endpoint
-                .clone()
-                .or_else(|| std::env::var("ANTHROPIC_COSTS_ENDPOINT").ok()),
-            default_endpoint: Some("https://api.anthropic.com/v1/organizations/usage"),
-            auth_header: "x-api-key",
-            extra_headers: vec![("anthropic-version", "2023-06-01".to_string())],
-            usage_log_env: Some("ANTHROPIC_USAGE_LOG"),
-        },
-        ProviderSpec {
-            id: "gemini",
-            label: "Gemini",
-            env_prefix: "GEMINI",
-            api_key: resolve_provider_api_key(
-                "gemini",
-                cfg.api.gemini_api_key.clone(),
-                "GEMINI_API_KEY",
-            ),
-            endpoint: cfg
-                .api
-                .gemini_costs_endpoint
-                .clone()
-                .or_else(|| std::env::var("GEMINI_COSTS_ENDPOINT").ok()),
-            default_endpoint: None,
-            auth_header: "Authorization",
-            extra_headers: vec![],
-            usage_log_env: Some("GEMINI_USAGE_LOG"),
-        },
-        ProviderSpec {
-            id: "mistral",
-            label: "Mistral",
-            env_prefix: "MISTRAL",
-            api_key: resolve_provider_api_key(
-                "mistral",
-                cfg.api.mistral_api_key.clone(),
-                "MISTRAL_API_KEY",
-            ),
-            endpoint: cfg
-                .api
-                .mistral_costs_endpoint
-                .clone()
-                .or_else(|| std::env::var("MISTRAL_COSTS_ENDPOINT").ok()),
-            default_endpoint: None,
-            auth_header: "Authorization",
-            extra_headers: vec![],
-            usage_log_env: Some("MISTRAL_USAGE_LOG"),
-        },
-        ProviderSpec {
-            id: "groq",
-            label: "Groq",
-            env_prefix: "GROQ",
-            api_key: resolve_provider_api_key("groq", cfg.api.groq_api_key.clone(), "GROQ_API_KEY"),
-            endpoint: cfg
-                .api
-                .groq_costs_endpoint
-                .clone()
-                .or_else(|| std::env::var("GROQ_COSTS_ENDPOINT").ok()),
-            default_endpoint: None,
-            auth_header: "Authorization",
-            extra_headers: vec![],
-            usage_log_env: Some("GROQ_USAGE_LOG"),
-        },
-        ProviderSpec {
-            id: "together",
-            label: "Together",
-            env_prefix: "TOGETHER",
-            api_key: resolve_provider_api_key(
-                "together",
-                cfg.api.together_api_key.clone(),
-                "TOGETHER_API_KEY",
-            ),
-            endpoint: cfg
-                .api
-                .together_costs_endpoint
-                .clone()
-                .or_else(|| std::env::var("TOGETHER_COSTS_ENDPOINT").ok()),
-            default_endpoint: None,
-            auth_header: "Authorization",
-            extra_headers: vec![],
-            usage_log_env: Some("TOGETHER_USAGE_LOG"),
-        },
-        ProviderSpec {
-            id: "openrouter",
-            label: "OpenRouter",
-            env_prefix: "OPENROUTER",
-            api_key: resolve_provider_api_key(
-                "openrouter",
-                cfg.api.openrouter_api_key.clone(),
-                "OPENROUTER_API_KEY",
-            ),
-            endpoint: cfg
-                .api
-                .openrouter_costs_endpoint
-                .clone()
-                .or_else(|| std::env::var("OPENROUTER_COSTS_ENDPOINT").ok()),
-            default_endpoint: None,
-            auth_header: "Authorization",
-            extra_headers: vec![],
-            usage_log_env: Some("OPENROUTER_USAGE_LOG"),
-        },
-        ProviderSpec {
-            id: "azure_openai",
-            label: "Azure OpenAI",
-            env_prefix: "AZURE_OPENAI",
-            api_key: resolve_provider_api_key(
-                "azure_openai",
-                cfg.api.azure_openai_api_key.clone(),
-                "AZURE_OPENAI_API_KEY",
-            ),
-            endpoint: cfg
-                .api
-                .azure_openai_costs_endpoint
-                .clone()
-                .or_else(|| std::env::var("AZURE_OPENAI_COSTS_ENDPOINT").ok()),
-            default_endpoint: None,
-            auth_header: "api-key",
-            extra_headers: vec![],
-            usage_log_env: Some("AZURE_OPENAI_USAGE_LOG"),
-        },
-        ProviderSpec {
-            id: "ollama",
-            label: "Ollama",
-            env_prefix: "OLLAMA",
-            api_key: resolve_provider_api_key(
-                "ollama",
-                cfg.api.ollama_api_key.clone(),
-                "OLLAMA_API_KEY",
-            ),
-            endpoint: cfg
-                .api
-                .ollama_usage_endpoint
-                .clone()
-                .or_else(|| std::env::var("OLLAMA_USAGE_ENDPOINT").ok()),
-            default_endpoint: None,
-            auth_header: "Authorization",
-            extra_headers: vec![],
-            usage_log_env: Some("OLLAMA_USAGE_LOG"),
-        },
-    ];
-
-    let mut items: Vec<UsageSnapshot> = builtins
+fn build_legacy_provider_specs(cfg: &AppConfig) -> Vec<ProviderSpec<'static>> {
+    builtin_provider_templates()
         .into_iter()
-        .filter_map(fetch_provider_snapshot)
-        .collect();
+        .map(|template| ProviderSpec {
+            id: template.id,
+            label: template.label,
+            env_prefix: template.env_prefix,
+            api_key: match template.id {
+                "openai" => resolve_provider_api_key(
+                    "openai",
+                    cfg.api.openai_api_key.clone(),
+                    "OPENAI_API_KEY",
+                ),
+                "anthropic" => resolve_provider_api_key(
+                    "anthropic",
+                    cfg.api.anthropic_api_key.clone(),
+                    "ANTHROPIC_API_KEY",
+                ),
+                "gemini" => resolve_provider_api_key(
+                    "gemini",
+                    cfg.api.gemini_api_key.clone(),
+                    "GEMINI_API_KEY",
+                ),
+                "mistral" => resolve_provider_api_key(
+                    "mistral",
+                    cfg.api.mistral_api_key.clone(),
+                    "MISTRAL_API_KEY",
+                ),
+                "groq" => {
+                    resolve_provider_api_key("groq", cfg.api.groq_api_key.clone(), "GROQ_API_KEY")
+                }
+                "copilot" => resolve_provider_api_key(
+                    "copilot",
+                    cfg.api.copilot_api_key.clone(),
+                    "COPILOT_API_KEY",
+                ),
+                "cursor" => resolve_provider_api_key(
+                    "cursor",
+                    cfg.api.cursor_api_key.clone(),
+                    "CURSOR_API_KEY",
+                ),
+                _ => None,
+            },
+            endpoint: legacy_endpoint(&cfg.api, template.id)
+                .or_else(|| std::env::var(format!("{}_COSTS_ENDPOINT", template.env_prefix)).ok()),
+            default_endpoint: template.default_endpoint,
+            method: template.method.clone(),
+            auth_header: template.auth_header,
+            auth_mode: template.auth_mode,
+            extra_headers: template
+                .extra_headers
+                .iter()
+                .map(|(key, value)| (*key, (*value).to_string()))
+                .collect(),
+            request_body: template.request_body.clone(),
+            usage_log_env: template.usage_log_env,
+        })
+        .collect()
+}
+
+fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec<'_>> {
+    let template = provider_template(&account.provider)?;
+    Some(ProviderSpec {
+        id: template.id,
+        label: &account.label,
+        env_prefix: template.env_prefix,
+        api_key: get_provider_account_api_key(&account.id),
+        endpoint: account.endpoint.clone(),
+        default_endpoint: template.default_endpoint,
+        method: template.method.clone(),
+        auth_header: template.auth_header,
+        auth_mode: template.auth_mode,
+        extra_headers: template
+            .extra_headers
+            .iter()
+            .map(|(key, value)| (*key, (*value).to_string()))
+            .collect(),
+        request_body: template.request_body.clone(),
+        usage_log_env: None,
+    })
+}
+
+pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
+    let mut items: Vec<UsageSnapshot> = if cfg.provider_accounts.is_empty() {
+        build_legacy_provider_specs(cfg)
+            .into_iter()
+            .filter_map(fetch_provider_snapshot)
+            .collect()
+    } else {
+        cfg.provider_accounts
+            .iter()
+            .filter_map(build_provider_account_spec)
+            .filter_map(fetch_provider_snapshot)
+            .collect()
+    };
 
     for profile in &cfg.profiles {
         let snapshot = fetch_custom_profile(profile);
@@ -481,18 +643,23 @@ fn fetch_custom_profile(profile: &ProviderProfile) -> Option<UsageSnapshot> {
         return None;
     }
 
-    let mut headers = vec![];
-    if let (Some(name), Some(key)) = (&profile.auth_header, &profile.api_key) {
-        if name.eq_ignore_ascii_case("authorization") {
-            headers.push((name.as_str(), format!("Bearer {key}")));
-        } else {
-            headers.push((name.as_str(), key.clone()));
-        }
-    }
-
     match snapshot_from_http_json(
         &profile.endpoint,
-        &headers,
+        HttpMethod::Get,
+        profile
+            .auth_header
+            .as_deref()
+            .zip(profile.api_key.as_deref())
+            .map(|(header, key)| {
+                let auth_mode = if header.eq_ignore_ascii_case("authorization") {
+                    AuthMode::Bearer
+                } else {
+                    AuthMode::Raw
+                };
+                (header, auth_mode, key)
+            }),
+        &[],
+        None,
         &profile.id,
         &profile.label,
         "profile-api",
@@ -520,18 +687,16 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
         .or_else(|| spec.default_endpoint.map(|v| v.to_string()));
 
     if let (Some(url), Some(key)) = (endpoint, spec.api_key) {
-        let auth_value = if spec.auth_header.eq_ignore_ascii_case("authorization") {
-            format!("Bearer {key}")
-        } else {
-            key
-        };
-
-        let mut headers = vec![(spec.auth_header, auth_value)];
-        for h in spec.extra_headers {
-            headers.push(h);
-        }
-
-        match snapshot_from_http_json(&url, &headers, spec.id, spec.label, "api") {
+        match snapshot_from_http_json(
+            &url,
+            spec.method,
+            Some((spec.auth_header, spec.auth_mode, key.as_str())),
+            &spec.extra_headers,
+            spec.request_body.as_ref(),
+            spec.id,
+            spec.label,
+            "api",
+        ) {
             Ok(s) => return Some(s),
             Err(e) => {
                 return Some(error_snapshot(
@@ -548,7 +713,10 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
 
 fn snapshot_from_http_json(
     url: &str,
+    method: HttpMethod,
+    auth: Option<(&str, AuthMode, &str)>,
     headers: &[(&str, String)],
+    request_body: Option<&Value>,
     provider: &str,
     label: &str,
     source: &str,
@@ -557,9 +725,18 @@ fn snapshot_from_http_json(
         .timeout(std::time::Duration::from_secs(12))
         .build()?;
 
-    let mut req = client.get(url);
+    let mut req = match method {
+        HttpMethod::Get => client.get(url),
+        HttpMethod::Post => client.post(url),
+    };
+    if let Some((header, auth_mode, key)) = auth {
+        req = apply_auth(req, header, auth_mode, key);
+    }
     for (k, v) in headers {
         req = req.header(*k, v);
+    }
+    if let Some(body) = request_body {
+        req = req.json(body);
     }
 
     let res = req.send()?.error_for_status()?;
@@ -567,12 +744,22 @@ fn snapshot_from_http_json(
 
     // strict-ish known responses first
     if provider == "openai" {
-        if let Ok(s) = parse_openai_costs_response(&value) {
+        if let Ok(s) = parse_openai_costs_response(&value, label, source) {
             return Ok(s);
         }
     }
     if provider == "anthropic" {
-        if let Ok(s) = parse_anthropic_usage_response(&value) {
+        if let Ok(s) = parse_anthropic_usage_response(&value, label, source) {
+            return Ok(s);
+        }
+    }
+    if provider == "copilot" {
+        if let Ok(s) = parse_copilot_usage_response(&value, label, source) {
+            return Ok(s);
+        }
+    }
+    if provider == "cursor" {
+        if let Ok(s) = parse_cursor_spend_response(&value, label, source) {
             return Ok(s);
         }
     }
@@ -580,7 +767,24 @@ fn snapshot_from_http_json(
     snapshot_from_value(&value, provider, label, source)
 }
 
-fn parse_openai_costs_response(value: &Value) -> Result<UsageSnapshot> {
+fn apply_auth(
+    req: reqwest::blocking::RequestBuilder,
+    header: &str,
+    auth_mode: AuthMode,
+    key: &str,
+) -> reqwest::blocking::RequestBuilder {
+    match auth_mode {
+        AuthMode::Bearer if header.eq_ignore_ascii_case("authorization") => req.bearer_auth(key),
+        AuthMode::Bearer => req.header(header, format!("Bearer {key}")),
+        AuthMode::Raw => req.header(header, key),
+        AuthMode::Basic if header.eq_ignore_ascii_case("authorization") => {
+            req.basic_auth(key, Some(""))
+        }
+        AuthMode::Basic => req.header(header, key),
+    }
+}
+
+fn parse_openai_costs_response(value: &Value, label: &str, source: &str) -> Result<UsageSnapshot> {
     let spent_usd = pick_f64(
         value,
         &["total_spent_usd", "spent_usd", "spent", "cost_usd"],
@@ -601,7 +805,7 @@ fn parse_openai_costs_response(value: &Value) -> Result<UsageSnapshot> {
 
     Ok(UsageSnapshot {
         provider: "openai".into(),
-        account_label: "OpenAI".into(),
+        account_label: label.to_string(),
         spent_usd,
         limit_usd: pick_f64(value, &["limit_usd", "budget_usd", "hard_limit_usd"]).unwrap_or(0.0),
         tokens_in: pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"])
@@ -612,11 +816,15 @@ fn parse_openai_costs_response(value: &Value) -> Result<UsageSnapshot> {
         )
         .unwrap_or(0),
         inactive_hours: derive_inactive_hours(value),
-        source: "openai-api".into(),
+        source: source.to_string(),
     })
 }
 
-fn parse_anthropic_usage_response(value: &Value) -> Result<UsageSnapshot> {
+fn parse_anthropic_usage_response(
+    value: &Value,
+    label: &str,
+    source: &str,
+) -> Result<UsageSnapshot> {
     let rows = value
         .get("data")
         .and_then(|d| d.as_array())
@@ -633,7 +841,7 @@ fn parse_anthropic_usage_response(value: &Value) -> Result<UsageSnapshot> {
 
     Ok(UsageSnapshot {
         provider: "anthropic".into(),
-        account_label: "Anthropic".into(),
+        account_label: label.to_string(),
         spent_usd,
         limit_usd: pick_f64(value, &["limit_usd", "budget_usd"]).unwrap_or(0.0),
         tokens_in: pick_u64(value, &["tokens_in", "input_tokens", "total_input_tokens"])
@@ -652,7 +860,66 @@ fn parse_anthropic_usage_response(value: &Value) -> Result<UsageSnapshot> {
                 .sum()
         }),
         inactive_hours: derive_inactive_hours(value),
-        source: "anthropic-api".into(),
+        source: source.to_string(),
+    })
+}
+
+fn parse_copilot_usage_response(value: &Value, label: &str, source: &str) -> Result<UsageSnapshot> {
+    let rows = value
+        .get("usageItems")
+        .and_then(|items| items.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let spent_usd =
+        pick_f64(value, &["spent_usd", "cost_usd", "total_cost_usd"]).unwrap_or_else(|| {
+            rows.iter()
+                .filter_map(|row| pick_f64(row, &["netAmount", "amount", "amount_usd"]))
+                .sum()
+        });
+
+    let request_count = rows
+        .iter()
+        .filter_map(|row| pick_u64(row, &["netQuantity", "quantity", "count"]))
+        .sum();
+
+    Ok(UsageSnapshot {
+        provider: "copilot".into(),
+        account_label: label.to_string(),
+        spent_usd,
+        limit_usd: pick_f64(value, &["limit_usd", "budget_usd"]).unwrap_or(0.0),
+        tokens_in: 0,
+        tokens_out: request_count,
+        inactive_hours: derive_inactive_hours(value),
+        source: source.to_string(),
+    })
+}
+
+fn parse_cursor_spend_response(value: &Value, label: &str, source: &str) -> Result<UsageSnapshot> {
+    let rows = value
+        .get("items")
+        .and_then(|items| items.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let spent_usd = pick_f64(value, &["spent_usd", "cost_usd", "total_cost_usd"])
+        .or_else(|| pick_f64(value, &["total_cents"]).map(|cents| cents / 100.0))
+        .unwrap_or_else(|| {
+            rows.iter()
+                .filter_map(|row| pick_f64(row, &["total_cents", "cents", "cost_cents"]))
+                .map(|cents| cents / 100.0)
+                .sum()
+        });
+
+    Ok(UsageSnapshot {
+        provider: "cursor".into(),
+        account_label: label.to_string(),
+        spent_usd,
+        limit_usd: pick_f64(value, &["limit_usd", "budget_usd"]).unwrap_or(0.0),
+        tokens_in: 0,
+        tokens_out: 0,
+        inactive_hours: derive_inactive_hours(value),
+        source: source.to_string(),
     })
 }
 
@@ -749,7 +1016,13 @@ fn error_snapshot(provider: &str, label: &str, source: String) -> UsageSnapshot 
 }
 
 fn pick_f64(v: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|k| v.get(*k).and_then(|x| x.as_f64()))
+    keys.iter().find_map(|k| {
+        v.get(*k).and_then(|x| {
+            x.as_f64()
+                .or_else(|| x.as_u64().map(|n| n as f64))
+                .or_else(|| x.as_i64().map(|n| n as f64))
+        })
+    })
 }
 
 fn pick_u64(v: &Value, keys: &[&str]) -> Option<u64> {
@@ -792,7 +1065,6 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
     ]
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,5 +1102,30 @@ mod tests {
         assert_eq!(snap.tokens_in, 111);
         assert_eq!(snap.tokens_out, 222);
         assert_eq!(snap.inactive_hours, 3);
+    }
+
+    #[test]
+    fn parse_copilot_usage_rows() {
+        let value: Value = serde_json::json!({
+            "usageItems": [
+                { "netAmount": 1.25, "netQuantity": 10 },
+                { "netAmount": 2.75, "netQuantity": 30 }
+            ]
+        });
+
+        let snap = parse_copilot_usage_response(&value, "Copilot", "api").unwrap();
+        assert_eq!(snap.spent_usd, 4.0);
+        assert_eq!(snap.tokens_in, 0);
+        assert_eq!(snap.tokens_out, 40);
+    }
+
+    #[test]
+    fn parse_cursor_total_cents() {
+        let value: Value = serde_json::json!({
+            "total_cents": 1234
+        });
+
+        let snap = parse_cursor_spend_response(&value, "Cursor", "api").unwrap();
+        assert!((snap.spent_usd - 12.34).abs() < f64::EPSILON);
     }
 }

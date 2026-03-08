@@ -31,7 +31,31 @@ UsageGuard normalizes every provider into this internal snapshot:
 ## Secret storage interface
 - `set_provider_api_key(provider_id, key)` stores keys in OS keyring when available.
 - `get_provider_api_key(provider_id)` resolves keys from keyring.
+- `set_provider_account_api_key(account_id, key)` stores keys for named provider accounts.
+- `get_provider_account_api_key(account_id)` resolves keys for named provider accounts.
 - Config JSON may still hold legacy keys; UsageGuard migrates them to keyring on load when possible.
+
+## Named provider accounts
+
+Desktop-managed accounts live in `provider_accounts` inside `config.json`:
+
+```json
+{
+  "provider_accounts": [
+    {
+      "id": "acct_openai_work_123456",
+      "provider": "openai",
+      "label": "Work",
+      "endpoint": null
+    }
+  ]
+}
+```
+
+- `provider` is the built-in vendor id.
+- `label` is the user-defined display name shown in the widget.
+- `endpoint` overrides the vendor default when needed.
+- The matching API key is stored separately in the OS keyring under the account id.
 
 ## Built-in providers
 
@@ -67,29 +91,20 @@ UsageGuard normalizes every provider into this internal snapshot:
 - Auth header: `Authorization: Bearer <key>`
 - Log: `GROQ_USAGE_LOG`
 
-### Together
-- Key: `TOGETHER_API_KEY`
-- Endpoint: `TOGETHER_COSTS_ENDPOINT`
+### Copilot
+- Key: `COPILOT_API_KEY`
+- Endpoint: `COPILOT_COSTS_ENDPOINT`
 - Auth header: `Authorization: Bearer <key>`
-- Log: `TOGETHER_USAGE_LOG`
+- Extra headers: `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`
+- Log: `COPILOT_USAGE_LOG`
 
-### OpenRouter
-- Key: `OPENROUTER_API_KEY`
-- Endpoint: `OPENROUTER_COSTS_ENDPOINT`
-- Auth header: `Authorization: Bearer <key>`
-- Log: `OPENROUTER_USAGE_LOG`
-
-### Azure OpenAI
-- Key: `AZURE_OPENAI_API_KEY`
-- Endpoint: `AZURE_OPENAI_COSTS_ENDPOINT`
-- Auth header: `api-key: <key>`
-- Log: `AZURE_OPENAI_USAGE_LOG`
-
-### Ollama
-- Key: `OLLAMA_API_KEY` (optional, if your endpoint requires auth)
-- Endpoint: `OLLAMA_USAGE_ENDPOINT`
-- Auth header: `Authorization: Bearer <key>`
-- Log: `OLLAMA_USAGE_LOG`
+### Cursor
+- Key: `CURSOR_API_KEY`
+- Endpoint: `CURSOR_COSTS_ENDPOINT` (default: `https://api.cursor.com/teams/spend`)
+- Method: `POST`
+- Auth header: `Authorization: Basic <base64(api_key:)>`
+- Body: `{}`
+- Log: `CURSOR_USAGE_LOG`
 
 ## Custom provider profiles (config)
 `config.json` supports `profiles` to add any provider via endpoint + auth header:
