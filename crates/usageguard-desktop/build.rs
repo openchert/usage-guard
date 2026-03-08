@@ -1,60 +1,42 @@
+#[path = "src/icon_art.rs"]
+mod icon_art;
+
 use std::fs;
 use std::path::Path;
 
 fn main() {
-    generate_placeholder_icons();
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/icon_art.rs");
+    configure_windows_sdk_env();
+    generate_icons();
     tauri_build::build();
 }
 
-fn generate_placeholder_icons() {
+fn generate_icons() {
     let icons_dir = Path::new("icons");
     fs::create_dir_all(icons_dir).unwrap();
 
-    let p32 = icons_dir.join("32x32.png");
-    if !p32.exists() {
-        write_icon_png(&p32, 32);
-    }
-    let p128 = icons_dir.join("128x128.png");
-    if !p128.exists() {
-        write_icon_png(&p128, 128);
+    for size in icon_art::BUNDLE_ICON_SIZES {
+        let path = icons_dir.join(format!("{size}x{size}.png"));
+        write_icon_png(&path, *size);
     }
 
-    // Windows resource file requires an .ico
     let ico_path = icons_dir.join("icon.ico");
-    if !ico_path.exists() {
-        write_icon_ico(&ico_path, 32);
-    }
+    write_icon_ico(&ico_path);
 }
 
-fn write_icon_ico(path: &Path, size: u32) {
+fn write_icon_ico(path: &Path) {
     use ico::{IconDir, IconDirEntry, IconImage, ResourceType};
-    let pixels = icon_rgba_pixels(size);
-    let image = IconImage::from_rgba_data(size, size, pixels);
     let mut icon_dir = IconDir::new(ResourceType::Icon);
-    icon_dir.add_entry(IconDirEntry::encode(&image).unwrap());
+
+    for size in icon_art::ICO_ICON_SIZES {
+        let pixels = icon_art::icon_rgba_pixels(*size);
+        let image = IconImage::from_rgba_data(*size, *size, pixels);
+        icon_dir.add_entry(IconDirEntry::encode(&image).unwrap());
+    }
+
     let file = fs::File::create(path).unwrap();
     icon_dir.write(file).unwrap();
-}
-
-fn icon_rgba_pixels(size: u32) -> Vec<u8> {
-    let half = (size / 2) as i32;
-    let margin = (size as i32 / 7).max(2);
-    let r2 = (half - margin).pow(2);
-    let mut pixels = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size as i32 {
-        for x in 0..size as i32 {
-            let idx = ((y * size as i32 + x) * 4) as usize;
-            let dx = x - half;
-            let dy = y - half;
-            if dx * dx + dy * dy <= r2 {
-                pixels[idx] = 100;
-                pixels[idx + 1] = 160;
-                pixels[idx + 2] = 255;
-                pixels[idx + 3] = 220;
-            }
-        }
-    }
-    pixels
 }
 
 fn write_icon_png(path: &Path, size: u32) {
@@ -63,5 +45,161 @@ fn write_icon_png(path: &Path, size: u32) {
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().unwrap();
-    writer.write_image_data(&icon_rgba_pixels(size)).unwrap();
+    writer
+        .write_image_data(&icon_art::icon_rgba_pixels(size))
+        .unwrap();
+}
+
+fn configure_windows_sdk_env() {
+    #[cfg(target_os = "windows")]
+    {
+        use std::env;
+
+        if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() != Some("windows") {
+            return;
+        }
+
+        if command_exists("rc.exe") {
+            return;
+        }
+
+        let Some((bin_dir, include_root)) = find_windows_sdk() else {
+            return;
+        };
+
+        prepend_path(&bin_dir);
+        extend_include_path(&include_root);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn command_exists(command: &str) -> bool {
+    std::process::Command::new("where")
+        .arg(command)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn find_windows_sdk() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::env;
+    use std::path::PathBuf;
+
+    let programs = [
+        env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+        env::var_os("ProgramFiles").map(PathBuf::from),
+    ];
+
+    for base in programs.into_iter().flatten() {
+        let root = base.join("Windows Kits").join("10");
+        let Some((bin_dir, version)) = find_sdk_bin_dir(&root) else {
+            continue;
+        };
+
+        let include_root = root.join("Include").join(version);
+        if include_root.is_dir() {
+            return Some((bin_dir, include_root));
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn find_sdk_bin_dir(root: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
+    use std::env;
+    use std::path::PathBuf;
+
+    let host = env::var("HOST").unwrap_or_default();
+    let arch_dir = if host.starts_with("aarch64") {
+        "arm64"
+    } else if host.starts_with("x86_64") {
+        "x64"
+    } else {
+        "x86"
+    };
+
+    let bin_root = root.join("bin");
+    let mut versions = fs::read_dir(&bin_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| {
+            let version = entry.file_name().to_string_lossy().into_owned();
+            let candidate = entry.path().join(arch_dir).join("rc.exe");
+            candidate
+                .exists()
+                .then_some((version, entry.path().join(arch_dir)))
+        })
+        .collect::<Vec<(String, PathBuf)>>();
+
+    versions.sort_by(|left, right| natural_cmp(&left.0, &right.0));
+    versions.pop().map(|(version, bin_dir)| (bin_dir, version))
+}
+
+#[cfg(target_os = "windows")]
+fn prepend_path(dir: &std::path::Path) {
+    use std::env;
+
+    let mut paths = env::split_paths(&env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    if paths.iter().any(|path| path == dir) {
+        return;
+    }
+
+    paths.insert(0, dir.to_path_buf());
+    let joined = env::join_paths(paths).unwrap();
+    env::set_var("PATH", joined);
+}
+
+#[cfg(target_os = "windows")]
+fn extend_include_path(include_root: &std::path::Path) {
+    use std::env;
+
+    let mut includes =
+        env::split_paths(&env::var_os("INCLUDE").unwrap_or_default()).collect::<Vec<_>>();
+    let extra = fs::read_dir(include_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+
+    let mut changed = false;
+    for dir in extra {
+        if includes.iter().any(|path| path == &dir) {
+            continue;
+        }
+        includes.push(dir);
+        changed = true;
+    }
+
+    if changed {
+        let joined = env::join_paths(includes).unwrap();
+        env::set_var("INCLUDE", joined);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn natural_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let parse = |value: &str| {
+        value
+            .split('.')
+            .map(|part| part.parse::<u32>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+
+    let left = parse(left);
+    let right = parse(right);
+    for (lhs, rhs) in left.iter().zip(right.iter()) {
+        match lhs.cmp(rhs) {
+            Ordering::Equal => continue,
+            order => return order,
+        }
+    }
+    left.len().cmp(&right.len())
 }

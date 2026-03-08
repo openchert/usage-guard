@@ -5,3 +5,6 @@
 /dist
 /crates/usageguard-desktop/gen/
 /crates/usageguard-desktop/icons/
+/.claude/
+/CLAUDE.md
+/rmeta*/

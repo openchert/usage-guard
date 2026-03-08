@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod icon_art;
+
 use chrono::Local;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -189,27 +191,10 @@ fn emit_native_notification(title: &str, body: &str) {
 fn emit_native_notification(_title: &str, _body: &str) {}
 
 fn create_tray_icon() -> tauri::image::Image<'static> {
-    const W: u32 = 16;
-    const H: u32 = 16;
-    let mut data = vec![0u8; (W * H * 4) as usize];
-    let half = W as i32 / 2;
-    let r2 = (half - 1).pow(2);
-    for y in 0..H as i32 {
-        for x in 0..W as i32 {
-            let idx = ((y * W as i32 + x) * 4) as usize;
-            let dx = x - half;
-            let dy = y - half;
-            if dx * dx + dy * dy <= r2 {
-                data[idx] = 100;
-                data[idx + 1] = 160;
-                data[idx + 2] = 255;
-                data[idx + 3] = 220;
-            }
-        }
-    }
-    // Leak into 'static so Image<'static> can borrow it
-    let data: &'static [u8] = Box::leak(data.into_boxed_slice());
-    tauri::image::Image::new(data, W, H)
+    static PIXELS: OnceLock<Box<[u8]>> = OnceLock::new();
+    let size = icon_art::TRAY_ICON_SIZE;
+    let data = PIXELS.get_or_init(|| icon_art::icon_rgba_pixels(size).into_boxed_slice());
+    tauri::image::Image::new(data, size, size)
 }
 
 fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>> {
