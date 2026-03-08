@@ -56,6 +56,10 @@ export function buildGenericApiCard(
     lines.push(`Inactive: ${snapshot.inactive_hours}h`);
   }
 
+  if (snapshot.status_message) {
+    lines.push(`Status: ${snapshot.status_message}`);
+  }
+
   return {
     displayLabel: label,
     title: lines.join('\n'),
@@ -88,6 +92,10 @@ export function buildProviderApiTitle(
 
   if (snapshot.inactive_hours > 0) {
     lines.push(`Inactive: ${snapshot.inactive_hours}h`);
+  }
+
+  if (snapshot.status_message) {
+    lines.push(`Status: ${snapshot.status_message}`);
   }
 
   return lines.join('\n');

@@ -13,3 +13,10 @@ anyhow.workspace = true
 dirs.workspace = true
 reqwest.workspace = true
 keyring.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_System_Memory",
+] }

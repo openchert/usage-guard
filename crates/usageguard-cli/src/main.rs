@@ -29,10 +29,6 @@ enum Command {
         openai_key: Option<String>,
         #[arg(long)]
         anthropic_key: Option<String>,
-        #[arg(long)]
-        openai_endpoint: Option<String>,
-        #[arg(long)]
-        anthropic_endpoint: Option<String>,
     },
 }
 
@@ -42,6 +38,9 @@ fn print_snapshot(s: &UsageSnapshot, cfg: &AppConfig) {
     println!("Tokens: in={} out={}", s.tokens_in, s.tokens_out);
     println!("Inactive: {}h", s.inactive_hours);
     println!("Source: {}", s.source);
+    if let Some(message) = &s.status_message {
+        println!("Status: {}", message);
+    }
     let alerts = evaluate_alerts(s, cfg);
     if alerts.is_empty() {
         println!("Alerts: none\n");
@@ -78,6 +77,8 @@ fn main() {
                 tokens_out: 0,
                 inactive_hours,
                 source: "cli".into(),
+                status_code: None,
+                status_message: None,
             };
             print_snapshot(&s, &cfg);
         }
@@ -85,37 +86,27 @@ fn main() {
             show,
             openai_key,
             anthropic_key,
-            openai_endpoint,
-            anthropic_endpoint,
         } => {
             let mut cfg = load_config().unwrap_or_default();
             let has_openai_arg = openai_key.is_some();
             let has_anthropic_arg = anthropic_key.is_some();
-            let has_openai_ep = openai_endpoint.is_some();
-            let has_anthropic_ep = anthropic_endpoint.is_some();
 
             if let Some(k) = openai_key {
                 if let Err(e) = set_provider_api_key("openai", Some(&k)) {
-                    eprintln!("Failed to store OpenAI key in keyring: {e}");
+                    eprintln!("Failed to store OpenAI key in secure storage: {e}");
                     std::process::exit(1);
                 }
                 cfg.api.openai_api_key = None;
             }
             if let Some(k) = anthropic_key {
                 if let Err(e) = set_provider_api_key("anthropic", Some(&k)) {
-                    eprintln!("Failed to store Anthropic key in keyring: {e}");
+                    eprintln!("Failed to store Anthropic key in secure storage: {e}");
                     std::process::exit(1);
                 }
                 cfg.api.anthropic_api_key = None;
             }
-            if let Some(v) = openai_endpoint {
-                cfg.api.openai_costs_endpoint = if v.trim().is_empty() { None } else { Some(v) };
-            }
-            if let Some(v) = anthropic_endpoint {
-                cfg.api.anthropic_costs_endpoint = if v.trim().is_empty() { None } else { Some(v) };
-            }
 
-            if has_openai_arg || has_anthropic_arg || has_openai_ep || has_anthropic_ep {
+            if has_openai_arg || has_anthropic_arg {
                 if let Err(e) = save_config(&cfg) {
                     eprintln!("Failed to save config: {e}");
                     std::process::exit(1);
@@ -123,27 +114,17 @@ fn main() {
                 println!("Config saved.");
             }
 
-            if show
-                || (!has_openai_arg && !has_anthropic_arg && !has_openai_ep && !has_anthropic_ep)
-            {
-                let openai_ep = cfg
-                    .api
-                    .openai_costs_endpoint
-                    .as_deref()
-                    .map(|s| format!("\"{}\"", s))
-                    .unwrap_or_else(|| "null".to_string());
-                let anthropic_ep = cfg
-                    .api
-                    .anthropic_costs_endpoint
-                    .as_deref()
-                    .map(|s| format!("\"{}\"", s))
-                    .unwrap_or_else(|| "null".to_string());
+            if show || (!has_openai_arg && !has_anthropic_arg) {
+                let secure_storage = if cfg!(target_os = "windows") {
+                    "windows-dpapi"
+                } else {
+                    "unsupported"
+                };
                 println!(
-                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"openai_endpoint\": {},\n  \"anthropic_endpoint\": {},\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
+                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"secure_storage\": \"{}\",\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
                     has_provider_api_key("openai") || cfg.api.openai_api_key.is_some(),
                     has_provider_api_key("anthropic") || cfg.api.anthropic_api_key.is_some(),
-                    openai_ep,
-                    anthropic_ep,
+                    secure_storage,
                     cfg.near_limit_ratio,
                     cfg.inactive_threshold_hours
                 );

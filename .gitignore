@@ -4,8 +4,10 @@
 .DS_Store
 /dist
 /crates/usageguard-desktop/gen/
-/crates/usageguard-desktop/icons/
-/docs
+/crates/usageguard-desktop/target_*/
+/docs/*
+!/docs/PROVIDERS.md
+!/docs/SECURITY.md
 /.claude/
 /CLAUDE.md
 /rmeta*/

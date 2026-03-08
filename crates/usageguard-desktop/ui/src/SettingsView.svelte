@@ -6,9 +6,6 @@
   interface ProviderCatalogEntry {
     id: string;
     label: string;
-    default_endpoint: string | null;
-    endpoint_required: boolean;
-    endpoint_hint: string;
   }
 
   interface ProviderAccountView {
@@ -16,10 +13,7 @@
     provider: string;
     provider_label: string;
     label: string;
-    endpoint: string | null;
-    default_endpoint: string | null;
     has_api_key: boolean;
-    endpoint_required: boolean;
   }
 
   interface ProviderSettingsPayload {
@@ -31,7 +25,6 @@
     id: string | null;
     provider: string;
     label: string;
-    endpoint: string;
     apiKey: string;
   }
 
@@ -46,7 +39,6 @@
     id: null,
     provider: '',
     label: '',
-    endpoint: '',
     apiKey: '',
   } as ProviderForm;
   let isLoading = true;
@@ -61,7 +53,6 @@
       id: null,
       provider: providerId,
       label: '',
-      endpoint: '',
       apiKey: '',
     };
     errorMessage = '';
@@ -75,27 +66,6 @@
     if (!providers.some((provider) => provider.id === form.provider)) {
       form.provider = providers[0]?.id ?? '';
     }
-  }
-
-  function selectedProvider(): ProviderCatalogEntry | null {
-    return providers.find((provider) => provider.id === form.provider) ?? providers[0] ?? null;
-  }
-
-  function endpointPlaceholder(): string {
-    return selectedProvider()?.default_endpoint ?? 'https://api.vendor.example/usage';
-  }
-
-  function endpointHint(): string {
-    const provider = selectedProvider();
-    if (!provider) return '';
-    if (provider.endpoint_required) return 'Required';
-    if (provider.default_endpoint) return `Default: ${provider.default_endpoint}`;
-    return provider.endpoint_hint;
-  }
-
-  function needsEndpoint(): boolean {
-    const p = selectedProvider();
-    return p ? p.endpoint_required || !p.default_endpoint : true;
   }
 
   async function closeWindow(): Promise<void> {
@@ -129,7 +99,6 @@
       id: account.id,
       provider: account.provider,
       label: account.label,
-      endpoint: account.endpoint ?? '',
       apiKey: '',
     };
   }
@@ -193,7 +162,6 @@
           id: form.id ?? undefined,
           provider: form.provider,
           label: form.label,
-          endpoint: form.endpoint,
           apiKey: form.apiKey,
         },
       }) as ProviderSettingsPayload;
@@ -367,17 +335,6 @@
           />
         </label>
 
-        {#if needsEndpoint()}
-          <label class="field">
-            <span class="field-label">Endpoint <span class="field-hint">{endpointHint()}</span></span>
-            <input
-              type="url"
-              bind:value={form.endpoint}
-              placeholder={endpointPlaceholder()}
-              autocomplete="off"
-            />
-          </label>
-        {/if}
       </div>
 
       <div class="form-footer">
@@ -640,12 +597,6 @@
     display: flex;
     align-items: center;
     gap: 4px;
-  }
-
-  .field-hint {
-    color: rgba(120, 128, 155, 0.7);
-    font-size: 9px;
-    font-style: italic;
   }
 
   input,

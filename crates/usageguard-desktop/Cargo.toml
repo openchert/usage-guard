@@ -17,6 +17,7 @@ base64 = "0.22"
 rand = "0.8"
 open = "5"
 reqwest.workspace = true
+url.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = "4"

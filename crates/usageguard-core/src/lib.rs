@@ -1,11 +1,27 @@
+mod secret_store;
+
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Local, Timelike, Utc};
+use chrono::{DateTime, Duration, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use secret_store::{app_config_dir, OpenAiOAuthSecret, SecretPayload, SecretStore};
 
 const KEYRING_SERVICE: &str = "usage-guard";
+const ACCESS_TOKEN_EXPIRY_SKEW_SECS: i64 = 60;
+const DEFAULT_ACCESS_TOKEN_LIFETIME_SECS: i64 = 45 * 60;
+
+#[derive(Debug, Clone, Default)]
+struct OpenAiSessionState {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    account_id: String,
+    plan_type: String,
+    expires_at: Option<DateTime<Utc>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSnapshot {
@@ -17,6 +33,10 @@ pub struct UsageSnapshot {
     pub tokens_out: u64,
     pub inactive_hours: u32,
     pub source: String,
+    #[serde(default)]
+    pub status_code: Option<String>,
+    #[serde(default)]
+    pub status_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +88,6 @@ pub struct ProviderProfile {
     pub label: String,
     pub endpoint: String,
     pub auth_header: Option<String>,
-    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,9 +102,6 @@ pub struct ProviderAccount {
 pub struct ProviderCatalogEntry {
     pub id: String,
     pub label: String,
-    pub default_endpoint: Option<String>,
-    pub endpoint_required: bool,
-    pub endpoint_hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +154,6 @@ struct ProviderTemplate {
     extra_headers: Vec<(&'static str, &'static str)>,
     request_body: Option<Value>,
     usage_log_env: Option<&'static str>,
-    endpoint_hint: &'static str,
 }
 
 fn builtin_provider_templates() -> Vec<ProviderTemplate> {
@@ -154,7 +169,6 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             extra_headers: vec![],
             request_body: None,
             usage_log_env: Some("OPENAI_USAGE_LOG"),
-            endpoint_hint: "Organization costs endpoint (optional override)",
         },
         ProviderTemplate {
             id: "anthropic",
@@ -167,7 +181,6 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             extra_headers: vec![("anthropic-version", "2023-06-01")],
             request_body: None,
             usage_log_env: Some("ANTHROPIC_USAGE_LOG"),
-            endpoint_hint: "Organization usage endpoint (optional override)",
         },
         ProviderTemplate {
             id: "gemini",
@@ -180,7 +193,6 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             extra_headers: vec![],
             request_body: None,
             usage_log_env: Some("GEMINI_USAGE_LOG"),
-            endpoint_hint: "Usage endpoint URL",
         },
         ProviderTemplate {
             id: "mistral",
@@ -193,7 +205,6 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             extra_headers: vec![],
             request_body: None,
             usage_log_env: Some("MISTRAL_USAGE_LOG"),
-            endpoint_hint: "Usage endpoint URL",
         },
         ProviderTemplate {
             id: "groq",
@@ -206,7 +217,6 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             extra_headers: vec![],
             request_body: None,
             usage_log_env: Some("GROQ_USAGE_LOG"),
-            endpoint_hint: "Usage endpoint URL",
         },
         ProviderTemplate {
             id: "copilot",
@@ -222,7 +232,6 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             ],
             request_body: None,
             usage_log_env: Some("COPILOT_USAGE_LOG"),
-            endpoint_hint: "GitHub organization premium request usage endpoint URL",
         },
         ProviderTemplate {
             id: "cursor",
@@ -235,7 +244,6 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             extra_headers: vec![],
             request_body: Some(serde_json::json!({})),
             usage_log_env: Some("CURSOR_USAGE_LOG"),
-            endpoint_hint: "Team spend endpoint (optional override)",
         },
     ]
 }
@@ -249,12 +257,10 @@ fn provider_template(provider_id: &str) -> Option<ProviderTemplate> {
 pub fn provider_catalog() -> Vec<ProviderCatalogEntry> {
     builtin_provider_templates()
         .into_iter()
+        .filter(|template| template.default_endpoint.is_some())
         .map(|template| ProviderCatalogEntry {
             id: template.id.to_string(),
             label: template.label.to_string(),
-            default_endpoint: template.default_endpoint.map(str::to_string),
-            endpoint_required: template.default_endpoint.is_none(),
-            endpoint_hint: template.endpoint_hint.to_string(),
         })
         .collect()
 }
@@ -267,22 +273,25 @@ fn keyring_entry(provider_id: &str) -> Result<keyring::Entry> {
 }
 
 pub fn set_provider_api_key(provider_id: &str, key: Option<&str>) -> Result<()> {
-    let entry = keyring_entry(provider_id)?;
-    match key {
-        Some(v) if !v.trim().is_empty() => entry.set_password(v.trim())?,
+    let mut payload = load_secret_payload();
+    match key.map(str::trim) {
+        Some(value) if !value.is_empty() => {
+            payload
+                .provider_api_keys
+                .insert(provider_id.to_string(), value.to_string());
+        }
         _ => {
-            let _ = entry.delete_credential();
+            payload.provider_api_keys.remove(provider_id);
         }
     }
-    Ok(())
+    save_secret_payload(&payload)
 }
 
 pub fn get_provider_api_key(provider_id: &str) -> Option<String> {
-    let entry = keyring_entry(provider_id).ok()?;
-    match entry.get_password() {
-        Ok(v) if !v.trim().is_empty() => Some(v),
-        _ => None,
-    }
+    SecretStore::load()
+        .ok()
+        .and_then(|payload| payload.provider_api_keys.get(provider_id).cloned())
+        .filter(|value| is_non_empty(value))
 }
 
 pub fn has_provider_api_key(provider_id: &str) -> bool {
@@ -290,39 +299,38 @@ pub fn has_provider_api_key(provider_id: &str) -> bool {
 }
 
 pub fn set_provider_account_api_key(account_id: &str, key: Option<&str>) -> Result<()> {
-    let entry = keyring_entry(account_id)?;
-    match key {
-        Some(v) if !v.trim().is_empty() => entry.set_password(v.trim())?,
-        _ => {
-            let _ = entry.delete_credential();
-        }
-    }
-    Ok(())
+    set_provider_api_key(account_id, key)
 }
 
 pub fn get_provider_account_api_key(account_id: &str) -> Option<String> {
-    let entry = keyring_entry(account_id).ok()?;
-    match entry.get_password() {
-        Ok(v) if !v.trim().is_empty() => Some(v),
-        _ => None,
-    }
+    get_provider_api_key(account_id)
 }
 
 pub fn has_provider_account_api_key(account_id: &str) -> bool {
     get_provider_account_api_key(account_id).is_some()
 }
 
-// --- OpenAI OAuth token storage (file-based) ---
-//
-// We keep OAuth tokens in the app config directory instead of the OS keyring.
-// The keyring backend was reliable for API keys, but it regressed the ChatGPT
-// OAuth flow on Windows: writes succeeded, but later reads were inconsistent,
-// so login state stopped surviving window close/reopen. A small JSON file in
-// the user config directory is the known-working path for this app.
+fn openai_session() -> &'static Mutex<OpenAiSessionState> {
+    static SESSION: OnceLock<Mutex<OpenAiSessionState>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new(OpenAiSessionState::default()))
+}
+
+fn is_non_empty(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn load_secret_payload() -> SecretPayload {
+    SecretStore::load_or_default()
+}
+
+fn save_secret_payload(payload: &SecretPayload) -> Result<()> {
+    SecretStore::save(payload)
+}
+
+// --- OpenAI OAuth token storage (legacy migration helpers) ---
 
 fn oauth_tokens_path() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("Unable to resolve config directory")?;
-    Ok(base.join("usage-guard").join("oauth_tokens.json"))
+    Ok(app_config_dir()?.join("oauth_tokens.json"))
 }
 
 fn oauth_tokens_entry() -> Result<keyring::Entry> {
@@ -341,7 +349,7 @@ struct OAuthTokenFile {
     openai_plan_type: String,
 }
 
-fn load_oauth_file() -> OAuthTokenFile {
+fn load_legacy_oauth_file() -> OAuthTokenFile {
     let path = match oauth_tokens_path() {
         Ok(p) => p,
         Err(_) => return OAuthTokenFile::default(),
@@ -353,14 +361,6 @@ fn load_oauth_file() -> OAuthTokenFile {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-fn save_oauth_file(file: &OAuthTokenFile) -> Result<()> {
-    let path = oauth_tokens_path()?;
-    let dir = path.parent().context("Config parent directory missing")?;
-    fs::create_dir_all(dir)?;
-    fs::write(&path, serde_json::to_string_pretty(file)?)?;
-    Ok(())
-}
-
 fn oauth_tokens_present(file: &OAuthTokenFile) -> bool {
     !file.openai_access_token.is_empty()
         || !file.openai_refresh_token.is_empty()
@@ -368,7 +368,7 @@ fn oauth_tokens_present(file: &OAuthTokenFile) -> bool {
         || !file.openai_plan_type.is_empty()
 }
 
-fn migrate_keyring_oauth_tokens() -> OAuthTokenFile {
+fn load_legacy_keyring_oauth_tokens() -> OAuthTokenFile {
     let entry = match oauth_tokens_entry() {
         Ok(entry) => entry,
         Err(_) => return OAuthTokenFile::default(),
@@ -382,73 +382,154 @@ fn migrate_keyring_oauth_tokens() -> OAuthTokenFile {
         _ => return OAuthTokenFile::default(),
     };
 
-    if save_oauth_file(&file).is_ok() {
-        let _ = entry.delete_credential();
-        return file;
-    }
-
-    OAuthTokenFile::default()
+    file
 }
 
-fn load_oauth_tokens() -> OAuthTokenFile {
-    let file = load_oauth_file();
-    if oauth_tokens_present(&file) {
-        return file;
-    }
-
-    let migrated = migrate_keyring_oauth_tokens();
-    if oauth_tokens_present(&migrated) {
-        return migrated;
-    }
-
-    OAuthTokenFile::default()
+fn load_stored_openai_secret() -> OpenAiOAuthSecret {
+    load_secret_payload().openai_oauth
 }
 
-fn save_oauth_tokens(file: &OAuthTokenFile) -> Result<()> {
-    save_oauth_file(file)?;
-    if let Ok(entry) = oauth_tokens_entry() {
-        let _ = entry.delete_credential();
+fn persist_openai_secret(secret: &OpenAiOAuthSecret) -> Result<()> {
+    let mut payload = load_secret_payload();
+    payload.openai_oauth = secret.clone();
+    save_secret_payload(&payload)
+}
+
+fn clear_stored_openai_secret() -> Result<()> {
+    let mut payload = load_secret_payload();
+    payload.openai_oauth = OpenAiOAuthSecret::default();
+    if payload.provider_api_keys.is_empty() {
+        SecretStore::clear()
+    } else {
+        save_secret_payload(&payload)
     }
-    Ok(())
+}
+
+fn update_in_memory_oauth_session(
+    access_token: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+    refresh_token: Option<String>,
+    account_id: Option<String>,
+    plan_type: Option<String>,
+) {
+    let mut session = openai_session().lock().unwrap();
+    if let Some(access) = access_token {
+        session.access_token = Some(access);
+        session.expires_at = expires_at;
+    }
+    if let Some(refresh) = refresh_token {
+        session.refresh_token = if is_non_empty(&refresh) {
+            Some(refresh)
+        } else {
+            None
+        };
+    }
+    if let Some(account_id) = account_id {
+        session.account_id = account_id;
+    }
+    if let Some(plan_type) = plan_type {
+        session.plan_type = plan_type;
+    }
+}
+
+fn clear_in_memory_oauth_session() {
+    *openai_session().lock().unwrap() = OpenAiSessionState::default();
+}
+
+fn current_cached_access_token() -> Option<String> {
+    let session = openai_session().lock().unwrap();
+    let expires_at = session.expires_at?;
+    if expires_at <= Utc::now() {
+        return None;
+    }
+    session.access_token.clone()
+}
+
+fn stored_or_cached_account_id() -> String {
+    let session = openai_session().lock().unwrap().clone();
+    if is_non_empty(&session.account_id) {
+        session.account_id
+    } else {
+        load_stored_openai_secret().account_id
+    }
+}
+
+fn token_expiry_from_now(expires_in_secs: Option<i64>) -> DateTime<Utc> {
+    let ttl = expires_in_secs
+        .unwrap_or(DEFAULT_ACCESS_TOKEN_LIFETIME_SECS)
+        .max(ACCESS_TOKEN_EXPIRY_SKEW_SECS + 1);
+    Utc::now() + Duration::seconds(ttl - ACCESS_TOKEN_EXPIRY_SKEW_SECS)
+}
+
+fn current_refresh_token() -> Option<String> {
+    let session_refresh = openai_session().lock().unwrap().refresh_token.clone();
+    if let Some(refresh) = session_refresh.filter(|value| is_non_empty(value)) {
+        return Some(refresh);
+    }
+
+    let stored = load_stored_openai_secret();
+    if is_non_empty(&stored.refresh_token) {
+        Some(stored.refresh_token)
+    } else {
+        None
+    }
+}
+
+pub fn has_openai_oauth_session() -> bool {
+    current_refresh_token().is_some() || current_cached_access_token().is_some()
 }
 
 pub fn get_openai_oauth_access_token() -> Option<String> {
-    let t = load_oauth_tokens();
-    if t.openai_access_token.is_empty() {
-        None
-    } else {
-        Some(t.openai_access_token)
-    }
+    current_cached_access_token()
 }
 
 pub fn get_openai_oauth_plan_type() -> Option<String> {
-    let t = load_oauth_tokens();
-    if t.openai_plan_type.is_empty() {
-        None
+    let session_plan = openai_session().lock().unwrap().plan_type.clone();
+    if is_non_empty(&session_plan) {
+        return Some(session_plan);
+    }
+
+    let stored = load_stored_openai_secret();
+    if is_non_empty(&stored.plan_type) {
+        Some(stored.plan_type)
     } else {
-        Some(t.openai_plan_type)
+        None
     }
 }
 
 pub fn set_openai_oauth_tokens(
     access: &str,
+    access_expires_at: DateTime<Utc>,
     refresh: &str,
     account_id: &str,
     plan_type: &str,
 ) -> Result<()> {
-    let mut file = load_oauth_tokens();
-    file.openai_access_token = access.to_string();
-    if !refresh.is_empty() {
-        file.openai_refresh_token = refresh.to_string();
+    update_in_memory_oauth_session(
+        Some(access.to_string()),
+        Some(access_expires_at),
+        Some(refresh.to_string()),
+        Some(account_id.to_string()),
+        Some(plan_type.to_string()),
+    );
+
+    if !is_non_empty(refresh) {
+        return Ok(());
     }
-    file.openai_account_id = account_id.to_string();
-    if !plan_type.is_empty() {
-        file.openai_plan_type = plan_type.to_string();
+
+    let mut stored = load_stored_openai_secret();
+    stored.refresh_token = refresh.to_string();
+    if is_non_empty(account_id) {
+        stored.account_id = account_id.to_string();
     }
-    save_oauth_tokens(&file)
+    if is_non_empty(plan_type) {
+        stored.plan_type = plan_type.to_string();
+    }
+    persist_openai_secret(&stored)
 }
 
 pub fn clear_openai_oauth_tokens() {
+    clear_in_memory_oauth_session();
+    let _ = clear_stored_openai_secret();
     if let Ok(entry) = oauth_tokens_entry() {
         let _ = entry.delete_credential();
     }
@@ -458,27 +539,62 @@ pub fn clear_openai_oauth_tokens() {
 }
 
 pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
-    let tokens = load_oauth_tokens();
-    if tokens.openai_access_token.is_empty() {
+    if !has_openai_oauth_session() {
         return None;
     }
 
-    match do_fetch_wham_usage(&tokens.openai_access_token, &tokens.openai_account_id) {
+    let account_id = stored_or_cached_account_id();
+    let access_token = match current_cached_access_token() {
+        Some(token) => token,
+        None => match try_refresh_oauth_token() {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("[usageguard] token refresh failed: {error}");
+                return Some(error_snapshot(
+                    "openai",
+                    "ChatGPT",
+                    "oauth",
+                    Some("oauth_reauth_required"),
+                    Some("ChatGPT sign-in expired. Sign in again."),
+                ));
+            }
+        },
+    };
+
+    match do_fetch_wham_usage(&access_token, &account_id) {
         Ok(snapshot) => Some(snapshot),
-        Err(e) => {
-            eprintln!("[usageguard] wham/usage failed: {e}");
+        Err(error) => {
+            eprintln!("[usageguard] wham/usage failed: {error}");
             // Token may be expired — try to refresh once
             match try_refresh_oauth_token() {
-                Ok(new_access) => match do_fetch_wham_usage(&new_access, &tokens.openai_account_id) {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(e2) => {
-                        eprintln!("[usageguard] wham/usage after refresh failed: {e2}");
-                        Some(error_snapshot("openai", "ChatGPT", format!("oauth-error:{e2}")))
+                Ok(new_access) => {
+                    match do_fetch_wham_usage(&new_access, &stored_or_cached_account_id()) {
+                        Ok(snapshot) => Some(snapshot),
+                        Err(refresh_error) => {
+                            eprintln!(
+                                "[usageguard] wham/usage after refresh failed: {refresh_error}"
+                            );
+                            Some(error_snapshot(
+                                "openai",
+                                "ChatGPT",
+                                "oauth",
+                                Some("oauth_usage_unavailable"),
+                                Some("Unable to load ChatGPT usage right now."),
+                            ))
+                        }
                     }
-                },
-                Err(e_refresh) => {
-                    eprintln!("[usageguard] token refresh failed: {e_refresh}");
-                    Some(error_snapshot("openai", "ChatGPT", format!("oauth-error:{e}")))
+                }
+                Err(refresh_error) => {
+                    eprintln!(
+                        "[usageguard] token refresh failed after usage error: {refresh_error}"
+                    );
+                    Some(error_snapshot(
+                        "openai",
+                        "ChatGPT",
+                        "oauth",
+                        Some("oauth_reauth_required"),
+                        Some("ChatGPT sign-in expired. Sign in again."),
+                    ))
                 }
             }
         }
@@ -486,10 +602,8 @@ pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
 }
 
 fn try_refresh_oauth_token() -> Result<String> {
-    let tokens = load_oauth_tokens();
-    if tokens.openai_refresh_token.is_empty() {
-        return Err(anyhow!("No refresh token stored"));
-    }
+    let refresh_token =
+        current_refresh_token().ok_or_else(|| anyhow!("No refresh token stored"))?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -497,28 +611,44 @@ fn try_refresh_oauth_token() -> Result<String> {
 
     let params = [
         ("grant_type", "refresh_token"),
-        ("refresh_token", tokens.openai_refresh_token.as_str()),
+        ("refresh_token", refresh_token.as_str()),
         ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
     ];
 
-    let resp: Value = client
+    let resp = client
         .post("https://auth.openai.com/oauth/token")
         .form(&params)
-        .send()?
-        .error_for_status()?
-        .json()?;
+        .send();
+    let resp: Value = match resp {
+        Ok(resp) => resp.error_for_status()?.json()?,
+        Err(error) => {
+            clear_openai_oauth_tokens();
+            return Err(error.into());
+        }
+    };
 
     let new_access = resp["access_token"]
         .as_str()
         .ok_or_else(|| anyhow!("No access_token in refresh response"))?
         .to_string();
-
-    let mut file = load_oauth_tokens();
-    file.openai_access_token = new_access.clone();
-    if let Some(new_refresh) = resp["refresh_token"].as_str() {
-        file.openai_refresh_token = new_refresh.to_string();
+    let expires_at = token_expiry_from_now(resp["expires_in"].as_i64());
+    let new_refresh = resp["refresh_token"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or(refresh_token);
+    let mut stored = load_stored_openai_secret();
+    stored.refresh_token = new_refresh.clone();
+    update_in_memory_oauth_session(
+        Some(new_access.clone()),
+        Some(expires_at),
+        Some(new_refresh),
+        Some(stored.account_id.clone()),
+        Some(stored.plan_type.clone()),
+    );
+    if let Err(error) = persist_openai_secret(&stored) {
+        clear_in_memory_oauth_session();
+        return Err(error);
     }
-    let _ = save_oauth_tokens(&file);
 
     Ok(new_access)
 }
@@ -541,8 +671,7 @@ fn do_fetch_wham_usage(access_token: &str, account_id: &str) -> Result<UsageSnap
     let resp = req.send()?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        return Err(anyhow!("HTTP {status}: {body}"));
+        return Err(anyhow!("HTTP {status}"));
     }
     let value: Value = resp.json()?;
     parse_wham_usage_response(&value)
@@ -550,11 +679,27 @@ fn do_fetch_wham_usage(access_token: &str, account_id: &str) -> Result<UsageSnap
 
 fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
     let plan_type = value["plan_type"].as_str().unwrap_or("unknown").to_string();
+    let account_id = value["account_id"]
+        .as_str()
+        .or_else(|| value["user_id"].as_str())
+        .unwrap_or_default()
+        .to_string();
 
-    // Persist updated plan type
-    let mut file = load_oauth_tokens();
-    file.openai_plan_type = plan_type.clone();
-    let _ = save_oauth_tokens(&file);
+    let mut stored = load_stored_openai_secret();
+    if is_non_empty(&account_id) {
+        stored.account_id = account_id.clone();
+    }
+    if is_non_empty(&plan_type) {
+        stored.plan_type = plan_type.clone();
+    }
+    let _ = persist_openai_secret(&stored);
+    update_in_memory_oauth_session(
+        None,
+        None,
+        None,
+        Some(stored.account_id.clone()),
+        Some(stored.plan_type.clone()),
+    );
 
     // primary_window  = shorter window (e.g. 5 hours)  → maps to the "5h" ring
     // secondary_window = longer window (e.g. 1 week)   → maps to the "week" ring
@@ -570,7 +715,6 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
         .or_else(|| value.pointer("/secondary_window/used_percent"))
         .and_then(|v| v.as_f64())
         .unwrap_or(primary_percent); // fall back to primary if secondary is absent/null
-
 
     // Capitalise first letter: "pro" → "Pro"
     let plan_display: String = {
@@ -594,17 +738,13 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
         tokens_out: 0,
         inactive_hours: 0,
         source: "oauth".to_string(),
+        status_code: None,
+        status_message: None,
     })
 }
 
-fn resolve_provider_api_key(
-    provider_id: &str,
-    config_value: Option<String>,
-    env_var: &str,
-) -> Option<String> {
-    get_provider_api_key(provider_id)
-        .or(config_value)
-        .or_else(|| std::env::var(env_var).ok())
+fn resolve_provider_api_key(provider_id: &str, env_var: &str) -> Option<String> {
+    get_provider_api_key(provider_id).or_else(|| std::env::var(env_var).ok())
 }
 
 struct ProviderSpec<'a> {
@@ -623,8 +763,7 @@ struct ProviderSpec<'a> {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("Unable to resolve config directory")?;
-    Ok(base.join("usage-guard").join("config.json"))
+    Ok(app_config_dir()?.join("config.json"))
 }
 
 fn legacy_endpoint(cfg: &ApiCredentials, provider_id: &str) -> Option<String> {
@@ -653,6 +792,120 @@ fn clear_legacy_endpoint(cfg: &mut ApiCredentials, provider_id: &str) {
     }
 }
 
+fn keyring_password(id: &str) -> Option<String> {
+    let entry = keyring_entry(id).ok()?;
+    match entry.get_password() {
+        Ok(value) if is_non_empty(&value) => Some(value),
+        _ => None,
+    }
+}
+
+fn delete_keyring_password(id: &str) {
+    if let Ok(entry) = keyring_entry(id) {
+        let _ = entry.delete_credential();
+    }
+}
+
+fn migrate_secret_payload(cfg: &mut AppConfig) -> Result<bool> {
+    let mut payload = load_secret_payload();
+    let mut changed = false;
+    let mut cleanup_needed = false;
+    let mut migrated_keyring_ids = Vec::new();
+
+    for (provider_id, key_slot) in [
+        ("openai", &mut cfg.api.openai_api_key),
+        ("anthropic", &mut cfg.api.anthropic_api_key),
+        ("gemini", &mut cfg.api.gemini_api_key),
+        ("mistral", &mut cfg.api.mistral_api_key),
+        ("groq", &mut cfg.api.groq_api_key),
+        ("copilot", &mut cfg.api.copilot_api_key),
+        ("cursor", &mut cfg.api.cursor_api_key),
+    ] {
+        if let Some(value) = key_slot.take().filter(|value| is_non_empty(value)) {
+            payload
+                .provider_api_keys
+                .insert(provider_id.to_string(), value);
+            changed = true;
+        }
+
+        if let Some(value) = keyring_password(provider_id) {
+            cleanup_needed = true;
+            let needs_update = payload.provider_api_keys.get(provider_id) != Some(&value);
+            payload
+                .provider_api_keys
+                .insert(provider_id.to_string(), value);
+            if needs_update {
+                changed = true;
+            }
+            migrated_keyring_ids.push(provider_id.to_string());
+        }
+    }
+
+    for account in &cfg.provider_accounts {
+        if let Some(value) = keyring_password(&account.id) {
+            cleanup_needed = true;
+            let needs_update = payload.provider_api_keys.get(&account.id) != Some(&value);
+            payload.provider_api_keys.insert(account.id.clone(), value);
+            if needs_update {
+                changed = true;
+            }
+            migrated_keyring_ids.push(account.id.clone());
+        }
+    }
+
+    let legacy_oauth = {
+        let file = load_legacy_oauth_file();
+        if oauth_tokens_present(&file) {
+            Some(file)
+        } else {
+            let keyring = load_legacy_keyring_oauth_tokens();
+            oauth_tokens_present(&keyring).then_some(keyring)
+        }
+    };
+
+    if let Some(legacy) = legacy_oauth {
+        cleanup_needed = true;
+        if is_non_empty(&legacy.openai_refresh_token) {
+            if payload.openai_oauth.refresh_token != legacy.openai_refresh_token {
+                changed = true;
+            }
+            payload.openai_oauth.refresh_token = legacy.openai_refresh_token;
+        }
+        if is_non_empty(&legacy.openai_account_id) {
+            if payload.openai_oauth.account_id != legacy.openai_account_id {
+                changed = true;
+            }
+            payload.openai_oauth.account_id = legacy.openai_account_id;
+        }
+        if is_non_empty(&legacy.openai_plan_type) {
+            if payload.openai_oauth.plan_type != legacy.openai_plan_type {
+                changed = true;
+            }
+            payload.openai_oauth.plan_type = legacy.openai_plan_type;
+        }
+    }
+
+    if !changed && !cleanup_needed {
+        return Ok(false);
+    }
+
+    if changed {
+        save_secret_payload(&payload)?;
+    }
+
+    for key_id in migrated_keyring_ids {
+        delete_keyring_password(&key_id);
+    }
+    if let Ok(entry) = oauth_tokens_entry() {
+        let _ = entry.delete_credential();
+    }
+    if let Ok(path) = oauth_tokens_path() {
+        let _ = fs::remove_file(path);
+    }
+
+    Ok(true)
+}
+
 fn migrate_legacy_provider_accounts(cfg: &mut AppConfig) -> bool {
     if !cfg.provider_accounts.is_empty() {
         return false;
@@ -660,6 +913,10 @@ fn migrate_legacy_provider_accounts(cfg: &mut AppConfig) -> bool {
 
     let mut migrated = false;
     for template in builtin_provider_templates() {
+        if template.default_endpoint.is_none() {
+            continue;
+        }
+
         let endpoint = legacy_endpoint(&cfg.api, template.id);
         let legacy_key = get_provider_api_key(template.id);
         if endpoint.is_none() && legacy_key.is_none() {
@@ -676,7 +933,7 @@ fn migrate_legacy_provider_accounts(cfg: &mut AppConfig) -> bool {
             id: account_id,
             provider: template.id.to_string(),
             label: template.label.to_string(),
-            endpoint,
+            endpoint: None,
         });
         clear_legacy_endpoint(&mut cfg.api, template.id);
         migrated = true;
@@ -695,43 +952,48 @@ pub fn load_config() -> Result<AppConfig> {
     let mut cfg = serde_json::from_str::<AppConfig>(&raw)
         .with_context(|| format!("Invalid config JSON: {}", path.display()))?;
 
-    // migrate plaintext keys to keyring when present
     let mut migrated = false;
-    if let Some(v) = cfg.api.openai_api_key.take() {
-        let _ = set_provider_api_key("openai", Some(&v));
+    migrated |= migrate_secret_payload(&mut cfg)?;
+    migrated |= migrate_legacy_provider_accounts(&mut cfg);
+
+    if !cfg.profiles.is_empty() {
+        cfg.profiles.clear();
         migrated = true;
     }
-    if let Some(v) = cfg.api.anthropic_api_key.take() {
-        let _ = set_provider_api_key("anthropic", Some(&v));
-        migrated = true;
+
+    for account in &mut cfg.provider_accounts {
+        if account.endpoint.take().is_some() {
+            migrated = true;
+        }
     }
-    if let Some(v) = cfg.api.gemini_api_key.take() {
-        let _ = set_provider_api_key("gemini", Some(&v));
-        migrated = true;
+
+    for provider_id in [
+        "openai",
+        "anthropic",
+        "gemini",
+        "mistral",
+        "groq",
+        "copilot",
+        "cursor",
+    ] {
+        if legacy_endpoint(&cfg.api, provider_id).is_some() {
+            clear_legacy_endpoint(&mut cfg.api, provider_id);
+            migrated = true;
+        }
     }
-    if let Some(v) = cfg.api.mistral_api_key.take() {
-        let _ = set_provider_api_key("mistral", Some(&v));
-        migrated = true;
-    }
-    if let Some(v) = cfg.api.groq_api_key.take() {
-        let _ = set_provider_api_key("groq", Some(&v));
-        migrated = true;
-    }
-    if let Some(v) = cfg.api.copilot_api_key.take() {
-        let _ = set_provider_api_key("copilot", Some(&v));
-        migrated = true;
-    }
-    if let Some(v) = cfg.api.cursor_api_key.take() {
-        let _ = set_provider_api_key("cursor", Some(&v));
+
+    let before_accounts = cfg.provider_accounts.len();
+    cfg.provider_accounts.retain(|account| {
+        provider_template(&account.provider)
+            .and_then(|template| template.default_endpoint)
+            .is_some()
+    });
+    if cfg.provider_accounts.len() != before_accounts {
         migrated = true;
     }
 
     if migrated {
-        let _ = save_config(&cfg);
-    }
-
-    if migrate_legacy_provider_accounts(&mut cfg) {
-        let _ = save_config(&cfg);
+        save_config(&cfg)?;
     }
 
     Ok(cfg)
@@ -813,7 +1075,7 @@ pub fn should_notify(alerts: &[Alert], now: DateTime<Local>, cfg: &AppConfig) ->
     has_critical || !is_quiet_hour(now, &cfg.quiet_hours)
 }
 
-fn build_legacy_provider_specs(cfg: &AppConfig) -> Vec<ProviderSpec<'static>> {
+fn build_legacy_provider_specs() -> Vec<ProviderSpec<'static>> {
     builtin_provider_templates()
         .into_iter()
         .map(|template| ProviderSpec {
@@ -821,43 +1083,16 @@ fn build_legacy_provider_specs(cfg: &AppConfig) -> Vec<ProviderSpec<'static>> {
             label: template.label,
             env_prefix: template.env_prefix,
             api_key: match template.id {
-                "openai" => resolve_provider_api_key(
-                    "openai",
-                    cfg.api.openai_api_key.clone(),
-                    "OPENAI_API_KEY",
-                ),
-                "anthropic" => resolve_provider_api_key(
-                    "anthropic",
-                    cfg.api.anthropic_api_key.clone(),
-                    "ANTHROPIC_API_KEY",
-                ),
-                "gemini" => resolve_provider_api_key(
-                    "gemini",
-                    cfg.api.gemini_api_key.clone(),
-                    "GEMINI_API_KEY",
-                ),
-                "mistral" => resolve_provider_api_key(
-                    "mistral",
-                    cfg.api.mistral_api_key.clone(),
-                    "MISTRAL_API_KEY",
-                ),
-                "groq" => {
-                    resolve_provider_api_key("groq", cfg.api.groq_api_key.clone(), "GROQ_API_KEY")
-                }
-                "copilot" => resolve_provider_api_key(
-                    "copilot",
-                    cfg.api.copilot_api_key.clone(),
-                    "COPILOT_API_KEY",
-                ),
-                "cursor" => resolve_provider_api_key(
-                    "cursor",
-                    cfg.api.cursor_api_key.clone(),
-                    "CURSOR_API_KEY",
-                ),
+                "openai" => resolve_provider_api_key("openai", "OPENAI_API_KEY"),
+                "anthropic" => resolve_provider_api_key("anthropic", "ANTHROPIC_API_KEY"),
+                "gemini" => resolve_provider_api_key("gemini", "GEMINI_API_KEY"),
+                "mistral" => resolve_provider_api_key("mistral", "MISTRAL_API_KEY"),
+                "groq" => resolve_provider_api_key("groq", "GROQ_API_KEY"),
+                "copilot" => resolve_provider_api_key("copilot", "COPILOT_API_KEY"),
+                "cursor" => resolve_provider_api_key("cursor", "CURSOR_API_KEY"),
                 _ => None,
             },
-            endpoint: legacy_endpoint(&cfg.api, template.id)
-                .or_else(|| std::env::var(format!("{}_COSTS_ENDPOINT", template.env_prefix)).ok()),
+            endpoint: None,
             default_endpoint: template.default_endpoint,
             method: template.method.clone(),
             auth_header: template.auth_header,
@@ -875,12 +1110,13 @@ fn build_legacy_provider_specs(cfg: &AppConfig) -> Vec<ProviderSpec<'static>> {
 
 fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec<'_>> {
     let template = provider_template(&account.provider)?;
+    template.default_endpoint?;
     Some(ProviderSpec {
         id: template.id,
         label: &account.label,
         env_prefix: template.env_prefix,
         api_key: get_provider_account_api_key(&account.id),
-        endpoint: account.endpoint.clone(),
+        endpoint: None,
         default_endpoint: template.default_endpoint,
         method: template.method.clone(),
         auth_header: template.auth_header,
@@ -905,7 +1141,7 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
 
     // API-key / env sources
     let api_items: Vec<UsageSnapshot> = if cfg.provider_accounts.is_empty() {
-        build_legacy_provider_specs(cfg)
+        build_legacy_provider_specs()
             .into_iter()
             .filter_map(fetch_provider_snapshot)
             .collect()
@@ -918,48 +1154,7 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
     };
     items.extend(api_items);
 
-    for profile in &cfg.profiles {
-        if let Some(s) = fetch_custom_profile(profile) {
-            items.push(s);
-        }
-    }
-
     items
-}
-
-fn fetch_custom_profile(profile: &ProviderProfile) -> Option<UsageSnapshot> {
-    if profile.endpoint.trim().is_empty() {
-        return None;
-    }
-
-    match snapshot_from_http_json(
-        &profile.endpoint,
-        HttpMethod::Get,
-        profile
-            .auth_header
-            .as_deref()
-            .zip(profile.api_key.as_deref())
-            .map(|(header, key)| {
-                let auth_mode = if header.eq_ignore_ascii_case("authorization") {
-                    AuthMode::Bearer
-                } else {
-                    AuthMode::Raw
-                };
-                (header, auth_mode, key)
-            }),
-        &[],
-        None,
-        &profile.id,
-        &profile.label,
-        "profile-api",
-    ) {
-        Ok(s) => Some(s),
-        Err(e) => Some(error_snapshot(
-            &profile.id,
-            &profile.label,
-            format!("api-error:{e}"),
-        )),
-    }
 }
 
 fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
@@ -987,11 +1182,13 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
             "api",
         ) {
             Ok(s) => return Some(s),
-            Err(e) => {
+            Err(_error) => {
                 return Some(error_snapshot(
                     spec.id,
                     spec.label,
-                    format!("api-error:{e}"),
+                    "api",
+                    Some("api_usage_unavailable"),
+                    Some("Unable to load provider usage right now."),
                 ));
             }
         }
@@ -1106,6 +1303,8 @@ fn parse_openai_costs_response(value: &Value, label: &str, source: &str) -> Resu
         .unwrap_or(0),
         inactive_hours: derive_inactive_hours(value),
         source: source.to_string(),
+        status_code: None,
+        status_message: None,
     })
 }
 
@@ -1150,6 +1349,8 @@ fn parse_anthropic_usage_response(
         }),
         inactive_hours: derive_inactive_hours(value),
         source: source.to_string(),
+        status_code: None,
+        status_message: None,
     })
 }
 
@@ -1181,6 +1382,8 @@ fn parse_copilot_usage_response(value: &Value, label: &str, source: &str) -> Res
         tokens_out: request_count,
         inactive_hours: derive_inactive_hours(value),
         source: source.to_string(),
+        status_code: None,
+        status_message: None,
     })
 }
 
@@ -1209,6 +1412,8 @@ fn parse_cursor_spend_response(value: &Value, label: &str, source: &str) -> Resu
         tokens_out: 0,
         inactive_hours: derive_inactive_hours(value),
         source: source.to_string(),
+        status_code: None,
+        status_message: None,
     })
 }
 
@@ -1226,7 +1431,7 @@ fn snapshot_from_ndjson(path: &str, provider: &str, label: &str) -> Result<Usage
     }
 
     let value = last.ok_or_else(|| anyhow!("No valid JSON rows in {path}"))?;
-    snapshot_from_value(&value, provider, label, "ndjson")
+    snapshot_from_value(&value, provider, label, "env")
 }
 
 fn snapshot_from_value(
@@ -1254,6 +1459,8 @@ fn snapshot_from_value(
         .unwrap_or(0),
         inactive_hours: derive_inactive_hours(value),
         source: source.to_string(),
+        status_code: None,
+        status_message: None,
     })
 }
 
@@ -1288,10 +1495,18 @@ fn env_fallback_snapshot(provider: &str, label: &str, prefix: &str) -> Option<Us
         tokens_out: 0,
         inactive_hours: 0,
         source: "env".to_string(),
+        status_code: None,
+        status_message: None,
     })
 }
 
-fn error_snapshot(provider: &str, label: &str, source: String) -> UsageSnapshot {
+fn error_snapshot(
+    provider: &str,
+    label: &str,
+    source: &str,
+    status_code: Option<&str>,
+    status_message: Option<&str>,
+) -> UsageSnapshot {
     UsageSnapshot {
         provider: provider.to_string(),
         account_label: label.to_string(),
@@ -1300,7 +1515,9 @@ fn error_snapshot(provider: &str, label: &str, source: String) -> UsageSnapshot 
         tokens_in: 0,
         tokens_out: 0,
         inactive_hours: 0,
-        source,
+        source: source.to_string(),
+        status_code: status_code.map(str::to_string),
+        status_message: status_message.map(str::to_string),
     }
 }
 
@@ -1340,6 +1557,8 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
             tokens_out: 12_300,
             inactive_hours: 2,
             source: "demo".into(),
+            status_code: None,
+            status_message: None,
         },
         UsageSnapshot {
             provider: "anthropic".into(),
@@ -1350,6 +1569,8 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
             tokens_out: 8_400,
             inactive_hours: 11,
             source: "demo".into(),
+            status_code: None,
+            status_message: None,
         },
     ]
 }
@@ -1370,6 +1591,8 @@ mod tests {
             tokens_out: 0,
             inactive_hours: 1,
             source: "test".into(),
+            status_code: None,
+            status_message: None,
         };
         let alerts = evaluate_alerts(&s, &cfg);
         assert!(alerts.iter().any(|a| a.code == "near_limit"));

@@ -1,11 +1,7 @@
-const tauri = (window as any).__TAURI__;
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
-export const invoke = tauri?.core?.invoke as
-  | ((cmd: string, args?: Record<string, unknown>) => Promise<any>)
-  | undefined;
+export { invoke, listen };
 
-export const listen = tauri?.event?.listen as
-  | ((event: string, handler: (event: unknown) => void) => Promise<() => void>)
-  | undefined;
-
-export const currentWindow = tauri?.window?.getCurrentWindow?.() ?? tauri?.window?.getCurrent?.() ?? null;
+export const currentWindow = getCurrentWindow();

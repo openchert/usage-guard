@@ -31,14 +31,19 @@ export const openaiOauthDisplayAdapter: UsageDisplayAdapter = {
     const primaryLeft = Math.round(remainingRatio(primaryUsed) * 100);
     const secondaryLeft = Math.round(remainingRatio(secondaryUsed) * 100);
 
+    const titleLines = [
+      label,
+      'ChatGPT OAuth',
+      `5h used: ${primaryUsed}% | left: ${primaryLeft}%`,
+      `week used: ${secondaryUsed}% | left: ${secondaryLeft}%`,
+    ];
+    if (snapshot.status_message) {
+      titleLines.push(`Status: ${snapshot.status_message}`);
+    }
+
     return {
       displayLabel: label,
-      title: [
-        label,
-        'ChatGPT OAuth',
-        `5h used: ${primaryUsed}% | left: ${primaryLeft}%`,
-        `week used: ${secondaryUsed}% | left: ${secondaryLeft}%`,
-      ].join('\n'),
+      title: titleLines.join('\n'),
       rings: [
         { label: '5h', ratio: remainingRatio(snapshot.tokens_in) },
         { ratio: remainingRatio(snapshot.spent_usd) },

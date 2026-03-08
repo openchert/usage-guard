@@ -12,7 +12,7 @@ This is the public high-level roadmap.
 ## Current status
 - Minimal desktop + CLI shipped.
 - Multi-provider support shipped.
-- Local-first model + keyring-backed secret storage shipped.
+- Local-first model + Windows DPAPI-backed secret storage shipped.
 - Release automation + checksums + one-command installers shipped.
 
 For internal detailed execution tracking, maintain private repo plans/state.

@@ -7,6 +7,8 @@ export interface UsageSnapshot {
   tokens_out: number | null;
   inactive_hours: number | null;
   source: string;
+  status_code?: string | null;
+  status_message?: string | null;
 }
 
 export interface UsageRingSpec {

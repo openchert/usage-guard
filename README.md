@@ -10,11 +10,8 @@ UsageGuard is a calm, local-first AI usage monitor with:
 > Minimal UI. Meaningful alerts. Local control.
 
 ## Docs
-- `docs/PROJECT.md`: current project overview, architecture, and development workflow
-- `docs/SESSION_2026-03-08_DESKTOP_REWRITE.md`: recap of the Tauri desktop rewrite and native context menu work
-- `docs/INTERFACES.md`: provider adapter contracts and normalized snapshot schema
-- `docs/ADAPTER_EXAMPLES.md`: custom provider and NDJSON examples
-- `docs/NEXT_STEPS.md`: public roadmap summary
+- [`docs/SECURITY.md`](docs/SECURITY.md): secure storage, OAuth flow, migration, and Tauri hardening
+- [`docs/PROVIDERS.md`](docs/PROVIDERS.md): provider/source modules, snapshot schema, and built-in fetch policy
 
 ## Suggested GitHub metadata
 **About blurb:**
@@ -124,44 +121,40 @@ Desktop:
 3. Choose **Manage Providers...**
 4. Select a vendor
 5. Enter a display name and API key
-6. Add an endpoint URL when the selected provider requires one
-7. Save the provider
+6. Save the provider
 
-The desktop settings window supports multiple named accounts per vendor, so you can add more than one OpenAI, Anthropic, or other supported account.
+The desktop settings window supports multiple named accounts per vendor.
 
-API keys are stored in the OS keyring when available instead of plain config JSON.
+On Windows, API keys and OAuth refresh tokens are stored in a DPAPI-encrypted blob at `%APPDATA%\usage-guard\secrets.bin`. OpenAI OAuth access tokens stay in memory only and are refreshed when needed.
 
-Copilot requires a GitHub organization premium-request usage endpoint URL. Cursor uses the built-in `https://api.cursor.com/teams/spend` endpoint by default.
+For the first hardened deploy, provider fetches are locked to built-in audited endpoints only. Custom endpoint overrides and custom provider profiles are not used for outbound requests.
+
+OpenAI ChatGPT OAuth uses the system browser plus a localhost callback at `http://localhost:1455/auth/callback`. The app validates the callback path and OAuth `state` before exchanging the code.
 
 CLI:
 ```bash
 usageguard config --openai-key "sk-..."
 usageguard config --anthropic-key "sk-ant-..."
-usageguard config --openai-endpoint "https://api.openai.com/v1/organization/costs"
-usageguard config --anthropic-endpoint "https://api.anthropic.com/v1/organizations/usage"
 usageguard demo
 ```
 
 ## Provider support
-UsageGuard now includes built-in adapters for:
-- OpenAI
-- Anthropic
-- Gemini
-- Mistral
-- Groq
-- Copilot
-- Cursor
+Current first-deploy remote sources:
+- OpenAI OAuth via `https://chatgpt.com/backend-api/wham/usage`
+- OpenAI API via the built-in organization costs endpoint
+- Anthropic API via the built-in organizations usage endpoint
+- Cursor API via the built-in team spend endpoint
 
-Plus custom provider profiles via config.
+The UI display path is modular per provider and source, so OAuth/API variants can interpret their own raw usage semantics without hardcoding that logic in the main widget.
 
-See `docs/PROJECT.md` for the current workspace layout and runtime behavior.
-See `docs/INTERFACES.md` for exact environment variables, headers, endpoint contracts, and normalized schema.
-See `docs/ADAPTER_EXAMPLES.md` for custom provider/profile examples.
-See `docs/NEXT_STEPS.md` for the public short roadmap.
+See [`docs/SECURITY.md`](docs/SECURITY.md) for storage and OAuth details.
+See [`docs/PROVIDERS.md`](docs/PROVIDERS.md) for provider/source display modules and snapshot semantics.
 
 ## Troubleshooting
 - If install command succeeds but command not found, restart terminal (PATH refresh).
-- If API shows `source: api-error:...`, verify key permissions and endpoint URL.
+- If ChatGPT OAuth sign-in fails, make sure nothing else is using `localhost:1455`.
+- If the widget shows `Status: Unable to load provider usage right now.`, verify the API key and that the provider account has access to the supported endpoint.
+- If secure storage is unavailable, the app does not fall back to plaintext secret persistence.
 - If no API/log/env source is available, app falls back to demo data by design.
 
 ## Release build automation

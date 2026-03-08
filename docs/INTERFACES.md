@@ -1,6 +1,13 @@
-# Usage Interfaces (Provider Adapters)
+# Usage Interfaces
 
-UsageGuard normalizes every provider into this internal snapshot:
+This file is the short reference for the current normalized runtime interfaces.
+
+For the provider display model, see `docs/PROVIDERS.md`.
+For secure storage and OAuth flow details, see `docs/SECURITY.md`.
+
+## Normalized snapshot
+
+UsageGuard normalizes provider data into this shape:
 
 ```json
 {
@@ -11,29 +18,37 @@ UsageGuard normalizes every provider into this internal snapshot:
   "tokens_in": 0,
   "tokens_out": 0,
   "inactive_hours": 0,
-  "source": "api|ndjson|env|demo|api-error:*"
+  "source": "oauth|api|env|demo",
+  "status_code": "string|null",
+  "status_message": "string|null"
 }
 ```
 
-## Adapter input priority (per provider)
-1. `*_USAGE_LOG` (NDJSON, latest valid line)
-2. API endpoint + API key
-3. Env fallback (`*_SPENT_USD`, `*_LIMIT_USD`)
-4. Demo fallback (if no providers produce data)
+`source` is a stable origin label, not a raw error carrier.
 
-## Common JSON keys accepted (generic parser)
-- Spend: `spent_usd`, `spent`, `cost_usd`, `total_cost_usd`
-- Limit: `limit_usd`, `budget_usd`, `limit`, `hard_limit_usd`
-- Input tokens: `tokens_in`, `input_tokens`, `total_input_tokens`
-- Output tokens: `tokens_out`, `output_tokens`, `total_output_tokens`
-- Inactivity: `inactive_hours` OR `last_activity_iso`/`last_activity`/`timestamp` (RFC3339)
+`status_code` and `status_message` hold bounded user-safe error state when a provider cannot be refreshed.
+
+## Snapshot input priority
+
+Per provider, data is resolved in this order:
+
+1. provider-specific OAuth source, when applicable
+2. provider API fetch using a built-in audited endpoint
+3. environment or usage-log fallback, where supported
+4. demo data fallback
 
 ## Secret storage interface
-- `set_provider_api_key(provider_id, key)` stores keys in OS keyring when available.
-- `get_provider_api_key(provider_id)` resolves keys from keyring.
-- `set_provider_account_api_key(account_id, key)` stores keys for named provider accounts.
-- `get_provider_account_api_key(account_id)` resolves keys for named provider accounts.
-- Config JSON may still hold legacy keys; UsageGuard migrates them to keyring on load when possible.
+
+The current storage helpers are:
+
+- `set_provider_api_key(provider_id, key)`
+- `get_provider_api_key(provider_id)`
+- `set_provider_account_api_key(account_id, key)`
+- `get_provider_account_api_key(account_id)`
+
+On Windows, these persist into the DPAPI-encrypted blob at `%APPDATA%\usage-guard\secrets.bin`.
+
+Legacy plaintext OAuth storage and legacy keyring entries are migrated into that encrypted store on load.
 
 ## Named provider accounts
 
@@ -52,75 +67,12 @@ Desktop-managed accounts live in `provider_accounts` inside `config.json`:
 }
 ```
 
-- `provider` is the built-in vendor id.
-- `label` is the user-defined display name shown in the widget.
-- `endpoint` overrides the vendor default when needed.
-- The matching API key is stored separately in the OS keyring under the account id.
+`endpoint` remains in the config shape for compatibility, but the hardened desktop fetch path does not use custom endpoint overrides.
 
-## Built-in providers
+## Built-in fetch policy
 
-### OpenAI
-- Key: `OPENAI_API_KEY` (or config `api.openai_api_key`)
-- Endpoint: `OPENAI_COSTS_ENDPOINT` (default: `https://api.openai.com/v1/organization/costs`)
-- Auth header: `Authorization: Bearer <key>`
-- Log: `OPENAI_USAGE_LOG`
+For the first hardened deploy:
 
-### Anthropic
-- Key: `ANTHROPIC_API_KEY`
-- Endpoint: `ANTHROPIC_COSTS_ENDPOINT` (default: `https://api.anthropic.com/v1/organizations/usage`)
-- Headers:
-  - `x-api-key: <key>`
-  - `anthropic-version: 2023-06-01`
-- Log: `ANTHROPIC_USAGE_LOG`
-
-### Gemini
-- Key: `GEMINI_API_KEY`
-- Endpoint: `GEMINI_COSTS_ENDPOINT`
-- Auth header: `Authorization: Bearer <key>`
-- Log: `GEMINI_USAGE_LOG`
-
-### Mistral
-- Key: `MISTRAL_API_KEY`
-- Endpoint: `MISTRAL_COSTS_ENDPOINT`
-- Auth header: `Authorization: Bearer <key>`
-- Log: `MISTRAL_USAGE_LOG`
-
-### Groq
-- Key: `GROQ_API_KEY`
-- Endpoint: `GROQ_COSTS_ENDPOINT`
-- Auth header: `Authorization: Bearer <key>`
-- Log: `GROQ_USAGE_LOG`
-
-### Copilot
-- Key: `COPILOT_API_KEY`
-- Endpoint: `COPILOT_COSTS_ENDPOINT`
-- Auth header: `Authorization: Bearer <key>`
-- Extra headers: `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`
-- Log: `COPILOT_USAGE_LOG`
-
-### Cursor
-- Key: `CURSOR_API_KEY`
-- Endpoint: `CURSOR_COSTS_ENDPOINT` (default: `https://api.cursor.com/teams/spend`)
-- Method: `POST`
-- Auth header: `Authorization: Basic <base64(api_key:)>`
-- Body: `{}`
-- Log: `CURSOR_USAGE_LOG`
-
-## Custom provider profiles (config)
-`config.json` supports `profiles` to add any provider via endpoint + auth header:
-
-```json
-{
-  "profiles": [
-    {
-      "id": "my_provider",
-      "label": "My Provider",
-      "endpoint": "https://example.com/usage",
-      "auth_header": "Authorization",
-      "api_key": "token"
-    }
-  ]
-}
-```
-
-If `auth_header` is `Authorization`, UsageGuard sends `Bearer <api_key>`.
+- custom endpoint overrides are ignored and purged on load
+- legacy custom provider profiles are not used for outbound fetches
+- the desktop provider picker exposes only providers with built-in audited endpoints
