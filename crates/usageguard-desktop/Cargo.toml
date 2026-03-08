@@ -12,6 +12,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono.workspace = true
 usageguard-core = { path = "../usageguard-core" }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+open = "5"
+reqwest.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = "4"

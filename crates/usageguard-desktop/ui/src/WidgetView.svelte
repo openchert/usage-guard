@@ -12,7 +12,7 @@
     tokens_in: number | null;
     tokens_out: number | null;
     inactive_hours: number | null;
-    source: string;
+    source: string; // "api" | "oauth" | "oauth-error:*" | "demo" | …
   }
 
   const CARD_W = 110;
@@ -32,6 +32,21 @@
     return providerMeta(snapshot.provider).label;
   }
 
+  function cardTitle(snapshot: UsageSnapshot): string {
+    if (snapshot.source !== 'oauth') return displayLabel(snapshot);
+
+    const primaryUsed = snapshot.tokens_in ?? 0;
+    const secondaryUsed = snapshot.spent_usd ?? 0;
+    const primaryLeft = Math.round(oauthRemainingRatio(primaryUsed) * 100);
+    const secondaryLeft = Math.round(oauthRemainingRatio(secondaryUsed) * 100);
+
+    return [
+      displayLabel(snapshot),
+      `5h used: ${primaryUsed}% | left: ${primaryLeft}%`,
+      `week used: ${secondaryUsed}% | left: ${secondaryLeft}%`,
+    ].join('\n');
+  }
+
   function sorted(items: UsageSnapshot[]): UsageSnapshot[] {
     return [...items].sort((a, b) => {
       return providerRank(a.provider) - providerRank(b.provider)
@@ -39,17 +54,31 @@
     });
   }
 
+  function oauthRemainingRatio(percent: number | null): number {
+    if (percent == null || !Number.isFinite(percent)) return 0;
+    return Math.min(1, Math.max(0, 1 - percent / 100));
+  }
+
   function weekRatio(snapshot: UsageSnapshot): number {
+    // OAuth: spent_usd holds secondary_window used_percent (0–100).
+    // Show REMAINING capacity so the ring drains as the limit is consumed.
+    if (snapshot.source === 'oauth') {
+      return oauthRemainingRatio(snapshot.spent_usd);
+    }
     if (snapshot.limit_usd && snapshot.limit_usd > 0 && snapshot.spent_usd != null) {
       return Math.min(1, snapshot.spent_usd / snapshot.limit_usd);
     }
-
     const total = (snapshot.tokens_in ?? 0) + (snapshot.tokens_out ?? 0);
     if (total > 0) return Math.min(1, total / 1_200_000);
     return 0;
   }
 
   function fiveHourRatio(snapshot: UsageSnapshot): number {
+    // OAuth: tokens_in holds primary_window used_percent (0–100).
+    // Show REMAINING capacity so the ring drains as the limit is consumed.
+    if (snapshot.source === 'oauth') {
+      return oauthRemainingRatio(snapshot.tokens_in);
+    }
     const weekly = weekRatio(snapshot);
     const inactive = snapshot.inactive_hours ?? 0;
     const activeFactor = Math.max(0.2, 1 - Math.min(inactive, 24) / 24);
@@ -139,14 +168,14 @@
 </script>
 
 <div class="widget-shell" on:mousedown={startDrag} role="presentation">
-  {#if snapshots.length === 0}
+  {#if snapshots.length === 0 && !isLoading}
     <div class="empty-state">
-      <span class="empty-copy">{isLoading ? 'Loading usage...' : 'No usage sources yet. Right-click for settings.'}</span>
+      <span class="empty-copy">Right-click to connect a provider</span>
     </div>
   {:else}
     {#each snapshots as snapshot}
       {@const provider = providerMeta(snapshot.provider)}
-      <div class="provider-card">
+      <div class="provider-card" title={cardTitle(snapshot)}>
         <span class="card-name">{displayLabel(snapshot)}</span>
         <div class="rings">
           <UsageRing ratio={fiveHourRatio(snapshot)} accent={provider.color} label="5h" theme={provider.usageRing} />

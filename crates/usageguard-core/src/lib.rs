@@ -312,6 +312,264 @@ pub fn has_provider_account_api_key(account_id: &str) -> bool {
     get_provider_account_api_key(account_id).is_some()
 }
 
+// --- OpenAI OAuth token storage (file-based) ---
+//
+// We avoid the OS keyring for OAuth tokens because the colon-separated
+// credential names (service:account) clash with Windows Credential Manager's
+// own separator, making reads unreliable.  A small JSON file in the same
+// config directory as config.json is simpler and equally protected by OS
+// file-system permissions (same approach used by GitHub CLI, AWS CLI, etc.).
+
+fn oauth_tokens_path() -> Result<PathBuf> {
+    let base = dirs::config_dir().context("Unable to resolve config directory")?;
+    Ok(base.join("usage-guard").join("oauth_tokens.json"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OAuthTokenFile {
+    #[serde(default)]
+    openai_access_token: String,
+    #[serde(default)]
+    openai_refresh_token: String,
+    #[serde(default)]
+    openai_account_id: String,
+    #[serde(default)]
+    openai_plan_type: String,
+}
+
+fn load_oauth_file() -> OAuthTokenFile {
+    let path = match oauth_tokens_path() {
+        Ok(p) => p,
+        Err(_) => return OAuthTokenFile::default(),
+    };
+    if !path.exists() {
+        return OAuthTokenFile::default();
+    }
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+fn save_oauth_file(file: &OAuthTokenFile) -> Result<()> {
+    let path = oauth_tokens_path()?;
+    let dir = path.parent().context("Config parent directory missing")?;
+    fs::create_dir_all(dir)?;
+    fs::write(&path, serde_json::to_string_pretty(file)?)?;
+    Ok(())
+}
+
+pub fn get_openai_oauth_access_token() -> Option<String> {
+    let t = load_oauth_file();
+    if t.openai_access_token.is_empty() {
+        None
+    } else {
+        Some(t.openai_access_token)
+    }
+}
+
+pub fn get_openai_oauth_plan_type() -> Option<String> {
+    let t = load_oauth_file();
+    if t.openai_plan_type.is_empty() {
+        None
+    } else {
+        Some(t.openai_plan_type)
+    }
+}
+
+pub fn set_openai_oauth_tokens(
+    access: &str,
+    refresh: &str,
+    account_id: &str,
+    plan_type: &str,
+) -> Result<()> {
+    let mut file = load_oauth_file();
+    file.openai_access_token = access.to_string();
+    if !refresh.is_empty() {
+        file.openai_refresh_token = refresh.to_string();
+    }
+    file.openai_account_id = account_id.to_string();
+    if !plan_type.is_empty() {
+        file.openai_plan_type = plan_type.to_string();
+    }
+    save_oauth_file(&file)
+}
+
+pub fn clear_openai_oauth_tokens() {
+    if let Ok(path) = oauth_tokens_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Returns the raw JSON string from wham/usage for debugging, or an error string.
+pub fn debug_openai_oauth_fetch() -> String {
+    let tokens = load_oauth_file();
+    if tokens.openai_access_token.is_empty() {
+        return "No access token stored".to_string();
+    }
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("Client build error: {e}"),
+    };
+    let mut req = client
+        .get("https://chatgpt.com/backend-api/wham/usage")
+        .bearer_auth(&tokens.openai_access_token)
+        .header("Accept", "application/json");
+    if !tokens.openai_account_id.is_empty() {
+        req = req.header("ChatGPT-Account-Id", &tokens.openai_account_id);
+    }
+    match req.send() {
+        Err(e) => format!("Request error: {e}"),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_else(|e| format!("<body read error: {e}>"));
+            format!("HTTP {status}\n{body}")
+        }
+    }
+}
+
+pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
+    let tokens = load_oauth_file();
+    if tokens.openai_access_token.is_empty() {
+        return None;
+    }
+
+    match do_fetch_wham_usage(&tokens.openai_access_token, &tokens.openai_account_id) {
+        Ok(snapshot) => Some(snapshot),
+        Err(e) => {
+            eprintln!("[usageguard] wham/usage failed: {e}");
+            // Token may be expired — try to refresh once
+            match try_refresh_oauth_token() {
+                Ok(new_access) => match do_fetch_wham_usage(&new_access, &tokens.openai_account_id) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(e2) => {
+                        eprintln!("[usageguard] wham/usage after refresh failed: {e2}");
+                        Some(error_snapshot("openai", "ChatGPT", format!("oauth-error:{e2}")))
+                    }
+                },
+                Err(e_refresh) => {
+                    eprintln!("[usageguard] token refresh failed: {e_refresh}");
+                    Some(error_snapshot("openai", "ChatGPT", format!("oauth-error:{e}")))
+                }
+            }
+        }
+    }
+}
+
+fn try_refresh_oauth_token() -> Result<String> {
+    let tokens = load_oauth_file();
+    if tokens.openai_refresh_token.is_empty() {
+        return Err(anyhow!("No refresh token stored"));
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", tokens.openai_refresh_token.as_str()),
+        ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
+    ];
+
+    let resp: Value = client
+        .post("https://auth.openai.com/oauth/token")
+        .form(&params)
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    let new_access = resp["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No access_token in refresh response"))?
+        .to_string();
+
+    let mut file = load_oauth_file();
+    file.openai_access_token = new_access.clone();
+    if let Some(new_refresh) = resp["refresh_token"].as_str() {
+        file.openai_refresh_token = new_refresh.to_string();
+    }
+    let _ = save_oauth_file(&file);
+
+    Ok(new_access)
+}
+
+fn do_fetch_wham_usage(access_token: &str, account_id: &str) -> Result<UsageSnapshot> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()?;
+
+    let mut req = client
+        .get("https://chatgpt.com/backend-api/wham/usage")
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .header("User-Agent", "opencode/0.1");
+
+    if !account_id.is_empty() {
+        req = req.header("ChatGPT-Account-Id", account_id);
+    }
+
+    let resp = req.send()?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(anyhow!("HTTP {status}: {body}"));
+    }
+    let value: Value = resp.json()?;
+    parse_wham_usage_response(&value)
+}
+
+fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
+    let plan_type = value["plan_type"].as_str().unwrap_or("unknown").to_string();
+
+    // Persist updated plan type
+    let mut file = load_oauth_file();
+    file.openai_plan_type = plan_type.clone();
+    let _ = save_oauth_file(&file);
+
+    // primary_window  = shorter window (e.g. 5 hours)  → maps to the "5h" ring
+    // secondary_window = longer window (e.g. 1 week)   → maps to the "week" ring
+    // Try nested path first (/rate_limit/…), then flat path (/primary_window/…)
+    let primary_percent = value
+        .pointer("/rate_limit/primary_window/used_percent")
+        .or_else(|| value.pointer("/primary_window/used_percent"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let secondary_percent = value
+        .pointer("/rate_limit/secondary_window/used_percent")
+        .or_else(|| value.pointer("/secondary_window/used_percent"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(primary_percent); // fall back to primary if secondary is absent/null
+
+    eprintln!("[usageguard] wham parsed: primary={primary_percent:.1}% secondary={secondary_percent:.1}% plan={plan_type}");
+
+    // Capitalise first letter: "pro" → "Pro"
+    let plan_display: String = {
+        let mut chars = plan_type.chars();
+        match chars.next() {
+            None => String::new(),
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        }
+    };
+
+    // Ring encoding for oauth snapshots (read back in WidgetView fiveHourRatio /
+    // weekRatio).  We store both windows as plain 0–100 percentages:
+    //   spent_usd / limit_usd(100) = secondary %  → week ring (outer/right)
+    //   tokens_in                  = primary %     → 5h ring  (inner/left)
+    Ok(UsageSnapshot {
+        provider: "openai".into(),
+        account_label: format!("ChatGPT {plan_display}"),
+        spent_usd: secondary_percent, // week ring = secondary / 100
+        limit_usd: 100.0,
+        tokens_in: primary_percent.round() as u64, // 5h ring reads this directly
+        tokens_out: 0,
+        inactive_hours: 0,
+        source: "oauth".to_string(),
+    })
+}
+
 fn resolve_provider_api_key(
     provider_id: &str,
     config_value: Option<String>,
@@ -611,7 +869,15 @@ fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec
 }
 
 pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
-    let mut items: Vec<UsageSnapshot> = if cfg.provider_accounts.is_empty() {
+    let mut items: Vec<UsageSnapshot> = vec![];
+
+    // OAuth subscriptions first (ChatGPT Plus/Pro via wham/usage)
+    if let Some(s) = fetch_openai_oauth_usage() {
+        items.push(s);
+    }
+
+    // API-key / env sources
+    let api_items: Vec<UsageSnapshot> = if cfg.provider_accounts.is_empty() {
         build_legacy_provider_specs(cfg)
             .into_iter()
             .filter_map(fetch_provider_snapshot)
@@ -623,19 +889,15 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
             .filter_map(fetch_provider_snapshot)
             .collect()
     };
+    items.extend(api_items);
 
     for profile in &cfg.profiles {
-        let snapshot = fetch_custom_profile(profile);
-        if let Some(s) = snapshot {
+        if let Some(s) = fetch_custom_profile(profile) {
             items.push(s);
         }
     }
 
-    if items.is_empty() {
-        demo_snapshots()
-    } else {
-        items
-    }
+    items
 }
 
 fn fetch_custom_profile(profile: &ProviderProfile) -> Option<UsageSnapshot> {

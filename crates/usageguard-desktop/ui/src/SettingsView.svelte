@@ -35,6 +35,11 @@
     apiKey: string;
   }
 
+  interface OAuthStatus {
+    connected: boolean;
+    plan_type: string | null;
+  }
+
   let providers = [] as ProviderCatalogEntry[];
   let accounts = [] as ProviderAccountView[];
   let form = {
@@ -46,8 +51,10 @@
   } as ProviderForm;
   let isLoading = true;
   let isSaving = false;
+  let isConnecting = false;
   let errorMessage = '';
   let successMessage = '';
+  let oauthStatus: OAuthStatus = { connected: false, plan_type: null };
 
   function resetForm(providerId = form.provider || providers[0]?.id || ''): void {
     form = {
@@ -132,13 +139,55 @@
 
     isLoading = true;
     try {
-      const payload = await invoke('get_provider_settings') as ProviderSettingsPayload;
+      const [payload, status] = await Promise.all([
+        invoke('get_provider_settings') as Promise<ProviderSettingsPayload>,
+        invoke('get_openai_oauth_status') as Promise<OAuthStatus>,
+      ]);
       applyPayload(payload);
+      oauthStatus = status;
       if (!form.provider) resetForm(payload.providers[0]?.id ?? '');
     } catch (error) {
       errorMessage = String(error);
     } finally {
       isLoading = false;
+    }
+  }
+
+  async function connectOAuth(): Promise<void> {
+    if (!invoke || isConnecting) return;
+    isConnecting = true;
+    errorMessage = '';
+    successMessage = '';
+    try {
+      const planType = await invoke('connect_openai_oauth') as string;
+      oauthStatus = { connected: true, plan_type: planType };
+      successMessage = `ChatGPT ${planType} connected.`;
+    } catch (error) {
+      errorMessage = String(error);
+    } finally {
+      isConnecting = false;
+    }
+  }
+
+  async function disconnectOAuth(): Promise<void> {
+    if (!invoke) return;
+    try {
+      await invoke('disconnect_openai_oauth');
+      oauthStatus = { connected: false, plan_type: null };
+    } catch (error) {
+      errorMessage = String(error);
+    }
+  }
+
+  async function debugOAuth(): Promise<void> {
+    if (!invoke) return;
+    const result = await invoke('debug_openai_oauth') as string;
+    try {
+      await navigator.clipboard.writeText(result);
+      successMessage = 'Debug output copied to clipboard.';
+    } catch {
+      // Clipboard not available — fall back to alert
+      window.alert(result);
     }
   }
 
@@ -226,6 +275,30 @@
     </header>
 
     <div class="body">
+      <!-- ChatGPT OAuth connection -->
+      <div class="oauth-row" class:oauth-connected={oauthStatus.connected}>
+        <div class="account-dot" style="--accent:{oauthStatus.connected ? '#10a37f' : 'rgba(255,255,255,0.2)'}"></div>
+        {#if oauthStatus.connected}
+          <div class="account-info">
+            <span class="account-name">ChatGPT {oauthStatus.plan_type ?? ''}</span>
+            <span class="account-vendor">Subscription</span>
+          </div>
+          <button class="link-btn" type="button" on:click={debugOAuth} title="Show raw API response">Debug</button>
+          <button class="link-btn" type="button" on:click={disconnectOAuth}>Disconnect</button>
+        {:else if isConnecting}
+          <div class="account-info">
+            <span class="account-vendor">Waiting for browser sign-in…</span>
+          </div>
+        {:else}
+          <div class="account-info">
+            <span class="account-vendor">ChatGPT Plus / Pro subscription</span>
+          </div>
+          <button class="save-btn" type="button" on:click={connectOAuth}>Sign in</button>
+        {/if}
+      </div>
+
+      <div class="divider"></div>
+
       <!-- Account list -->
       {#if isLoading}
         <div class="placeholder">Loading…</div>
@@ -414,6 +487,18 @@
     overflow: hidden;
     padding: 10px 10px 10px;
     gap: 8px;
+  }
+
+  /* ChatGPT OAuth row */
+  .oauth-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.02);
+    flex-shrink: 0;
   }
 
   /* Account list */

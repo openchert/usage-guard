@@ -172,7 +172,7 @@ fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
     }
 
     const SETTINGS_W: f64 = 360.0;
-    const SETTINGS_H: f64 = 480.0;
+    const SETTINGS_H: f64 = 540.0;
     const GAP: f64 = 8.0;
 
     // Position the settings window just above the main widget, right-aligned.
@@ -560,6 +560,244 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
     }
 }
 
+// --- OpenAI OAuth PKCE helpers ---
+
+const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_OAUTH_REDIRECT: &str = "http://localhost:1455/auth/callback";
+
+fn pkce_verifier() -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
+/// Blocks until the browser hits the local callback, or 5 minutes elapse.
+fn wait_for_callback() -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:1455")
+        .map_err(|e| format!("Port 1455 unavailable: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| e.to_string())?;
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err("Timed out waiting for browser sign-in (5 minutes)".into());
+        }
+
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                let mut reader = BufReader::new(&stream);
+
+                // Read first line: "GET /auth/callback?code=...&... HTTP/1.1"
+                let mut first_line = String::new();
+                let _ = reader.read_line(&mut first_line);
+
+                // Drain remaining request headers so the browser isn't left hanging
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if line == "\r\n" => break,
+                        _ => {}
+                    }
+                }
+
+                let code = first_line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.split('?').nth(1))
+                    .and_then(|qs| {
+                        qs.split('&')
+                            .find(|p| p.starts_with("code="))
+                            .map(|p| p["code=".len()..].to_string())
+                    })
+                    .ok_or_else(|| "No code parameter in callback URL".to_string())?;
+
+                let body = "<html><body><h2>Connected to UsageGuard. You can close this tab.</h2></body></html>";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                return Ok(code);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Exchanges the auth code for access + refresh tokens.
+fn exchange_code(code: &str, verifier: &str) -> Result<(String, String, String), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("code_verifier", verifier),
+        ("redirect_uri", OPENAI_OAUTH_REDIRECT),
+        ("client_id", OPENAI_OAUTH_CLIENT_ID),
+    ];
+
+    let resp: serde_json::Value = client
+        .post("https://auth.openai.com/oauth/token")
+        .form(&params)
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+
+    let access = resp["access_token"]
+        .as_str()
+        .ok_or("No access_token in response")?
+        .to_string();
+    let refresh = resp["refresh_token"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Extract chatgpt_account_id from id_token JWT payload (no signature verify needed)
+    let account_id = resp["id_token"]
+        .as_str()
+        .and_then(decode_chatgpt_account_id)
+        .unwrap_or_default();
+
+    Ok((access, refresh, account_id))
+}
+
+fn decode_chatgpt_account_id(jwt: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+
+    // Try the direct claim, then the namespaced claim, then organizations array
+    payload["chatgpt_account_id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .or_else(|| {
+            payload["https://api.openai.com/auth.chatgpt_account_id"]
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            payload["organizations"]
+                .as_array()?
+                .first()?
+                .get("id")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+}
+
+#[tauri::command]
+async fn connect_openai_oauth(app: AppHandle) -> Result<String, String> {
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+    // OpenAI requires state to be at least 8 characters
+    let state = pkce_verifier();
+
+    let auth_url = format!(
+        "https://auth.openai.com/oauth/authorize\
+         ?response_type=code\
+         &client_id={OPENAI_OAUTH_CLIENT_ID}\
+         &redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback\
+         &scope=openid%20profile%20email%20offline_access\
+         &code_challenge={challenge}\
+         &code_challenge_method=S256\
+         &state={state}\
+         &id_token_add_organizations=true\
+         &codex_cli_simplified_flow=true"
+    );
+
+    open::that(&auth_url).map_err(|e| format!("Could not open browser: {e}"))?;
+
+    // Wait for the browser redirect on port 1455 (blocks up to 5 min)
+    let code = tauri::async_runtime::spawn_blocking(wait_for_callback)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e)?;
+
+    // Exchange the code for tokens (blocking HTTP)
+    let (access, refresh, account_id) = {
+        let code = code.clone();
+        let verifier = verifier.clone();
+        tauri::async_runtime::spawn_blocking(move || exchange_code(&code, &verifier))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e)?
+    };
+
+    // Persist tokens; plan_type will be populated on first usage fetch
+    usageguard_core::set_openai_oauth_tokens(&access, &refresh, &account_id, "")
+        .map_err(|e| e.to_string())?;
+
+    // Immediately fetch usage so the plan_type lands in keyring
+    let plan_type = tauri::async_runtime::spawn_blocking(
+        usageguard_core::fetch_openai_oauth_usage,
+    )
+    .await
+    .ok()
+    .flatten()
+    .and_then(|_| usageguard_core::get_openai_oauth_plan_type())
+    .unwrap_or_else(|| "connected".to_string());
+
+    emit_widget_refresh(&app);
+    Ok(plan_type)
+}
+
+#[tauri::command]
+fn disconnect_openai_oauth(app: AppHandle) {
+    usageguard_core::clear_openai_oauth_tokens();
+    emit_widget_refresh(&app);
+}
+
+#[derive(Serialize)]
+struct OAuthStatus {
+    connected: bool,
+    plan_type: Option<String>,
+}
+
+#[tauri::command]
+fn debug_openai_oauth() -> String {
+    usageguard_core::debug_openai_oauth_fetch()
+}
+
+#[tauri::command]
+fn get_openai_oauth_status() -> OAuthStatus {
+    let connected = usageguard_core::get_openai_oauth_access_token().is_some();
+    let plan_type = if connected {
+        usageguard_core::get_openai_oauth_plan_type().filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    OAuthStatus { connected, plan_type }
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -664,6 +902,10 @@ fn main() {
             quit,
             show_context_menu,
             set_window_rect,
+            connect_openai_oauth,
+            disconnect_openai_oauth,
+            get_openai_oauth_status,
+            debug_openai_oauth,
         ])
         .run(tauri::generate_context!())
         .expect("error running tauri application");
