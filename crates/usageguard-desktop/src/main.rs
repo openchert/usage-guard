@@ -173,6 +173,7 @@ fn emit_widget_refresh(app: &AppHandle) {
 
 fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
+        let _ = win.set_always_on_top(true);
         let _ = win.show();
         let _ = win.set_focus();
         return Ok(());
@@ -205,7 +206,7 @@ fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
     .resizable(false)
     .decorations(false)
     .transparent(true)
-    .always_on_top(false)
+    .always_on_top(true)
     .skip_taskbar(false)
     .shadow(false)
     .maximizable(false)
