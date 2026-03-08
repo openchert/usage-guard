@@ -1,3 +1,7 @@
 /target
+/target_codex*/
+**/target_codex*/
 .DS_Store
 /dist
+/crates/usageguard-desktop/gen/
+/crates/usageguard-desktop/icons/

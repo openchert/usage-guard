@@ -126,12 +126,18 @@ fn main() {
             if show
                 || (!has_openai_arg && !has_anthropic_arg && !has_openai_ep && !has_anthropic_ep)
             {
+                let openai_ep = cfg.api.openai_costs_endpoint.as_deref()
+                    .map(|s| format!("\"{}\"", s))
+                    .unwrap_or_else(|| "null".to_string());
+                let anthropic_ep = cfg.api.anthropic_costs_endpoint.as_deref()
+                    .map(|s| format!("\"{}\"", s))
+                    .unwrap_or_else(|| "null".to_string());
                 println!(
-                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"openai_endpoint\": {:?},\n  \"anthropic_endpoint\": {:?},\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
+                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"openai_endpoint\": {},\n  \"anthropic_endpoint\": {},\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
                     has_provider_api_key("openai") || cfg.api.openai_api_key.is_some(),
                     has_provider_api_key("anthropic") || cfg.api.anthropic_api_key.is_some(),
-                    cfg.api.openai_costs_endpoint,
-                    cfg.api.anthropic_costs_endpoint,
+                    openai_ep,
+                    anthropic_ep,
                     cfg.near_limit_ratio,
                     cfg.inactive_threshold_hours
                 );

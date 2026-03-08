@@ -1,106 +1,166 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use chrono::Local;
-use eframe::egui;
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use tauri::{
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State, WebviewWindow,
+};
 use usageguard_core::{
     evaluate_alerts, load_config, provider_snapshots, save_config, set_provider_api_key,
-    should_notify, Alert, AppConfig, UsageSnapshot,
+    should_notify, AppConfig, UsageSnapshot,
 };
 
-struct UsageGuardApp {
-    cfg: AppConfig,
-    snapshots: Vec<UsageSnapshot>,
-    expanded: HashSet<String>,
-    show_connect: bool,
-    openai_key_input: String,
-    anthropic_key_input: String,
-    openai_endpoint_input: String,
-    anthropic_endpoint_input: String,
-    status: String,
-    last_updated: String,
-    last_notified_signature: HashMap<String, String>,
-    notification_line: String,
+struct AppState {
+    cfg: Mutex<AppConfig>,
+    last_notified: Mutex<HashMap<String, String>>,
 }
 
-impl Default for UsageGuardApp {
-    fn default() -> Self {
-        let cfg = load_config().unwrap_or_default();
-        let mut app = Self {
-            openai_key_input: cfg.api.openai_api_key.clone().unwrap_or_default(),
-            anthropic_key_input: cfg.api.anthropic_api_key.clone().unwrap_or_default(),
-            openai_endpoint_input: cfg.api.openai_costs_endpoint.clone().unwrap_or_default(),
-            anthropic_endpoint_input: cfg.api.anthropic_costs_endpoint.clone().unwrap_or_default(),
-            cfg,
-            snapshots: Vec::new(),
-            expanded: HashSet::new(),
-            show_connect: false,
-            status: String::new(),
-            last_updated: "never".to_string(),
-            last_notified_signature: HashMap::new(),
-            notification_line: String::new(),
-        };
-        app.refresh();
-        app
+const TRAY_TOGGLE_ID: &str = "tray.toggle";
+const TRAY_QUIT_ID: &str = "tray.quit";
+const CTX_REFRESH_ID: &str = "widget.refresh";
+const CTX_ALWAYS_ON_TOP_ID: &str = "widget.always_on_top";
+const CTX_HIDE_ID: &str = "widget.hide";
+const CTX_QUIT_ID: &str = "widget.quit";
+const REFRESH_EVENT: &str = "usageguard://refresh";
+
+#[tauri::command]
+fn get_snapshots(state: State<AppState>) -> Vec<UsageSnapshot> {
+    let cfg = state.cfg.lock().unwrap().clone();
+    let snapshots = provider_snapshots(&cfg);
+    fire_notifications(&snapshots, &cfg, &mut state.last_notified.lock().unwrap());
+    snapshots
+}
+
+#[tauri::command]
+fn get_config(state: State<AppState>) -> AppConfig {
+    state.cfg.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn save_api_key(provider: String, key: String) -> Result<(), String> {
+    set_provider_api_key(&provider, Some(&key)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_config(config: AppConfig, state: State<AppState>) -> Result<(), String> {
+    save_config(&config).map_err(|e| e.to_string())?;
+    *state.cfg.lock().unwrap() = config;
+    Ok(())
+}
+
+#[tauri::command]
+fn quit(app: AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
+fn show_context_menu(window: WebviewWindow, x: f64, y: f64) -> Result<(), String> {
+    let menu = create_widget_menu(&window).map_err(|e| e.to_string())?;
+    window
+        .popup_menu_at(&menu, tauri::LogicalPosition::new(x, y))
+        .map_err(|e| e.to_string())
+}
+
+/// Inline FFI bindings — no external crate needed, user32.dll is always present.
+#[cfg(target_os = "windows")]
+mod win32 {
+    pub const SWP_NOACTIVATE: u32 = 0x0010;
+    pub const SWP_NOZORDER: u32 = 0x0004;
+    pub const SPI_GETWORKAREA: u32 = 0x0030;
+
+    #[repr(C)]
+    pub struct Rect {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn SetWindowPos(
+            hwnd: isize,
+            hwnd_insert_after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+
+        /// Retrieves system-wide parameters. Used here with SPI_GETWORKAREA to get
+        /// the usable desktop area, which excludes the taskbar.
+        pub fn SystemParametersInfoW(
+            ui_action: u32,
+            ui_param: u32,
+            pv_param: *mut std::ffi::c_void,
+            f_win_ini: u32,
+        ) -> i32;
     }
 }
 
-impl UsageGuardApp {
-    fn refresh(&mut self) {
-        self.snapshots = provider_snapshots(&self.cfg);
-        self.last_updated = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        self.evaluate_notification_state();
-    }
-
-    fn evaluate_notification_state(&mut self) {
-        let mut lines = Vec::new();
-
-        for s in &self.snapshots {
-            let alerts = evaluate_alerts(s, &self.cfg);
-            let should = should_notify(&alerts, Local::now(), &self.cfg);
-            if !should || alerts.is_empty() {
-                continue;
+/// Set window position and size in a single atomic OS call.
+/// On Windows, SetWindowPos sets both in one call so DWM never composites an
+/// intermediate frame — the previous two-call approach caused a one-frame flash.
+/// Caller passes physical (device) pixel values.
+#[tauri::command]
+fn set_window_rect(window: tauri::WebviewWindow, x: i32, y: i32, w: i32, h: i32) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe {
+                win32::SetWindowPos(
+                    hwnd.0 as isize,
+                    0,
+                    x,
+                    y,
+                    w,
+                    h,
+                    win32::SWP_NOACTIVATE | win32::SWP_NOZORDER,
+                );
             }
-
-            let signature = alert_signature(&alerts);
-            let key = s.provider.clone();
-            let changed = self
-                .last_notified_signature
-                .get(&key)
-                .map(|x| x != &signature)
-                .unwrap_or(true);
-
-            if changed {
-                self.last_notified_signature.insert(key, signature);
-                let msg = format!("{}: {}", s.provider, alerts[0].message);
-                emit_native_notification("UsageGuard alert", &msg);
-                lines.push(msg);
-            }
         }
-
-        self.notification_line = lines.join(" | ");
     }
-
-    fn validate_inputs(&self) -> Result<(), String> {
-        if !self.openai_endpoint_input.trim().is_empty()
-            && !self.openai_endpoint_input.starts_with("https://")
-        {
-            return Err("OpenAI endpoint must start with https://".to_string());
-        }
-        if !self.anthropic_endpoint_input.trim().is_empty()
-            && !self.anthropic_endpoint_input.starts_with("https://")
-        {
-            return Err("Anthropic endpoint must start with https://".to_string());
-        }
-        Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+        let _ = window.set_size(tauri::PhysicalSize::new(w.max(0) as u32, h.max(0) as u32));
     }
 }
 
-fn alert_signature(alerts: &[Alert]) -> String {
-    alerts
-        .iter()
-        .map(|a| format!("{}:{}", a.level, a.code))
-        .collect::<Vec<_>>()
-        .join(",")
+fn fire_notifications(
+    snapshots: &[UsageSnapshot],
+    cfg: &AppConfig,
+    last_notified: &mut HashMap<String, String>,
+) {
+    for s in snapshots {
+        if s.source == "demo" {
+            continue;
+        }
+        let alerts = evaluate_alerts(s, cfg);
+        if !should_notify(&alerts, Local::now(), cfg) {
+            continue;
+        }
+        let sig = alerts
+            .iter()
+            .map(|a| format!("{}:{}", a.level, a.code))
+            .collect::<Vec<_>>()
+            .join(",");
+        let changed = last_notified
+            .get(&s.provider)
+            .map(|x| x != &sig)
+            .unwrap_or(true);
+        if changed {
+            last_notified.insert(s.provider.clone(), sig);
+            emit_native_notification(
+                "UsageGuard",
+                &format!("{}: {}", s.account_label, alerts[0].message),
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -128,208 +188,184 @@ fn emit_native_notification(title: &str, body: &str) {
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn emit_native_notification(_title: &str, _body: &str) {}
 
-fn forecast_eta_to_limit(snapshot: &UsageSnapshot) -> Option<String> {
-    if snapshot.limit_usd <= snapshot.spent_usd || snapshot.limit_usd <= 0.0 {
-        return None;
+fn create_tray_icon() -> tauri::image::Image<'static> {
+    const W: u32 = 16;
+    const H: u32 = 16;
+    let mut data = vec![0u8; (W * H * 4) as usize];
+    let half = W as i32 / 2;
+    let r2 = (half - 1).pow(2);
+    for y in 0..H as i32 {
+        for x in 0..W as i32 {
+            let idx = ((y * W as i32 + x) * 4) as usize;
+            let dx = x - half;
+            let dy = y - half;
+            if dx * dx + dy * dy <= r2 {
+                data[idx] = 100;
+                data[idx + 1] = 160;
+                data[idx + 2] = 255;
+                data[idx + 3] = 220;
+            }
+        }
     }
-    let burn_env = format!(
-        "{}_BURN_USD_PER_HOUR",
-        snapshot.provider.to_uppercase().replace('-', "_")
-    );
-    let burn_rate = std::env::var(&burn_env)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())?;
-    if burn_rate <= 0.0 {
-        return None;
-    }
-    let remaining = snapshot.limit_usd - snapshot.spent_usd;
-    let eta_hours = remaining / burn_rate;
-    if eta_hours.is_finite() && eta_hours > 0.0 {
-        Some(format!("ETA to limit: {:.1}h", eta_hours))
-    } else {
-        None
+    // Leak into 'static so Image<'static> can borrow it
+    let data: &'static [u8] = Box::leak(data.into_boxed_slice());
+    tauri::image::Image::new(data, W, H)
+}
+
+fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>> {
+    let app = window.app_handle();
+    let always_on_top = window.is_always_on_top().unwrap_or(true);
+    let first_sep = PredefinedMenuItem::separator(app)?;
+    let second_sep = PredefinedMenuItem::separator(app)?;
+
+    Menu::with_items(
+        app,
+        &[
+            &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
+            &first_sep,
+            &CheckMenuItem::with_id(
+                app,
+                CTX_ALWAYS_ON_TOP_ID,
+                "Always on Top",
+                true,
+                always_on_top,
+                None::<&str>,
+            )?,
+            &MenuItem::with_id(app, CTX_HIDE_ID, "Hide to Tray", true, None::<&str>)?,
+            &second_sep,
+            &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
+        ],
+    )
+}
+
+fn toggle_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        if win.is_visible().unwrap_or(false) {
+            let _ = win.hide();
+        } else {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
     }
 }
 
-impl eframe::App for UsageGuardApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_secs(30));
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-
-            let drag_resp =
-                ui.add(egui::Label::new("UsageGuard").sense(egui::Sense::click_and_drag()));
-            if drag_resp.dragged() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+fn handle_menu_event(app: &AppHandle, id: &str) {
+    match id {
+        TRAY_TOGGLE_ID => toggle_window(app),
+        TRAY_QUIT_ID | CTX_QUIT_ID => app.exit(0),
+        CTX_REFRESH_ID => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit(REFRESH_EVENT, ());
             }
-
-            ui.horizontal(|ui| {
-                if ui.button("Refresh").clicked() {
-                    self.refresh();
+        }
+        CTX_ALWAYS_ON_TOP_ID => {
+            if let Some(win) = app.get_webview_window("main") {
+                if let Ok(current) = win.is_always_on_top() {
+                    let _ = win.set_always_on_top(!current);
                 }
-                ui.small(format!("Last updated: {}", self.last_updated));
+            }
+        }
+        CTX_HIDE_ID => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.hide();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn main() {
+    tauri::Builder::default()
+        .setup(|app| {
+            let cfg = load_config().unwrap_or_default();
+            app.manage(AppState {
+                cfg: Mutex::new(cfg),
+                last_notified: Mutex::new(HashMap::new()),
             });
 
-            if !self.notification_line.is_empty() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 180, 90),
-                    format!("Alert: {}", self.notification_line),
-                );
-            }
+            // Position widget at bottom-right of the work area (excludes taskbar on Windows)
+            if let Some(win) = app.get_webview_window("main") {
+                if let Ok(Some(monitor)) = win.current_monitor() {
+                    let scale = monitor.scale_factor();
 
-            ui.small("Idle mode: bars only. Click a provider row to show details.");
-
-            for s in &self.snapshots {
-                let alerts = evaluate_alerts(s, &self.cfg);
-                let percent = if s.limit_usd > 0.0 {
-                    (s.spent_usd / s.limit_usd).clamp(0.0, 1.2)
-                } else {
-                    0.0
-                };
-
-                let is_expanded = self.expanded.contains(&s.provider);
-
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        let label = if is_expanded {
-                            format!("▼ {}", s.provider)
-                        } else {
-                            format!("▶ {}", s.provider)
+                    // On Windows, use SystemParametersInfo(SPI_GETWORKAREA) so the widget
+                    // lands above the taskbar instead of behind it.
+                    #[cfg(target_os = "windows")]
+                    let (area_w, area_h) = {
+                        let mut rect = win32::Rect {
+                            left: 0,
+                            top: 0,
+                            right: 0,
+                            bottom: 0,
                         };
-                        if ui.button(label).clicked() {
-                            if is_expanded {
-                                self.expanded.remove(&s.provider);
-                            } else {
-                                self.expanded.insert(s.provider.clone());
-                            }
+                        unsafe {
+                            win32::SystemParametersInfoW(
+                                win32::SPI_GETWORKAREA,
+                                0,
+                                &mut rect as *mut _ as *mut _,
+                                0,
+                            );
                         }
-                        if s.source.starts_with("api-error:") {
-                            ui.colored_label(egui::Color32::from_rgb(220, 130, 80), "API error");
-                        }
-                    });
+                        (rect.right as f64 / scale, rect.bottom as f64 / scale)
+                    };
 
-                    ui.add(egui::ProgressBar::new(percent as f32).show_percentage());
+                    #[cfg(not(target_os = "windows"))]
+                    let (area_w, area_h) = {
+                        let size = monitor.size();
+                        (size.width as f64 / scale, size.height as f64 / scale)
+                    };
 
-                    if is_expanded {
-                        ui.label(format!("${:.2}/${:.2}", s.spent_usd, s.limit_usd));
-                        ui.label(format!("tokens in={} out={}", s.tokens_in, s.tokens_out));
-                        ui.label(format!("inactive {}h", s.inactive_hours));
-                        ui.small(format!("source: {}", s.source));
-                        if let Some(eta) = forecast_eta_to_limit(s) {
-                            ui.small(eta);
-                        }
+                    let widget_w = 244.0;
+                    let widget_h = 100.0;
+                    let margin_right = 20.0;
+                    let margin_bottom = 12.0;
+                    let _ = win.set_position(tauri::LogicalPosition::new(
+                        area_w - widget_w - margin_right,
+                        area_h - widget_h - margin_bottom,
+                    ));
+                }
+            }
 
-                        if alerts.is_empty() {
-                            ui.label("status: ok");
-                        } else {
-                            for a in &alerts {
-                                ui.label(format!("{}: {}", a.level, a.message));
-                            }
-                        }
+            app.on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()));
+
+            let sep = PredefinedMenuItem::separator(app)?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &MenuItem::with_id(app, TRAY_TOGGLE_ID, "Show / Hide", true, None::<&str>)?,
+                    &sep,
+                    &MenuItem::with_id(app, TRAY_QUIT_ID, "Quit UsageGuard", true, None::<&str>)?,
+                ],
+            )?;
+
+            TrayIconBuilder::new()
+                .icon(create_tray_icon())
+                .tooltip("UsageGuard")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        toggle_window(tray.app_handle());
                     }
-                });
-            }
+                })
+                .build(app)?;
 
-            ui.separator();
-            if ui.button("Connect API").clicked() {
-                self.show_connect = !self.show_connect;
-            }
-
-            if self.show_connect {
-                ui.group(|ui| {
-                    ui.label("OpenAI API key");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.openai_key_input)
-                            .password(true)
-                            .hint_text("sk-..."),
-                    );
-
-                    ui.label("OpenAI costs endpoint (optional)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.openai_endpoint_input)
-                            .hint_text("https://api.openai.com/v1/organization/costs"),
-                    );
-
-                    ui.label("Anthropic API key");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.anthropic_key_input)
-                            .password(true)
-                            .hint_text("sk-ant-..."),
-                    );
-
-                    ui.label("Anthropic usage endpoint (optional)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.anthropic_endpoint_input)
-                            .hint_text("https://api.anthropic.com/v1/organizations/usage"),
-                    );
-
-                    if ui.button("Save locally").clicked() {
-                        match self.validate_inputs() {
-                            Ok(_) => {
-                                if let Err(e) = set_provider_api_key(
-                                    "openai",
-                                    Some(self.openai_key_input.trim()),
-                                ) {
-                                    self.status = format!("Keyring save failed (OpenAI): {e}");
-                                    return;
-                                }
-                                if let Err(e) = set_provider_api_key(
-                                    "anthropic",
-                                    Some(self.anthropic_key_input.trim()),
-                                ) {
-                                    self.status = format!("Keyring save failed (Anthropic): {e}");
-                                    return;
-                                }
-                                self.cfg.api.openai_api_key = None;
-                                self.cfg.api.anthropic_api_key = None;
-                                self.cfg.api.openai_costs_endpoint =
-                                    if self.openai_endpoint_input.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(self.openai_endpoint_input.trim().to_string())
-                                    };
-                                self.cfg.api.anthropic_costs_endpoint =
-                                    if self.anthropic_endpoint_input.trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(self.anthropic_endpoint_input.trim().to_string())
-                                    };
-
-                                match save_config(&self.cfg) {
-                                    Ok(_) => {
-                                        self.status = "Saved local config.".to_string();
-                                        self.refresh();
-                                    }
-                                    Err(e) => self.status = format!("Save failed: {e}"),
-                                }
-                            }
-                            Err(msg) => self.status = msg,
-                        }
-                    }
-                });
-            }
-
-            if !self.status.is_empty() {
-                ui.small(&self.status);
-            }
-        });
-    }
-}
-
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_inner_size([420.0, 560.0])
-            .with_transparent(false),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "UsageGuard",
-        options,
-        Box::new(|_cc| Ok(Box::<UsageGuardApp>::default())),
-    )
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_snapshots,
+            get_config,
+            save_api_key,
+            update_config,
+            quit,
+            show_context_menu,
+            set_window_rect,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error running tauri application");
 }

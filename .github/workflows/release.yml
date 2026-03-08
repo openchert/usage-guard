@@ -102,7 +102,7 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           cd release-assets
-          sha256sum *.zip *.tar.gz > SHA256SUMS
+          sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create release and upload assets

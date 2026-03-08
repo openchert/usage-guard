@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -792,16 +792,6 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
     ]
 }
 
-trait Hour {
-    fn hour(&self) -> u32;
-}
-
-impl Hour for DateTime<Local> {
-    fn hour(&self) -> u32 {
-        use chrono::Timelike;
-        Timelike::hour(self)
-    }
-}
 
 #[cfg(test)]
 mod tests {
