@@ -314,15 +314,19 @@ pub fn has_provider_account_api_key(account_id: &str) -> bool {
 
 // --- OpenAI OAuth token storage (file-based) ---
 //
-// We avoid the OS keyring for OAuth tokens because the colon-separated
-// credential names (service:account) clash with Windows Credential Manager's
-// own separator, making reads unreliable.  A small JSON file in the same
-// config directory as config.json is simpler and equally protected by OS
-// file-system permissions (same approach used by GitHub CLI, AWS CLI, etc.).
+// We keep OAuth tokens in the app config directory instead of the OS keyring.
+// The keyring backend was reliable for API keys, but it regressed the ChatGPT
+// OAuth flow on Windows: writes succeeded, but later reads were inconsistent,
+// so login state stopped surviving window close/reopen. A small JSON file in
+// the user config directory is the known-working path for this app.
 
 fn oauth_tokens_path() -> Result<PathBuf> {
     let base = dirs::config_dir().context("Unable to resolve config directory")?;
     Ok(base.join("usage-guard").join("oauth_tokens.json"))
+}
+
+fn oauth_tokens_entry() -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(KEYRING_SERVICE, "openai.oauth.tokens")?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -357,8 +361,59 @@ fn save_oauth_file(file: &OAuthTokenFile) -> Result<()> {
     Ok(())
 }
 
+fn oauth_tokens_present(file: &OAuthTokenFile) -> bool {
+    !file.openai_access_token.is_empty()
+        || !file.openai_refresh_token.is_empty()
+        || !file.openai_account_id.is_empty()
+        || !file.openai_plan_type.is_empty()
+}
+
+fn migrate_keyring_oauth_tokens() -> OAuthTokenFile {
+    let entry = match oauth_tokens_entry() {
+        Ok(entry) => entry,
+        Err(_) => return OAuthTokenFile::default(),
+    };
+    let raw = match entry.get_password() {
+        Ok(raw) if !raw.trim().is_empty() => raw,
+        _ => return OAuthTokenFile::default(),
+    };
+    let file = match serde_json::from_str::<OAuthTokenFile>(&raw) {
+        Ok(file) if oauth_tokens_present(&file) => file,
+        _ => return OAuthTokenFile::default(),
+    };
+
+    if save_oauth_file(&file).is_ok() {
+        let _ = entry.delete_credential();
+        return file;
+    }
+
+    OAuthTokenFile::default()
+}
+
+fn load_oauth_tokens() -> OAuthTokenFile {
+    let file = load_oauth_file();
+    if oauth_tokens_present(&file) {
+        return file;
+    }
+
+    let migrated = migrate_keyring_oauth_tokens();
+    if oauth_tokens_present(&migrated) {
+        return migrated;
+    }
+
+    OAuthTokenFile::default()
+}
+
+fn save_oauth_tokens(file: &OAuthTokenFile) -> Result<()> {
+    save_oauth_file(file)?;
+    if let Ok(entry) = oauth_tokens_entry() {
+        let _ = entry.delete_credential();
+    }
+    Ok(())
+}
+
 pub fn get_openai_oauth_access_token() -> Option<String> {
-    let t = load_oauth_file();
+    let t = load_oauth_tokens();
     if t.openai_access_token.is_empty() {
         None
     } else {
@@ -367,7 +422,7 @@ pub fn get_openai_oauth_access_token() -> Option<String> {
 }
 
 pub fn get_openai_oauth_plan_type() -> Option<String> {
-    let t = load_oauth_file();
+    let t = load_oauth_tokens();
     if t.openai_plan_type.is_empty() {
         None
     } else {
@@ -381,7 +436,7 @@ pub fn set_openai_oauth_tokens(
     account_id: &str,
     plan_type: &str,
 ) -> Result<()> {
-    let mut file = load_oauth_file();
+    let mut file = load_oauth_tokens();
     file.openai_access_token = access.to_string();
     if !refresh.is_empty() {
         file.openai_refresh_token = refresh.to_string();
@@ -390,47 +445,20 @@ pub fn set_openai_oauth_tokens(
     if !plan_type.is_empty() {
         file.openai_plan_type = plan_type.to_string();
     }
-    save_oauth_file(&file)
+    save_oauth_tokens(&file)
 }
 
 pub fn clear_openai_oauth_tokens() {
+    if let Ok(entry) = oauth_tokens_entry() {
+        let _ = entry.delete_credential();
+    }
     if let Ok(path) = oauth_tokens_path() {
         let _ = fs::remove_file(path);
     }
 }
 
-/// Returns the raw JSON string from wham/usage for debugging, or an error string.
-pub fn debug_openai_oauth_fetch() -> String {
-    let tokens = load_oauth_file();
-    if tokens.openai_access_token.is_empty() {
-        return "No access token stored".to_string();
-    }
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return format!("Client build error: {e}"),
-    };
-    let mut req = client
-        .get("https://chatgpt.com/backend-api/wham/usage")
-        .bearer_auth(&tokens.openai_access_token)
-        .header("Accept", "application/json");
-    if !tokens.openai_account_id.is_empty() {
-        req = req.header("ChatGPT-Account-Id", &tokens.openai_account_id);
-    }
-    match req.send() {
-        Err(e) => format!("Request error: {e}"),
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_else(|e| format!("<body read error: {e}>"));
-            format!("HTTP {status}\n{body}")
-        }
-    }
-}
-
 pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
-    let tokens = load_oauth_file();
+    let tokens = load_oauth_tokens();
     if tokens.openai_access_token.is_empty() {
         return None;
     }
@@ -458,7 +486,7 @@ pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
 }
 
 fn try_refresh_oauth_token() -> Result<String> {
-    let tokens = load_oauth_file();
+    let tokens = load_oauth_tokens();
     if tokens.openai_refresh_token.is_empty() {
         return Err(anyhow!("No refresh token stored"));
     }
@@ -485,12 +513,12 @@ fn try_refresh_oauth_token() -> Result<String> {
         .ok_or_else(|| anyhow!("No access_token in refresh response"))?
         .to_string();
 
-    let mut file = load_oauth_file();
+    let mut file = load_oauth_tokens();
     file.openai_access_token = new_access.clone();
     if let Some(new_refresh) = resp["refresh_token"].as_str() {
         file.openai_refresh_token = new_refresh.to_string();
     }
-    let _ = save_oauth_file(&file);
+    let _ = save_oauth_tokens(&file);
 
     Ok(new_access)
 }
@@ -524,9 +552,9 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
     let plan_type = value["plan_type"].as_str().unwrap_or("unknown").to_string();
 
     // Persist updated plan type
-    let mut file = load_oauth_file();
+    let mut file = load_oauth_tokens();
     file.openai_plan_type = plan_type.clone();
-    let _ = save_oauth_file(&file);
+    let _ = save_oauth_tokens(&file);
 
     // primary_window  = shorter window (e.g. 5 hours)  → maps to the "5h" ring
     // secondary_window = longer window (e.g. 1 week)   → maps to the "week" ring
@@ -543,7 +571,6 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
         .and_then(|v| v.as_f64())
         .unwrap_or(primary_percent); // fall back to primary if secondary is absent/null
 
-    eprintln!("[usageguard] wham parsed: primary={primary_percent:.1}% secondary={secondary_percent:.1}% plan={plan_type}");
 
     // Capitalise first letter: "pro" → "Pro"
     let plan_display: String = {

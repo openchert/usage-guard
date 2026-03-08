@@ -136,7 +136,6 @@
 
   async function loadSettings(): Promise<void> {
     if (!invoke) return;
-
     isLoading = true;
     try {
       const [payload, status] = await Promise.all([
@@ -179,17 +178,6 @@
     }
   }
 
-  async function debugOAuth(): Promise<void> {
-    if (!invoke) return;
-    const result = await invoke('debug_openai_oauth') as string;
-    try {
-      await navigator.clipboard.writeText(result);
-      successMessage = 'Debug output copied to clipboard.';
-    } catch {
-      // Clipboard not available — fall back to alert
-      window.alert(result);
-    }
-  }
 
   async function save(): Promise<void> {
     if (!invoke || isSaving) return;
@@ -283,7 +271,6 @@
             <span class="account-name">ChatGPT {oauthStatus.plan_type ?? ''}</span>
             <span class="account-vendor">Subscription</span>
           </div>
-          <button class="link-btn" type="button" on:click={debugOAuth} title="Show raw API response">Debug</button>
           <button class="link-btn" type="button" on:click={disconnectOAuth}>Disconnect</button>
         {:else if isConnecting}
           <div class="account-info">

@@ -38,8 +38,6 @@
   $: radius = 50 - resolvedTheme.thickness / 2;
   $: innerRadius = Math.max(0, 50 - resolvedTheme.thickness);
   $: progressPath = describeArc(radius, normalizedRatio);
-  $: percent = Math.round(normalizedRatio * 100);
-  $: titleText = label ? `${label}: ${percent}%` : `${percent}%`;
   $: cssVars = [
     `--ring-size:${resolvedTheme.size}px`,
     `--ring-label-color:${resolvedTheme.labelColor}`,
@@ -48,10 +46,8 @@
   ].join(';');
 </script>
 
-<div class="usage-ring" style={cssVars} title={titleText}>
+<div class="usage-ring" style={cssVars}>
   <svg class="ring-svg" viewBox="0 0 100 100" aria-hidden="true">
-    <title>{titleText}</title>
-
     {#if resolvedTheme.innerFill !== 'transparent'}
       <circle cx="50" cy="50" r={innerRadius} fill={resolvedTheme.innerFill} />
     {/if}

@@ -1,20 +1,9 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import UsageRing from './UsageRing.svelte';
-  import { currentWindow, invoke, listen } from './tauri';
   import { providerMeta, providerRank } from './providerTheme';
-  import { resolveUsageCard } from './usageDisplay';
-
-  interface UsageSnapshot {
-    provider: string;
-    account_label: string;
-    spent_usd: number | null;
-    limit_usd: number | null;
-    tokens_in: number | null;
-    tokens_out: number | null;
-    inactive_hours: number | null;
-    source: string; // "api" | "oauth" | "oauth-error:*" | "demo" | …
-  }
+  import { currentWindow, invoke, listen } from './tauri';
+  import { resolveUsageCard, type UsageSnapshot } from './usageDisplay';
 
   const CARD_W = 110;
   const CARD_GAP = 6;
@@ -38,46 +27,11 @@
     return cardSpec(snapshot).displayLabel;
   }
 
-  function cardTitle(snapshot: UsageSnapshot): string {
-    return cardSpec(snapshot).title;
-  }
-
   function sorted(items: UsageSnapshot[]): UsageSnapshot[] {
     return [...items].sort((a, b) => {
       return providerRank(a.provider) - providerRank(b.provider)
         || displayLabel(a).localeCompare(displayLabel(b));
     });
-  }
-
-  function oauthRemainingRatio(percent: number | null): number {
-    if (percent == null || !Number.isFinite(percent)) return 0;
-    return Math.min(1, Math.max(0, 1 - percent / 100));
-  }
-
-  function weekRatio(snapshot: UsageSnapshot): number {
-    // OAuth: spent_usd holds secondary_window used_percent (0–100).
-    // Show REMAINING capacity so the ring drains as the limit is consumed.
-    if (snapshot.source === 'oauth') {
-      return oauthRemainingRatio(snapshot.spent_usd);
-    }
-    if (snapshot.limit_usd && snapshot.limit_usd > 0 && snapshot.spent_usd != null) {
-      return Math.min(1, snapshot.spent_usd / snapshot.limit_usd);
-    }
-    const total = (snapshot.tokens_in ?? 0) + (snapshot.tokens_out ?? 0);
-    if (total > 0) return Math.min(1, total / 1_200_000);
-    return 0;
-  }
-
-  function fiveHourRatio(snapshot: UsageSnapshot): number {
-    // OAuth: tokens_in holds primary_window used_percent (0–100).
-    // Show REMAINING capacity so the ring drains as the limit is consumed.
-    if (snapshot.source === 'oauth') {
-      return oauthRemainingRatio(snapshot.tokens_in);
-    }
-    const weekly = weekRatio(snapshot);
-    const inactive = snapshot.inactive_hours ?? 0;
-    const activeFactor = Math.max(0.2, 1 - Math.min(inactive, 24) / 24);
-    return Math.min(1, weekly * (0.22 + activeFactor * 0.35));
   }
 
   async function resizeToFit(count: number): Promise<void> {
@@ -170,11 +124,18 @@
   {:else}
     {#each snapshots as snapshot}
       {@const provider = providerMeta(snapshot.provider)}
-      <div class="provider-card" title={cardTitle(snapshot)}>
-        <span class="card-name">{displayLabel(snapshot)}</span>
+      {@const card = cardSpec(snapshot)}
+      <div class="provider-card" title={card.title}>
+        <span class="card-name">{card.displayLabel}</span>
         <div class="rings">
-          <UsageRing ratio={fiveHourRatio(snapshot)} accent={provider.color} label="5h" theme={provider.usageRing} />
-          <UsageRing ratio={weekRatio(snapshot)} accent={provider.color} theme={provider.usageRing} />
+          {#each card.rings as ring}
+            <UsageRing
+              ratio={ring.ratio}
+              accent={provider.color}
+              label={ring.label ?? ''}
+              theme={provider.usageRing}
+            />
+          {/each}
         </div>
       </div>
     {/each}

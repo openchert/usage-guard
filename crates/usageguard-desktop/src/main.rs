@@ -783,11 +783,6 @@ struct OAuthStatus {
 }
 
 #[tauri::command]
-fn debug_openai_oauth() -> String {
-    usageguard_core::debug_openai_oauth_fetch()
-}
-
-#[tauri::command]
 fn get_openai_oauth_status() -> OAuthStatus {
     let connected = usageguard_core::get_openai_oauth_access_token().is_some();
     let plan_type = if connected {
@@ -905,7 +900,6 @@ fn main() {
             connect_openai_oauth,
             disconnect_openai_oauth,
             get_openai_oauth_status,
-            debug_openai_oauth,
         ])
         .run(tauri::generate_context!())
         .expect("error running tauri application");
