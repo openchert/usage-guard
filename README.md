@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public\assets\title.png" alt="UsageGuard icon" width="140">
+  <img src="public\assets\title.png" alt="UsageGuard icon" width="280">
 </p>
 
 # UsageGuard
