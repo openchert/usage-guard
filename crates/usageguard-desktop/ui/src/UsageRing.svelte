@@ -79,7 +79,7 @@
         fill="none"
         stroke={resolvedTheme.accentColor}
         stroke-width={resolvedTheme.thickness}
-        stroke-linecap="round"
+        stroke-linecap="butt"
       />
     {/if}
   </svg>

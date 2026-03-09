@@ -19,6 +19,16 @@ pub struct OpenAiOAuthSecret {
     pub plan_type: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AnthropicOAuthSecret {
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub subscription_type: String,
+    #[serde(default)]
+    pub rate_limit_tier: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretPayload {
     pub version: u32,
@@ -26,6 +36,8 @@ pub struct SecretPayload {
     pub provider_api_keys: HashMap<String, String>,
     #[serde(default)]
     pub openai_oauth: OpenAiOAuthSecret,
+    #[serde(default)]
+    pub anthropic_oauth: AnthropicOAuthSecret,
 }
 
 impl Default for SecretPayload {
@@ -34,6 +46,7 @@ impl Default for SecretPayload {
             version: SECRET_PAYLOAD_VERSION,
             provider_api_keys: HashMap::new(),
             openai_oauth: OpenAiOAuthSecret::default(),
+            anthropic_oauth: AnthropicOAuthSecret::default(),
         }
     }
 }
@@ -240,19 +253,22 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn dpapi_round_trip() {
-        with_test_dir("roundtrip", |_| {
-            let mut payload = SecretPayload::default();
-            payload
-                .provider_api_keys
-                .insert("openai".into(), "sk-test".into());
-            payload.openai_oauth.refresh_token = "refresh-token".into();
-            payload.openai_oauth.account_id = "acct_123".into();
-            payload.openai_oauth.plan_type = "plus".into();
+        let mut payload = SecretPayload::default();
+        payload
+            .provider_api_keys
+            .insert("openai".into(), "sk-test".into());
+        payload.openai_oauth.refresh_token = "refresh-token".into();
+        payload.openai_oauth.account_id = "acct_123".into();
+        payload.openai_oauth.plan_type = "plus".into();
+        payload.anthropic_oauth.refresh_token = "claude-refresh".into();
+        payload.anthropic_oauth.subscription_type = "max".into();
+        payload.anthropic_oauth.rate_limit_tier = "premium".into();
 
-            SecretStore::save(&payload).unwrap();
-            let loaded = SecretStore::load().unwrap();
-            assert_eq!(loaded, payload);
-        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let encrypted = encrypt_bytes(&raw).unwrap();
+        let decrypted = decrypt_bytes(&encrypted).unwrap();
+        let loaded = serde_json::from_slice::<SecretPayload>(&decrypted).unwrap();
+        assert_eq!(loaded, payload);
     }
 
     #[cfg(target_os = "windows")]

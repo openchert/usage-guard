@@ -8,11 +8,17 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use secret_store::{app_config_dir, OpenAiOAuthSecret, SecretPayload, SecretStore};
+use secret_store::{
+    app_config_dir, AnthropicOAuthSecret, OpenAiOAuthSecret, SecretPayload, SecretStore,
+};
 
 const KEYRING_SERVICE: &str = "usage-guard";
 const ACCESS_TOKEN_EXPIRY_SKEW_SECS: i64 = 60;
 const DEFAULT_ACCESS_TOKEN_LIFETIME_SECS: i64 = 45 * 60;
+const ANTHROPIC_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
+const ANTHROPIC_OAUTH_SCOPE: &str =
+    "user:inference user:mcp_servers user:profile user:sessions:claude_code";
+const CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV: &str = "USAGEGUARD_CLAUDE_CREDENTIALS_PATH_OVERRIDE";
 
 #[derive(Debug, Clone, Default)]
 struct OpenAiSessionState {
@@ -21,6 +27,29 @@ struct OpenAiSessionState {
     account_id: String,
     plan_type: String,
     expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnthropicSessionState {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    subscription_type: String,
+    rate_limit_tier: String,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ClaudeDesktopCredentials {
+    #[serde(default, rename = "claudeAiOauth")]
+    claude_ai_oauth: ClaudeDesktopOAuth,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ClaudeDesktopOAuth {
+    #[serde(default, rename = "subscriptionType")]
+    subscription_type: String,
+    #[serde(default, rename = "rateLimitTier")]
+    rate_limit_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +344,11 @@ fn openai_session() -> &'static Mutex<OpenAiSessionState> {
     SESSION.get_or_init(|| Mutex::new(OpenAiSessionState::default()))
 }
 
+fn anthropic_session() -> &'static Mutex<AnthropicSessionState> {
+    static SESSION: OnceLock<Mutex<AnthropicSessionState>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new(AnthropicSessionState::default()))
+}
+
 fn is_non_empty(value: &str) -> bool {
     !value.trim().is_empty()
 }
@@ -325,6 +359,22 @@ fn load_secret_payload() -> SecretPayload {
 
 fn save_secret_payload(payload: &SecretPayload) -> Result<()> {
     SecretStore::save(payload)
+}
+
+fn has_remaining_secret_payload(payload: &SecretPayload) -> bool {
+    !payload.provider_api_keys.is_empty()
+        || payload.openai_oauth != OpenAiOAuthSecret::default()
+        || payload.anthropic_oauth != AnthropicOAuthSecret::default()
+}
+
+fn payload_after_clearing_openai_secret(mut payload: SecretPayload) -> Option<SecretPayload> {
+    payload.openai_oauth = OpenAiOAuthSecret::default();
+    has_remaining_secret_payload(&payload).then_some(payload)
+}
+
+fn payload_after_clearing_anthropic_secret(mut payload: SecretPayload) -> Option<SecretPayload> {
+    payload.anthropic_oauth = AnthropicOAuthSecret::default();
+    has_remaining_secret_payload(&payload).then_some(payload)
 }
 
 // --- OpenAI OAuth token storage (legacy migration helpers) ---
@@ -396,12 +446,30 @@ fn persist_openai_secret(secret: &OpenAiOAuthSecret) -> Result<()> {
 }
 
 fn clear_stored_openai_secret() -> Result<()> {
-    let mut payload = load_secret_payload();
-    payload.openai_oauth = OpenAiOAuthSecret::default();
-    if payload.provider_api_keys.is_empty() {
-        SecretStore::clear()
-    } else {
+    let payload = load_secret_payload();
+    if let Some(payload) = payload_after_clearing_openai_secret(payload) {
         save_secret_payload(&payload)
+    } else {
+        SecretStore::clear()
+    }
+}
+
+fn load_stored_anthropic_secret() -> AnthropicOAuthSecret {
+    load_secret_payload().anthropic_oauth
+}
+
+fn persist_anthropic_secret(secret: &AnthropicOAuthSecret) -> Result<()> {
+    let mut payload = load_secret_payload();
+    payload.anthropic_oauth = secret.clone();
+    save_secret_payload(&payload)
+}
+
+fn clear_stored_anthropic_secret() -> Result<()> {
+    let payload = load_secret_payload();
+    if let Some(payload) = payload_after_clearing_anthropic_secret(payload) {
+        save_secret_payload(&payload)
+    } else {
+        SecretStore::clear()
     }
 }
 
@@ -475,6 +543,184 @@ fn current_refresh_token() -> Option<String> {
     }
 }
 
+fn update_in_memory_anthropic_session(
+    access_token: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+    refresh_token: Option<String>,
+    subscription_type: Option<String>,
+    rate_limit_tier: Option<String>,
+) {
+    let mut session = anthropic_session().lock().unwrap();
+    if let Some(access) = access_token {
+        session.access_token = Some(access);
+        session.expires_at = expires_at;
+    }
+    if let Some(refresh) = refresh_token {
+        session.refresh_token = if is_non_empty(&refresh) {
+            Some(refresh)
+        } else {
+            None
+        };
+    }
+    if let Some(subscription_type) = subscription_type {
+        session.subscription_type = subscription_type;
+    }
+    if let Some(rate_limit_tier) = rate_limit_tier {
+        session.rate_limit_tier = rate_limit_tier;
+    }
+}
+
+fn clear_in_memory_anthropic_session() {
+    *anthropic_session().lock().unwrap() = AnthropicSessionState::default();
+}
+
+fn current_cached_anthropic_access_token() -> Option<String> {
+    let session = anthropic_session().lock().unwrap();
+    let expires_at = session.expires_at?;
+    if expires_at <= Utc::now() {
+        return None;
+    }
+    session.access_token.clone()
+}
+
+fn current_anthropic_refresh_token() -> Option<String> {
+    let session_refresh = anthropic_session().lock().unwrap().refresh_token.clone();
+    if let Some(refresh) = session_refresh.filter(|value| is_non_empty(value)) {
+        return Some(refresh);
+    }
+
+    let stored = load_stored_anthropic_secret();
+    if is_non_empty(&stored.refresh_token) {
+        Some(stored.refresh_token)
+    } else {
+        None
+    }
+}
+
+fn normalize_plan_label(value: &str) -> String {
+    value
+        .split(|ch: char| ch == '_' || ch == '-' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut normalized = first.to_uppercase().collect::<String>();
+                    normalized.push_str(&chars.as_str().to_lowercase());
+                    normalized
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn anthropic_plan_label_from_subscription_type(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    match value.to_ascii_lowercase().as_str() {
+        "pro" => Some("Pro".to_string()),
+        "max" => Some("Max".to_string()),
+        "team" => Some("Team".to_string()),
+        "enterprise" => Some("Enterprise".to_string()),
+        _ => Some(normalize_plan_label(value)),
+    }
+}
+
+fn anthropic_plan_label_from_rate_limit_tier(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let parts = normalized
+        .split(|ch: char| ch == '_' || ch == '-' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.iter().any(|part| *part == "enterprise") {
+        return Some("Enterprise".to_string());
+    }
+    if parts.iter().any(|part| *part == "team") {
+        return Some("Team".to_string());
+    }
+    if parts.iter().any(|part| *part == "max") {
+        return Some("Max".to_string());
+    }
+    if parts.iter().any(|part| *part == "pro") {
+        return Some("Pro".to_string());
+    }
+
+    None
+}
+
+fn claude_credentials_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV) {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    Some(dirs::home_dir()?.join(".claude").join(".credentials.json"))
+}
+
+fn load_local_claude_oauth_metadata() -> Option<(String, String)> {
+    let path = claude_credentials_path()?;
+    let raw = fs::read_to_string(path).ok()?;
+    let credentials = serde_json::from_str::<ClaudeDesktopCredentials>(&raw).ok()?;
+    let subscription_type = credentials
+        .claude_ai_oauth
+        .subscription_type
+        .trim()
+        .to_string();
+    let rate_limit_tier = credentials
+        .claude_ai_oauth
+        .rate_limit_tier
+        .trim()
+        .to_string();
+
+    if is_non_empty(&subscription_type) || is_non_empty(&rate_limit_tier) {
+        Some((subscription_type, rate_limit_tier))
+    } else {
+        None
+    }
+}
+
+fn sync_anthropic_plan_metadata_from_local_credentials() -> Option<(String, String)> {
+    let (subscription_type, rate_limit_tier) = load_local_claude_oauth_metadata()?;
+    let mut stored = load_stored_anthropic_secret();
+
+    if is_non_empty(&subscription_type) {
+        stored.subscription_type = subscription_type.clone();
+    }
+    if is_non_empty(&rate_limit_tier) {
+        stored.rate_limit_tier = rate_limit_tier.clone();
+    }
+
+    let _ = persist_anthropic_secret(&stored);
+    update_in_memory_anthropic_session(
+        None,
+        None,
+        None,
+        is_non_empty(&stored.subscription_type).then_some(stored.subscription_type.clone()),
+        is_non_empty(&stored.rate_limit_tier).then_some(stored.rate_limit_tier.clone()),
+    );
+
+    Some((stored.subscription_type, stored.rate_limit_tier))
+}
+
+fn anthropic_plan_type_from_fields(
+    subscription_type: &str,
+    rate_limit_tier: &str,
+) -> Option<String> {
+    anthropic_plan_label_from_subscription_type(subscription_type)
+        .or_else(|| anthropic_plan_label_from_rate_limit_tier(rate_limit_tier))
+}
+
 pub fn has_openai_oauth_session() -> bool {
     current_refresh_token().is_some() || current_cached_access_token().is_some()
 }
@@ -495,6 +741,28 @@ pub fn get_openai_oauth_plan_type() -> Option<String> {
     } else {
         None
     }
+}
+
+pub fn has_anthropic_oauth_session() -> bool {
+    current_anthropic_refresh_token().is_some() || current_cached_anthropic_access_token().is_some()
+}
+
+pub fn get_anthropic_oauth_plan_type() -> Option<String> {
+    let session = anthropic_session().lock().unwrap().clone();
+    if let Some(plan_type) =
+        anthropic_plan_type_from_fields(&session.subscription_type, &session.rate_limit_tier)
+    {
+        return Some(plan_type);
+    }
+
+    let stored = load_stored_anthropic_secret();
+    anthropic_plan_type_from_fields(&stored.subscription_type, &stored.rate_limit_tier).or_else(
+        || {
+            let (subscription_type, rate_limit_tier) =
+                sync_anthropic_plan_metadata_from_local_credentials()?;
+            anthropic_plan_type_from_fields(&subscription_type, &rate_limit_tier)
+        },
+    )
 }
 
 pub fn set_openai_oauth_tokens(
@@ -527,6 +795,36 @@ pub fn set_openai_oauth_tokens(
     persist_openai_secret(&stored)
 }
 
+pub fn set_anthropic_oauth_tokens(
+    access: &str,
+    access_expires_at: DateTime<Utc>,
+    refresh: &str,
+    subscription_type: &str,
+    rate_limit_tier: &str,
+) -> Result<()> {
+    update_in_memory_anthropic_session(
+        Some(access.to_string()),
+        Some(access_expires_at),
+        Some(refresh.to_string()),
+        Some(subscription_type.to_string()),
+        Some(rate_limit_tier.to_string()),
+    );
+
+    if !is_non_empty(refresh) {
+        return Ok(());
+    }
+
+    let mut stored = load_stored_anthropic_secret();
+    stored.refresh_token = refresh.to_string();
+    if is_non_empty(subscription_type) {
+        stored.subscription_type = subscription_type.to_string();
+    }
+    if is_non_empty(rate_limit_tier) {
+        stored.rate_limit_tier = rate_limit_tier.to_string();
+    }
+    persist_anthropic_secret(&stored)
+}
+
 pub fn clear_openai_oauth_tokens() {
     clear_in_memory_oauth_session();
     let _ = clear_stored_openai_secret();
@@ -536,6 +834,11 @@ pub fn clear_openai_oauth_tokens() {
     if let Ok(path) = oauth_tokens_path() {
         let _ = fs::remove_file(path);
     }
+}
+
+pub fn clear_anthropic_oauth_tokens() {
+    clear_in_memory_anthropic_session();
+    let _ = clear_stored_anthropic_secret();
 }
 
 pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
@@ -601,6 +904,65 @@ pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
     }
 }
 
+pub fn fetch_anthropic_oauth_usage() -> Option<UsageSnapshot> {
+    if !has_anthropic_oauth_session() {
+        return None;
+    }
+
+    let access_token = match current_cached_anthropic_access_token() {
+        Some(token) => token,
+        None => match try_refresh_anthropic_oauth_token() {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("[usageguard] anthropic token refresh failed: {error}");
+                return Some(error_snapshot(
+                    "anthropic",
+                    "Claude",
+                    "oauth",
+                    Some("oauth_reauth_required"),
+                    Some("Claude sign-in expired. Sign in again."),
+                ));
+            }
+        },
+    };
+
+    match do_fetch_anthropic_oauth_usage(&access_token) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            eprintln!("[usageguard] anthropic oauth usage failed: {error}");
+            match try_refresh_anthropic_oauth_token() {
+                Ok(new_access) => match do_fetch_anthropic_oauth_usage(&new_access) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(refresh_error) => {
+                        eprintln!(
+                            "[usageguard] anthropic oauth usage after refresh failed: {refresh_error}"
+                        );
+                        Some(error_snapshot(
+                            "anthropic",
+                            "Claude",
+                            "oauth",
+                            Some("oauth_usage_unavailable"),
+                            Some("Unable to load Claude usage right now."),
+                        ))
+                    }
+                },
+                Err(refresh_error) => {
+                    eprintln!(
+                        "[usageguard] anthropic token refresh failed after usage error: {refresh_error}"
+                    );
+                    Some(error_snapshot(
+                        "anthropic",
+                        "Claude",
+                        "oauth",
+                        Some("oauth_reauth_required"),
+                        Some("Claude sign-in expired. Sign in again."),
+                    ))
+                }
+            }
+        }
+    }
+}
+
 fn try_refresh_oauth_token() -> Result<String> {
     let refresh_token =
         current_refresh_token().ok_or_else(|| anyhow!("No refresh token stored"))?;
@@ -615,17 +977,24 @@ fn try_refresh_oauth_token() -> Result<String> {
         ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
     ];
 
-    let resp = client
+    let resp: Value = client
         .post("https://auth.openai.com/oauth/token")
         .form(&params)
-        .send();
-    let resp: Value = match resp {
-        Ok(resp) => resp.error_for_status()?.json()?,
-        Err(error) => {
+        .send()
+        .map_err(|error| {
             clear_openai_oauth_tokens();
-            return Err(error.into());
-        }
-    };
+            anyhow!(error)
+        })?
+        .error_for_status()
+        .map_err(|error| {
+            clear_openai_oauth_tokens();
+            anyhow!(error)
+        })?
+        .json()
+        .map_err(|error| {
+            clear_openai_oauth_tokens();
+            anyhow!(error)
+        })?;
 
     let new_access = resp["access_token"]
         .as_str()
@@ -647,6 +1016,81 @@ fn try_refresh_oauth_token() -> Result<String> {
     );
     if let Err(error) = persist_openai_secret(&stored) {
         clear_in_memory_oauth_session();
+        return Err(error);
+    }
+
+    Ok(new_access)
+}
+
+fn try_refresh_anthropic_oauth_token() -> Result<String> {
+    let refresh_token = current_anthropic_refresh_token()
+        .ok_or_else(|| anyhow!("No Anthropic refresh token stored"))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let params = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        "scope": ANTHROPIC_OAUTH_SCOPE,
+    });
+
+    let resp: Value = client
+        .post("https://platform.claude.com/v1/oauth/token")
+        .header("Content-Type", "application/json")
+        .json(&params)
+        .send()
+        .map_err(|error| {
+            clear_anthropic_oauth_tokens();
+            anyhow!(error)
+        })?
+        .error_for_status()
+        .map_err(|error| {
+            clear_anthropic_oauth_tokens();
+            anyhow!(error)
+        })?
+        .json()
+        .map_err(|error| {
+            clear_anthropic_oauth_tokens();
+            anyhow!(error)
+        })?;
+
+    let new_access = resp["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No access_token in Anthropic refresh response"))?
+        .to_string();
+    let expires_at = token_expiry_from_now(resp["expires_in"].as_i64());
+    let new_refresh = resp["refresh_token"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or(refresh_token);
+    let mut stored = load_stored_anthropic_secret();
+    stored.refresh_token = new_refresh.clone();
+    if let Some(subscription_type) = pick_str(
+        &resp,
+        &[
+            "subscriptionType",
+            "subscription_type",
+            "planType",
+            "plan_type",
+        ],
+    ) {
+        stored.subscription_type = subscription_type.to_string();
+    }
+    if let Some(rate_limit_tier) = pick_str(&resp, &["rateLimitTier", "rate_limit_tier", "tier"]) {
+        stored.rate_limit_tier = rate_limit_tier.to_string();
+    }
+    update_in_memory_anthropic_session(
+        Some(new_access.clone()),
+        Some(expires_at),
+        Some(new_refresh),
+        is_non_empty(&stored.subscription_type).then_some(stored.subscription_type.clone()),
+        is_non_empty(&stored.rate_limit_tier).then_some(stored.rate_limit_tier.clone()),
+    );
+    if let Err(error) = persist_anthropic_secret(&stored) {
+        clear_in_memory_anthropic_session();
         return Err(error);
     }
 
@@ -675,6 +1119,26 @@ fn do_fetch_wham_usage(access_token: &str, account_id: &str) -> Result<UsageSnap
     }
     let value: Value = resp.json()?;
     parse_wham_usage_response(&value)
+}
+
+fn do_fetch_anthropic_oauth_usage(access_token: &str) -> Result<UsageSnapshot> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()?;
+
+    let resp = client
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER)
+        .header("User-Agent", "usageguard/0.1")
+        .send()?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(anyhow!("HTTP {status}"));
+    }
+    let value: Value = resp.json()?;
+    parse_anthropic_oauth_usage_response(&value)
 }
 
 fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
@@ -735,6 +1199,92 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
         spent_usd: secondary_percent, // week ring = secondary / 100
         limit_usd: 100.0,
         tokens_in: primary_percent.round() as u64, // 5h ring reads this directly
+        tokens_out: 0,
+        inactive_hours: 0,
+        source: "oauth".to_string(),
+        status_code: None,
+        status_message: None,
+    })
+}
+
+fn anthropic_oauth_bucket_value(bucket: &Value) -> Option<f64> {
+    match bucket {
+        Value::Number(number) => number.as_f64().map(|value| value.clamp(0.0, 100.0)),
+        Value::Object(_) => pick_f64(bucket, &["utilization", "usage", "percent", "value"])
+            .map(|value| value.clamp(0.0, 100.0)),
+        _ => None,
+    }
+}
+
+fn anthropic_oauth_bucket_percent(value: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(anthropic_oauth_bucket_value)
+            .or_else(|| {
+                let utilization_key = format!("{key}_utilization");
+                value
+                    .get(utilization_key.as_str())
+                    .and_then(anthropic_oauth_bucket_value)
+            })
+    })
+}
+
+fn parse_anthropic_oauth_usage_response(value: &Value) -> Result<UsageSnapshot> {
+    let mut stored = load_stored_anthropic_secret();
+    if let Some(subscription_type) = pick_str(
+        value,
+        &[
+            "subscriptionType",
+            "subscription_type",
+            "planType",
+            "plan_type",
+        ],
+    ) {
+        stored.subscription_type = subscription_type.to_string();
+    }
+    if let Some(rate_limit_tier) = pick_str(value, &["rateLimitTier", "rate_limit_tier", "tier"]) {
+        stored.rate_limit_tier = rate_limit_tier.to_string();
+    }
+    let _ = persist_anthropic_secret(&stored);
+    update_in_memory_anthropic_session(
+        None,
+        None,
+        None,
+        is_non_empty(&stored.subscription_type).then_some(stored.subscription_type.clone()),
+        is_non_empty(&stored.rate_limit_tier).then_some(stored.rate_limit_tier.clone()),
+    );
+
+    let five_hour_percent = anthropic_oauth_bucket_percent(
+        value,
+        &["five_hour", "fiveHour", "5_hour", "short_term", "shortTerm"],
+    );
+    let seven_day_percent = anthropic_oauth_bucket_percent(
+        value,
+        &[
+            "seven_day",
+            "seven_day_all",
+            "daily",
+            "sevenDayAll",
+            "7_day_all",
+            "long_term",
+            "longTerm",
+            "weekly",
+        ],
+    );
+
+    let session_used = five_hour_percent.or(seven_day_percent).unwrap_or(0.0);
+    let week_used = seven_day_percent.or(five_hour_percent).unwrap_or(0.0);
+    let account_label = get_anthropic_oauth_plan_type()
+        .map(|plan_type| format!("Claude {plan_type}"))
+        .unwrap_or_else(|| "Claude".to_string());
+
+    Ok(UsageSnapshot {
+        provider: "anthropic".into(),
+        account_label,
+        spent_usd: week_used,
+        limit_usd: 100.0,
+        tokens_in: session_used.round() as u64,
         tokens_out: 0,
         inactive_hours: 0,
         source: "oauth".to_string(),
@@ -1134,8 +1684,11 @@ fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec
 pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
     let mut items: Vec<UsageSnapshot> = vec![];
 
-    // OAuth subscriptions first (ChatGPT Plus/Pro via wham/usage)
+    // OAuth subscriptions first (consumer plans before API-key sources)
     if let Some(s) = fetch_openai_oauth_usage() {
+        items.push(s);
+    }
+    if let Some(s) = fetch_anthropic_oauth_usage() {
         items.push(s);
     }
 
@@ -1578,6 +2131,40 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_claude_credentials_override(name: &str, body: &str, test: impl FnOnce()) {
+        let _guard = test_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "usageguard_core_claude_plan_{name}_{}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        let credentials_path = root.join(".claude").join(".credentials.json");
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&config_root).unwrap();
+        fs::create_dir_all(credentials_path.parent().unwrap()).unwrap();
+        fs::write(&credentials_path, body).unwrap();
+
+        std::env::set_var("USAGEGUARD_CONFIG_DIR_OVERRIDE", &config_root);
+        std::env::set_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV, &credentials_path);
+        clear_in_memory_anthropic_session();
+        let _ = SecretStore::clear();
+
+        test();
+
+        clear_in_memory_anthropic_session();
+        let _ = SecretStore::clear();
+        std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
+        std::env::remove_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn near_limit_alert() {
@@ -1639,5 +2226,97 @@ mod tests {
 
         let snap = parse_cursor_spend_response(&value, "Cursor", "api").unwrap();
         assert!((snap.spent_usd - 12.34).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_anthropic_oauth_usage_response_full_data() {
+        clear_in_memory_anthropic_session();
+        update_in_memory_anthropic_session(
+            None,
+            None,
+            None,
+            Some("pro".into()),
+            Some("premium".into()),
+        );
+
+        let value: Value = serde_json::json!({
+            "five_hour": { "utilization": 62.5, "resets_at": "2026-03-09T12:00:00Z" },
+            "seven_day": { "utilization": 37.0, "resets_at": "2026-03-12T00:00:00Z" }
+        });
+
+        let snap = parse_anthropic_oauth_usage_response(&value).unwrap();
+        assert_eq!(snap.provider, "anthropic");
+        assert_eq!(snap.source, "oauth");
+        assert!(snap.account_label.starts_with("Claude"));
+        assert_eq!(snap.tokens_in, 63);
+        assert!((snap.spent_usd - 37.0).abs() < f64::EPSILON);
+        assert!((snap.limit_usd - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_anthropic_oauth_usage_response_falls_back_when_window_missing() {
+        clear_in_memory_anthropic_session();
+        let value: Value = serde_json::json!({
+            "seven_day": { "utilization": 24.0 }
+        });
+
+        let snap = parse_anthropic_oauth_usage_response(&value).unwrap();
+        assert_eq!(snap.tokens_in, 24);
+        assert!((snap.spent_usd - 24.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn anthropic_plan_type_ignores_generic_rate_limit_tiers() {
+        assert_eq!(
+            anthropic_plan_type_from_fields("", "default_claude_ai"),
+            None
+        );
+    }
+
+    #[test]
+    fn anthropic_plan_type_falls_back_to_local_claude_credentials() {
+        with_claude_credentials_override(
+            "local_profile",
+            r#"{
+                "claudeAiOauth": {
+                    "subscriptionType": "pro",
+                    "rateLimitTier": "default_claude_ai"
+                }
+            }"#,
+            || {
+                let plan_type = get_anthropic_oauth_plan_type();
+                let session = anthropic_session().lock().unwrap().clone();
+
+                assert_eq!(plan_type.as_deref(), Some("Pro"));
+                assert_eq!(session.subscription_type, "pro");
+                assert_eq!(session.rate_limit_tier, "default_claude_ai");
+            },
+        );
+    }
+
+    #[test]
+    fn clearing_openai_oauth_preserves_anthropic_secret() {
+        let mut payload = SecretPayload::default();
+        payload.openai_oauth.refresh_token = "openai-refresh".into();
+        payload.anthropic_oauth.refresh_token = "claude-refresh".into();
+        payload.anthropic_oauth.subscription_type = "max".into();
+
+        let updated = payload_after_clearing_openai_secret(payload).unwrap();
+        assert_eq!(updated.openai_oauth, OpenAiOAuthSecret::default());
+        assert_eq!(updated.anthropic_oauth.refresh_token, "claude-refresh");
+        assert_eq!(updated.anthropic_oauth.subscription_type, "max");
+    }
+
+    #[test]
+    fn clearing_anthropic_oauth_preserves_openai_secret() {
+        let mut payload = SecretPayload::default();
+        payload.openai_oauth.refresh_token = "openai-refresh".into();
+        payload.openai_oauth.plan_type = "plus".into();
+        payload.anthropic_oauth.refresh_token = "claude-refresh".into();
+
+        let updated = payload_after_clearing_anthropic_secret(payload).unwrap();
+        assert_eq!(updated.anthropic_oauth, AnthropicOAuthSecret::default());
+        assert_eq!(updated.openai_oauth.refresh_token, "openai-refresh");
+        assert_eq!(updated.openai_oauth.plan_type, "plus");
     }
 }

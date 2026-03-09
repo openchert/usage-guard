@@ -43,10 +43,12 @@
   } as ProviderForm;
   let isLoading = true;
   let isSaving = false;
-  let isConnecting = false;
+  let isConnectingOpenAi = false;
+  let isConnectingAnthropic = false;
   let errorMessage = '';
   let successMessage = '';
-  let oauthStatus: OAuthStatus = { connected: false, plan_type: null };
+  let openaiOAuthStatus: OAuthStatus = { connected: false, plan_type: null };
+  let anthropicOAuthStatus: OAuthStatus = { connected: false, plan_type: null };
 
   function resetForm(providerId = form.provider || providers[0]?.id || ''): void {
     form = {
@@ -107,12 +109,14 @@
     if (!invoke) return;
     isLoading = true;
     try {
-      const [payload, status] = await Promise.all([
+      const [payload, openaiStatus, anthropicStatus] = await Promise.all([
         invoke('get_provider_settings') as Promise<ProviderSettingsPayload>,
         invoke('get_openai_oauth_status') as Promise<OAuthStatus>,
+        invoke('get_anthropic_oauth_status') as Promise<OAuthStatus>,
       ]);
       applyPayload(payload);
-      oauthStatus = status;
+      openaiOAuthStatus = openaiStatus;
+      anthropicOAuthStatus = anthropicStatus;
       if (!form.provider) resetForm(payload.providers[0]?.id ?? '');
     } catch (error) {
       errorMessage = String(error);
@@ -121,27 +125,53 @@
     }
   }
 
-  async function connectOAuth(): Promise<void> {
-    if (!invoke || isConnecting) return;
-    isConnecting = true;
+  async function connectOpenAIOAuth(): Promise<void> {
+    if (!invoke || isConnectingOpenAi) return;
+    isConnectingOpenAi = true;
     errorMessage = '';
     successMessage = '';
     try {
       const planType = await invoke('connect_openai_oauth') as string;
-      oauthStatus = { connected: true, plan_type: planType };
+      openaiOAuthStatus = { connected: true, plan_type: planType };
       successMessage = `ChatGPT ${planType} connected.`;
     } catch (error) {
       errorMessage = String(error);
     } finally {
-      isConnecting = false;
+      isConnectingOpenAi = false;
     }
   }
 
-  async function disconnectOAuth(): Promise<void> {
+  async function disconnectOpenAIOAuth(): Promise<void> {
     if (!invoke) return;
     try {
       await invoke('disconnect_openai_oauth');
-      oauthStatus = { connected: false, plan_type: null };
+      openaiOAuthStatus = { connected: false, plan_type: null };
+    } catch (error) {
+      errorMessage = String(error);
+    }
+  }
+
+  async function connectAnthropicOAuth(): Promise<void> {
+    if (!invoke || isConnectingAnthropic) return;
+    isConnectingAnthropic = true;
+    errorMessage = '';
+    successMessage = '';
+    try {
+      const planType = await invoke('connect_anthropic_oauth') as string;
+      anthropicOAuthStatus = { connected: true, plan_type: planType };
+      successMessage = `Claude ${planType} connected.`;
+    } catch (error) {
+      errorMessage = String(error);
+    } finally {
+      isConnectingAnthropic = false;
+    }
+  }
+
+  async function disconnectAnthropicOAuth(): Promise<void> {
+    if (!invoke) return;
+    try {
+      await invoke('disconnect_anthropic_oauth');
+      anthropicOAuthStatus = { connected: false, plan_type: null };
     } catch (error) {
       errorMessage = String(error);
     }
@@ -205,7 +235,7 @@
   });
 </script>
 
-<div class="shell">
+<div class="shell" on:contextmenu|preventDefault>
   <div class="panel">
     <!-- Title bar -->
     <header class="bar" on:mousedown={startDrag} role="presentation">
@@ -232,15 +262,15 @@
 
     <div class="body">
       <!-- ChatGPT OAuth connection -->
-      <div class="oauth-row" class:oauth-connected={oauthStatus.connected}>
-        <div class="account-dot" style="--accent:{oauthStatus.connected ? '#10a37f' : 'rgba(255,255,255,0.2)'}"></div>
-        {#if oauthStatus.connected}
+      <div class="oauth-row" class:oauth-connected={openaiOAuthStatus.connected}>
+        <div class="account-dot" style="--accent:{openaiOAuthStatus.connected ? '#10a37f' : 'rgba(255,255,255,0.2)'}"></div>
+        {#if openaiOAuthStatus.connected}
           <div class="account-info">
-            <span class="account-name">ChatGPT {oauthStatus.plan_type ?? ''}</span>
+            <span class="account-name">ChatGPT {openaiOAuthStatus.plan_type ?? ''}</span>
             <span class="account-vendor">Subscription</span>
           </div>
-          <button class="link-btn" type="button" on:click={disconnectOAuth}>Disconnect</button>
-        {:else if isConnecting}
+          <button class="link-btn" type="button" on:click={disconnectOpenAIOAuth}>Disconnect</button>
+        {:else if isConnectingOpenAi}
           <div class="account-info">
             <span class="account-vendor">Waiting for browser sign-in…</span>
           </div>
@@ -248,7 +278,27 @@
           <div class="account-info">
             <span class="account-vendor">ChatGPT Plus / Pro subscription</span>
           </div>
-          <button class="save-btn" type="button" on:click={connectOAuth}>Sign in</button>
+          <button class="save-btn" type="button" on:click={connectOpenAIOAuth}>Sign in</button>
+        {/if}
+      </div>
+
+      <div class="oauth-row" class:oauth-connected={anthropicOAuthStatus.connected}>
+        <div class="account-dot" style="--accent:{anthropicOAuthStatus.connected ? '#d97a4e' : 'rgba(255,255,255,0.2)'}"></div>
+        {#if anthropicOAuthStatus.connected}
+          <div class="account-info">
+            <span class="account-name">Claude {anthropicOAuthStatus.plan_type ?? ''}</span>
+            <span class="account-vendor">Subscription</span>
+          </div>
+          <button class="link-btn" type="button" on:click={disconnectAnthropicOAuth}>Disconnect</button>
+        {:else if isConnectingAnthropic}
+          <div class="account-info">
+            <span class="account-vendor">Waiting for browser sign-in…</span>
+          </div>
+        {:else}
+          <div class="account-info">
+            <span class="account-vendor">Claude Pro / Max subscription</span>
+          </div>
+          <button class="save-btn" type="button" on:click={connectAnthropicOAuth}>Sign in</button>
         {/if}
       </div>
 
