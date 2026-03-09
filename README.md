@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="public\assets\title.png" alt="UsageGuard icon" width="140">
+</p>
+
 # UsageGuard
 
 **Know your AI usage in 5 seconds, without getting distracted.**
