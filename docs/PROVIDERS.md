@@ -11,6 +11,7 @@ Instead, each provider/source combination can define its own display adapter und
 Examples:
 
 - `openaiOauth.ts`
+- `anthropicOauth.ts`
 - `openaiApi.ts`
 - `anthropicApi.ts`
 - `shared.ts`
@@ -38,6 +39,20 @@ The UI then converts usage into remaining quota for the display rings:
 - `24% used` becomes `76% left`
 
 The OpenAI OAuth hover text is adapter-specific and shows both used and remaining values.
+
+## Anthropic OAuth display behavior
+
+Anthropic OAuth uses `https://api.anthropic.com/api/oauth/usage`.
+
+The widget reads:
+
+- the five-hour utilization bucket for the `5h` ring
+- the seven-day utilization bucket for the `week` ring
+
+The Anthropic OAuth adapter also shows provider-specific hover text with:
+
+- current five-hour usage and remaining percentage
+- current seven-day usage and remaining percentage
 
 ## Snapshot schema
 
@@ -70,6 +85,7 @@ That means:
 Current built-in remote fetch sources:
 
 - OpenAI OAuth
+- Anthropic OAuth
 - OpenAI API
 - Anthropic API
 - Cursor API

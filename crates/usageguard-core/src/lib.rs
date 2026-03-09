@@ -96,18 +96,10 @@ impl Default for QuietHours {
 pub struct ApiCredentials {
     pub openai_api_key: Option<String>,
     pub anthropic_api_key: Option<String>,
-    pub gemini_api_key: Option<String>,
-    pub mistral_api_key: Option<String>,
-    pub groq_api_key: Option<String>,
-    pub copilot_api_key: Option<String>,
     pub cursor_api_key: Option<String>,
 
     pub openai_costs_endpoint: Option<String>,
     pub anthropic_costs_endpoint: Option<String>,
-    pub gemini_costs_endpoint: Option<String>,
-    pub mistral_costs_endpoint: Option<String>,
-    pub groq_costs_endpoint: Option<String>,
-    pub copilot_costs_endpoint: Option<String>,
     pub cursor_costs_endpoint: Option<String>,
 }
 
@@ -143,6 +135,10 @@ pub struct AppConfig {
     pub provider_accounts: Vec<ProviderAccount>,
     #[serde(default)]
     pub profiles: Vec<ProviderProfile>,
+    /// Last known widget position in logical pixels [x, y].
+    /// Saved on quit and restored on next launch.
+    #[serde(default)]
+    pub widget_position: Option<[f64; 2]>,
 }
 
 impl Default for AppConfig {
@@ -154,6 +150,7 @@ impl Default for AppConfig {
             api: ApiCredentials::default(),
             provider_accounts: vec![],
             profiles: vec![],
+            widget_position: None,
         }
     }
 }
@@ -210,57 +207,6 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             extra_headers: vec![("anthropic-version", "2023-06-01")],
             request_body: None,
             usage_log_env: Some("ANTHROPIC_USAGE_LOG"),
-        },
-        ProviderTemplate {
-            id: "gemini",
-            label: "Gemini",
-            env_prefix: "GEMINI",
-            default_endpoint: None,
-            method: HttpMethod::Get,
-            auth_header: "Authorization",
-            auth_mode: AuthMode::Bearer,
-            extra_headers: vec![],
-            request_body: None,
-            usage_log_env: Some("GEMINI_USAGE_LOG"),
-        },
-        ProviderTemplate {
-            id: "mistral",
-            label: "Mistral",
-            env_prefix: "MISTRAL",
-            default_endpoint: None,
-            method: HttpMethod::Get,
-            auth_header: "Authorization",
-            auth_mode: AuthMode::Bearer,
-            extra_headers: vec![],
-            request_body: None,
-            usage_log_env: Some("MISTRAL_USAGE_LOG"),
-        },
-        ProviderTemplate {
-            id: "groq",
-            label: "Groq",
-            env_prefix: "GROQ",
-            default_endpoint: None,
-            method: HttpMethod::Get,
-            auth_header: "Authorization",
-            auth_mode: AuthMode::Bearer,
-            extra_headers: vec![],
-            request_body: None,
-            usage_log_env: Some("GROQ_USAGE_LOG"),
-        },
-        ProviderTemplate {
-            id: "copilot",
-            label: "Copilot",
-            env_prefix: "COPILOT",
-            default_endpoint: None,
-            method: HttpMethod::Get,
-            auth_header: "Authorization",
-            auth_mode: AuthMode::Bearer,
-            extra_headers: vec![
-                ("Accept", "application/vnd.github+json"),
-                ("X-GitHub-Api-Version", "2022-11-28"),
-            ],
-            request_body: None,
-            usage_log_env: Some("COPILOT_USAGE_LOG"),
         },
         ProviderTemplate {
             id: "cursor",
@@ -1320,10 +1266,6 @@ fn legacy_endpoint(cfg: &ApiCredentials, provider_id: &str) -> Option<String> {
     match provider_id {
         "openai" => cfg.openai_costs_endpoint.clone(),
         "anthropic" => cfg.anthropic_costs_endpoint.clone(),
-        "gemini" => cfg.gemini_costs_endpoint.clone(),
-        "mistral" => cfg.mistral_costs_endpoint.clone(),
-        "groq" => cfg.groq_costs_endpoint.clone(),
-        "copilot" => cfg.copilot_costs_endpoint.clone(),
         "cursor" => cfg.cursor_costs_endpoint.clone(),
         _ => None,
     }
@@ -1333,10 +1275,6 @@ fn clear_legacy_endpoint(cfg: &mut ApiCredentials, provider_id: &str) {
     match provider_id {
         "openai" => cfg.openai_costs_endpoint = None,
         "anthropic" => cfg.anthropic_costs_endpoint = None,
-        "gemini" => cfg.gemini_costs_endpoint = None,
-        "mistral" => cfg.mistral_costs_endpoint = None,
-        "groq" => cfg.groq_costs_endpoint = None,
-        "copilot" => cfg.copilot_costs_endpoint = None,
         "cursor" => cfg.cursor_costs_endpoint = None,
         _ => {}
     }
@@ -1365,10 +1303,6 @@ fn migrate_secret_payload(cfg: &mut AppConfig) -> Result<bool> {
     for (provider_id, key_slot) in [
         ("openai", &mut cfg.api.openai_api_key),
         ("anthropic", &mut cfg.api.anthropic_api_key),
-        ("gemini", &mut cfg.api.gemini_api_key),
-        ("mistral", &mut cfg.api.mistral_api_key),
-        ("groq", &mut cfg.api.groq_api_key),
-        ("copilot", &mut cfg.api.copilot_api_key),
         ("cursor", &mut cfg.api.cursor_api_key),
     ] {
         if let Some(value) = key_slot.take().filter(|value| is_non_empty(value)) {
@@ -1517,15 +1451,7 @@ pub fn load_config() -> Result<AppConfig> {
         }
     }
 
-    for provider_id in [
-        "openai",
-        "anthropic",
-        "gemini",
-        "mistral",
-        "groq",
-        "copilot",
-        "cursor",
-    ] {
+    for provider_id in ["openai", "anthropic", "cursor"] {
         if legacy_endpoint(&cfg.api, provider_id).is_some() {
             clear_legacy_endpoint(&mut cfg.api, provider_id);
             migrated = true;
@@ -1635,10 +1561,6 @@ fn build_legacy_provider_specs() -> Vec<ProviderSpec<'static>> {
             api_key: match template.id {
                 "openai" => resolve_provider_api_key("openai", "OPENAI_API_KEY"),
                 "anthropic" => resolve_provider_api_key("anthropic", "ANTHROPIC_API_KEY"),
-                "gemini" => resolve_provider_api_key("gemini", "GEMINI_API_KEY"),
-                "mistral" => resolve_provider_api_key("mistral", "MISTRAL_API_KEY"),
-                "groq" => resolve_provider_api_key("groq", "GROQ_API_KEY"),
-                "copilot" => resolve_provider_api_key("copilot", "COPILOT_API_KEY"),
                 "cursor" => resolve_provider_api_key("cursor", "CURSOR_API_KEY"),
                 _ => None,
             },
@@ -1792,11 +1714,6 @@ fn snapshot_from_http_json(
             return Ok(s);
         }
     }
-    if provider == "copilot" {
-        if let Ok(s) = parse_copilot_usage_response(&value, label, source) {
-            return Ok(s);
-        }
-    }
     if provider == "cursor" {
         if let Ok(s) = parse_cursor_spend_response(&value, label, source) {
             return Ok(s);
@@ -1900,39 +1817,6 @@ fn parse_anthropic_usage_response(
                 .filter_map(|r| pick_u64(r, &["output_tokens", "tokens_out"]))
                 .sum()
         }),
-        inactive_hours: derive_inactive_hours(value),
-        source: source.to_string(),
-        status_code: None,
-        status_message: None,
-    })
-}
-
-fn parse_copilot_usage_response(value: &Value, label: &str, source: &str) -> Result<UsageSnapshot> {
-    let rows = value
-        .get("usageItems")
-        .and_then(|items| items.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let spent_usd =
-        pick_f64(value, &["spent_usd", "cost_usd", "total_cost_usd"]).unwrap_or_else(|| {
-            rows.iter()
-                .filter_map(|row| pick_f64(row, &["netAmount", "amount", "amount_usd"]))
-                .sum()
-        });
-
-    let request_count = rows
-        .iter()
-        .filter_map(|row| pick_u64(row, &["netQuantity", "quantity", "count"]))
-        .sum();
-
-    Ok(UsageSnapshot {
-        provider: "copilot".into(),
-        account_label: label.to_string(),
-        spent_usd,
-        limit_usd: pick_f64(value, &["limit_usd", "budget_usd"]).unwrap_or(0.0),
-        tokens_in: 0,
-        tokens_out: request_count,
         inactive_hours: derive_inactive_hours(value),
         source: source.to_string(),
         status_code: None,
@@ -2201,21 +2085,6 @@ mod tests {
         assert_eq!(snap.tokens_in, 111);
         assert_eq!(snap.tokens_out, 222);
         assert_eq!(snap.inactive_hours, 3);
-    }
-
-    #[test]
-    fn parse_copilot_usage_rows() {
-        let value: Value = serde_json::json!({
-            "usageItems": [
-                { "netAmount": 1.25, "netQuantity": 10 },
-                { "netAmount": 2.75, "netQuantity": 30 }
-            ]
-        });
-
-        let snap = parse_copilot_usage_response(&value, "Copilot", "api").unwrap();
-        assert_eq!(snap.spent_usd, 4.0);
-        assert_eq!(snap.tokens_in, 0);
-        assert_eq!(snap.tokens_out, 40);
     }
 
     #[test]

@@ -411,11 +411,9 @@
     display: flex;
     flex-direction: column;
     height: 100%;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 14px;
-    background:
-      radial-gradient(circle at top right, rgba(82, 140, 255, 0.14), transparent 38%),
-      linear-gradient(180deg, rgba(16, 17, 24, 0.99), rgba(9, 10, 15, 0.99));
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px;
+    background: var(--bg-surface);
     color: #e4e8f3;
     font-size: 12px;
     overflow: hidden;
@@ -655,7 +653,7 @@
     padding: 7px 9px;
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 8px;
-    background: rgba(8, 10, 14, 0.7);
+    background: rgba(0, 0, 0, 0.35);
     color: #e4e8f3;
     font: inherit;
     font-size: 12px;
@@ -666,7 +664,7 @@
   input:focus,
   select:focus {
     border-color: rgba(100, 140, 255, 0.45);
-    background: rgba(10, 12, 18, 0.88);
+    background: rgba(0, 0, 0, 0.5);
   }
 
   /* Footer */

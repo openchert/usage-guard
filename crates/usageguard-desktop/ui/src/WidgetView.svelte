@@ -189,11 +189,9 @@
     gap: 6px;
     height: 100%;
     padding: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.07);
     border-radius: 12px;
-    background:
-      radial-gradient(circle at top right, rgba(82, 140, 255, 0.18), transparent 34%),
-      linear-gradient(180deg, rgba(16, 17, 24, 0.98), rgba(9, 10, 15, 0.98));
+    background: #1e1f2e;
     cursor: grab;
     user-select: none;
     -webkit-user-select: none;
@@ -221,7 +219,7 @@
     padding: 9px 8px 8px;
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 8px;
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.025));
+    background: rgba(255, 255, 255, 0.03);
     display: flex;
     flex-direction: column;
     gap: 8px;

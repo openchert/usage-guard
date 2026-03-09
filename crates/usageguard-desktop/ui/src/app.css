@@ -1,3 +1,7 @@
+:root {
+  --bg-surface: #1e1f2e;
+}
+
 *,
 *::before,
 *::after {

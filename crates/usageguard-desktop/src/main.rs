@@ -183,16 +183,20 @@ fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
     const SETTINGS_H: f64 = 540.0;
     const GAP: f64 = 8.0;
 
-    // Position the settings window just above the main widget, right-aligned.
+    // Position the settings window to the left of the main widget, bottom-aligned.
+    // No clamping so it follows the widget to whichever monitor it lives on.
     let position = app.get_webview_window("main").and_then(|main_win| {
         let scale = main_win.scale_factor().ok()?;
         let phys_pos = main_win.outer_position().ok()?;
         let phys_size = main_win.inner_size().ok()?;
         let widget_x = phys_pos.x as f64 / scale;
         let widget_y = phys_pos.y as f64 / scale;
-        let widget_w = phys_size.width as f64 / scale;
-        let x = (widget_x + widget_w - SETTINGS_W).max(0.0);
-        let y = (widget_y - SETTINGS_H - GAP).max(0.0);
+        let widget_h = phys_size.height as f64 / scale;
+        // Left of the widget, bottom-aligned with the widget background edge.
+        // +8 compensates for the settings shell padding so the visible panel
+        // bottom lines up with the widget window bottom.
+        let x = widget_x - SETTINGS_W - GAP;
+        let y = widget_y + widget_h - SETTINGS_H + 8.0;
         Some((x, y))
     });
 
@@ -352,9 +356,24 @@ fn delete_provider_account(
     Ok(provider_settings_payload(&cfg))
 }
 
+/// Saves the current widget position to config, then exits.
+/// Called from every quit path so the position is always persisted.
+fn save_position_and_exit(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        if let (Ok(pos), Ok(scale)) = (win.outer_position(), win.scale_factor()) {
+            let state = app.state::<AppState>();
+            let mut cfg = state.cfg.lock().unwrap().clone();
+            cfg.widget_position = Some([pos.x as f64 / scale, pos.y as f64 / scale]);
+            let _ = save_config(&cfg);
+            *state.cfg.lock().unwrap() = cfg;
+        }
+    }
+    app.exit(0);
+}
+
 #[tauri::command]
 fn quit(app: AppHandle) {
-    app.exit(0);
+    save_position_and_exit(&app);
 }
 
 #[tauri::command]
@@ -547,7 +566,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         TRAY_TOGGLE_ID => toggle_window(app),
         TRAY_PROVIDERS_ID | CTX_PROVIDERS_ID => spawn_open_provider_settings(app.clone()),
-        TRAY_QUIT_ID | CTX_QUIT_ID => app.exit(0),
+        TRAY_QUIT_ID | CTX_QUIT_ID => save_position_and_exit(app),
         CTX_REFRESH_ID => {
             emit_widget_refresh(app);
         }
@@ -1051,14 +1070,17 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let cfg = load_config().unwrap_or_default();
+            let saved_position = cfg.widget_position;
             app.manage(AppState {
                 cfg: Mutex::new(cfg),
                 last_notified: Mutex::new(HashMap::new()),
             });
 
-            // Position widget at bottom-right of the work area (excludes taskbar on Windows)
+            // Restore last widget position, or default to bottom-right of the work area.
             if let Some(win) = app.get_webview_window("main") {
-                if let Ok(Some(monitor)) = win.current_monitor() {
+                if let Some([x, y]) = saved_position {
+                    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+                } else if let Ok(Some(monitor)) = win.current_monitor() {
                     let scale = monitor.scale_factor();
 
                     // On Windows, use SystemParametersInfo(SPI_GETWORKAREA) so the widget
@@ -1090,8 +1112,8 @@ fn main() {
 
                     let widget_w = 244.0;
                     let widget_h = 100.0;
-                    let margin_right = 20.0;
-                    let margin_bottom = 12.0;
+                    let margin_right = 30.0;
+                    let margin_bottom = 14.0;
                     let _ = win.set_position(tauri::LogicalPosition::new(
                         area_w - widget_w - margin_right,
                         area_h - widget_h - margin_bottom,

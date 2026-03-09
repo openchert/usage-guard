@@ -2,7 +2,8 @@ $ErrorActionPreference = 'Stop'
 
 $Repo = 'openchert/usage-guard'
 $ApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-$InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { Join-Path $HOME 'bin' }
+$DefaultInstallRoot = Join-Path $env:LOCALAPPDATA 'Programs\usageguard'
+$InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { Join-Path $DefaultInstallRoot 'bin' }
 
 $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
 if ($arch -ne 'x64') {
@@ -11,6 +12,7 @@ if ($arch -ne 'x64') {
 
 $assetName = 'usage-guard-windows-x64.zip'
 
+Write-Host 'Installing prebuilt UsageGuard binaries for Windows x64. Rust is not required.'
 Write-Host 'Fetching latest release metadata...'
 $release = Invoke-RestMethod -Uri $ApiUrl
 $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
@@ -37,7 +39,8 @@ try {
   Write-Host "Installed to $InstallDir"
 
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if (-not $userPath.Split(';') -contains $InstallDir) {
+  $pathEntries = if ([string]::IsNullOrWhiteSpace($userPath)) { @() } else { $userPath.Split(';') }
+  if (-not ($pathEntries -contains $InstallDir)) {
     $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $InstallDir } else { "$userPath;$InstallDir" }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     Write-Host "Added $InstallDir to user PATH. Restart terminal to use commands globally."
@@ -45,8 +48,8 @@ try {
 
   Write-Host ''
   Write-Host 'Try:'
-  Write-Host '  usageguard.exe demo'
-  Write-Host '  usageguard-desktop.exe'
+  Write-Host '  usageguard demo'
+  Write-Host '  usageguard-desktop'
 }
 finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
