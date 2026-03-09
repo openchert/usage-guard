@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/assets/title.png" alt="UsageGuard" width="280">
+  <img src="public/assets/title.png" alt="UsageGuard" width="240">
 </p>
 
 <h1 align="center">UsageGuard</h1>
