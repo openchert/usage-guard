@@ -35,6 +35,25 @@ function formatCompactCount(value: number): string {
   }).format(value);
 }
 
+export function formatResetTime(value?: string | null): string | null {
+  if (!value) return null;
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date);
+}
+
+export function appendResetLine(lines: string[], label: string, value?: string | null): void {
+  const formatted = formatResetTime(value);
+  if (formatted) {
+    lines.push(`${label} resets: ${formatted}`);
+  }
+}
+
 function weeklyRatio(snapshot: UsageSnapshot): number {
   if (snapshot.limit_usd != null && snapshot.limit_usd > 0 && snapshot.spent_usd != null) {
     return clampRatio(snapshot.spent_usd / snapshot.limit_usd);

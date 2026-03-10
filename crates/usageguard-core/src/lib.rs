@@ -19,6 +19,17 @@ const ANTHROPIC_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 const ANTHROPIC_OAUTH_SCOPE: &str =
     "user:inference user:mcp_servers user:profile user:sessions:claude_code";
 const CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV: &str = "USAGEGUARD_CLAUDE_CREDENTIALS_PATH_OVERRIDE";
+pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 15;
+pub const MIN_REFRESH_INTERVAL_SECS: u32 = 15;
+pub const MAX_REFRESH_INTERVAL_SECS: u32 = 900;
+
+fn default_refresh_interval_secs() -> u32 {
+    DEFAULT_REFRESH_INTERVAL_SECS
+}
+
+pub fn clamp_refresh_interval_secs(value: u32) -> u32 {
+    value.clamp(MIN_REFRESH_INTERVAL_SECS, MAX_REFRESH_INTERVAL_SECS)
+}
 
 #[derive(Debug, Clone, Default)]
 struct OpenAiSessionState {
@@ -99,6 +110,10 @@ pub struct UsageSnapshot {
     pub status_message: Option<String>,
     #[serde(default)]
     pub api_metrics: Option<ApiMetricCard>,
+    #[serde(default)]
+    pub primary_reset_at: Option<String>,
+    #[serde(default)]
+    pub secondary_reset_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +176,8 @@ pub struct AppConfig {
     pub near_limit_ratio: f64,
     pub inactive_threshold_hours: u32,
     pub quiet_hours: QuietHours,
+    #[serde(default = "default_refresh_interval_secs")]
+    pub refresh_interval_secs: u32,
     pub api: ApiCredentials,
     #[serde(default)]
     pub provider_accounts: Vec<ProviderAccount>,
@@ -184,6 +201,7 @@ impl Default for AppConfig {
             near_limit_ratio: 0.85,
             inactive_threshold_hours: 8,
             quiet_hours: QuietHours::default(),
+            refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             api: ApiCredentials::default(),
             provider_accounts: vec![],
             profiles: vec![],
@@ -1076,6 +1094,8 @@ struct OpenAiOAuthUsageData {
     plan_type: String,
     primary_percent: f64,
     secondary_percent: f64,
+    primary_reset_at: Option<String>,
+    secondary_reset_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1084,6 +1104,8 @@ struct AnthropicOAuthUsageData {
     rate_limit_tier: String,
     session_used: f64,
     week_used: f64,
+    session_reset_at: Option<String>,
+    week_reset_at: Option<String>,
 }
 
 fn openai_oauth_plan_label(value: &str) -> String {
@@ -1174,6 +1196,19 @@ fn parse_openai_oauth_usage_data(value: &Value) -> Result<OpenAiOAuthUsageData> 
         ));
     }
 
+    let primary_reset_at = openai_oauth_window_reset_at(
+        value,
+        "primary_window",
+        "primaryWindow",
+        "short_window",
+    );
+    let secondary_reset_at = openai_oauth_window_reset_at(
+        value,
+        "secondary_window",
+        "secondaryWindow",
+        "long_window",
+    );
+
     Ok(OpenAiOAuthUsageData {
         account_id,
         plan_type: openai_oauth_plan_label(value["plan_type"].as_str().unwrap_or_default()),
@@ -1185,6 +1220,10 @@ fn parse_openai_oauth_usage_data(value: &Value) -> Result<OpenAiOAuthUsageData> 
             .or(primary_percent)
             .unwrap_or(0.0)
             .clamp(0.0, 100.0),
+        primary_reset_at: primary_reset_at
+            .clone()
+            .or_else(|| secondary_reset_at.clone()),
+        secondary_reset_at: secondary_reset_at.or(primary_reset_at),
     })
 }
 
@@ -1259,6 +1298,8 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
         status_code: None,
         status_message: None,
         api_metrics: None,
+        primary_reset_at: usage.primary_reset_at.clone(),
+        secondary_reset_at: usage.secondary_reset_at.clone(),
     })
 }
 
@@ -1271,44 +1312,88 @@ fn anthropic_oauth_bucket_value(bucket: &Value) -> Option<f64> {
     }
 }
 
+fn openai_oauth_window_reset_at(
+    value: &Value,
+    primary_key: &str,
+    camel_key: &str,
+    fallback_key: &str,
+) -> Option<String> {
+    [
+        format!("/rate_limit/{primary_key}/resets_at"),
+        format!("/rate_limit/{primary_key}/reset_at"),
+        format!("/rate_limit/{primary_key}/resetsAt"),
+        format!("/rate_limit/{primary_key}/resetAt"),
+        format!("/rate_limit/{camel_key}/resets_at"),
+        format!("/rate_limit/{camel_key}/reset_at"),
+        format!("/rate_limit/{camel_key}/resetsAt"),
+        format!("/rate_limit/{camel_key}/resetAt"),
+        format!("/{primary_key}/resets_at"),
+        format!("/{primary_key}/reset_at"),
+        format!("/{primary_key}/resetsAt"),
+        format!("/{primary_key}/resetAt"),
+        format!("/{camel_key}/resets_at"),
+        format!("/{camel_key}/reset_at"),
+        format!("/{camel_key}/resetsAt"),
+        format!("/{camel_key}/resetAt"),
+        format!("/{fallback_key}/resets_at"),
+        format!("/{fallback_key}/reset_at"),
+        format!("/{fallback_key}/resetsAt"),
+        format!("/{fallback_key}/resetAt"),
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    .map(str::to_string)
+}
+
+fn anthropic_oauth_bucket<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| value.get(*key))
+}
+
 fn anthropic_oauth_bucket_percent(value: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|key| {
-        value
-            .get(*key)
-            .and_then(anthropic_oauth_bucket_value)
-            .or_else(|| {
+    anthropic_oauth_bucket(value, keys)
+        .and_then(anthropic_oauth_bucket_value)
+        .or_else(|| {
+            keys.iter().find_map(|key| {
                 let utilization_key = format!("{key}_utilization");
                 value
                     .get(utilization_key.as_str())
                     .and_then(anthropic_oauth_bucket_value)
             })
-    })
+        })
+}
+
+fn anthropic_oauth_bucket_reset_at(value: &Value, keys: &[&str]) -> Option<String> {
+    anthropic_oauth_bucket(value, keys)
+        .and_then(|bucket| pick_str(bucket, &["resets_at", "reset_at", "resetsAt", "resetAt"]))
+        .map(str::to_string)
 }
 
 fn parse_anthropic_oauth_usage_data(value: &Value) -> Result<AnthropicOAuthUsageData> {
+    let five_hour_keys = &["five_hour", "fiveHour", "5_hour", "short_term", "shortTerm"];
+    let seven_day_keys = &[
+        "seven_day",
+        "seven_day_all",
+        "daily",
+        "sevenDayAll",
+        "7_day_all",
+        "long_term",
+        "longTerm",
+        "weekly",
+    ];
     let five_hour_percent = anthropic_oauth_bucket_percent(
         value,
-        &["five_hour", "fiveHour", "5_hour", "short_term", "shortTerm"],
+        five_hour_keys,
     );
-    let seven_day_percent = anthropic_oauth_bucket_percent(
-        value,
-        &[
-            "seven_day",
-            "seven_day_all",
-            "daily",
-            "sevenDayAll",
-            "7_day_all",
-            "long_term",
-            "longTerm",
-            "weekly",
-        ],
-    );
+    let seven_day_percent = anthropic_oauth_bucket_percent(value, seven_day_keys);
 
     if five_hour_percent.is_none() && seven_day_percent.is_none() {
         return Err(anyhow!(
             "Anthropic oauth usage response missing supported utilization buckets"
         ));
     }
+
+    let five_hour_reset_at = anthropic_oauth_bucket_reset_at(value, five_hour_keys);
+    let seven_day_reset_at = anthropic_oauth_bucket_reset_at(value, seven_day_keys);
 
     Ok(AnthropicOAuthUsageData {
         subscription_type: pick_str(
@@ -1333,6 +1418,10 @@ fn parse_anthropic_oauth_usage_data(value: &Value) -> Result<AnthropicOAuthUsage
             .or(five_hour_percent)
             .unwrap_or(0.0)
             .clamp(0.0, 100.0),
+        session_reset_at: five_hour_reset_at
+            .clone()
+            .or_else(|| seven_day_reset_at.clone()),
+        week_reset_at: seven_day_reset_at.or(five_hour_reset_at),
     })
 }
 
@@ -1352,6 +1441,8 @@ fn anthropic_oauth_snapshot_from_usage(
         status_code: None,
         status_message: None,
         api_metrics: None,
+        primary_reset_at: usage.session_reset_at.clone(),
+        secondary_reset_at: usage.week_reset_at.clone(),
     }
 }
 
@@ -1644,6 +1735,12 @@ pub fn load_config() -> Result<AppConfig> {
         migrated = true;
     }
 
+    let normalized_refresh_interval = clamp_refresh_interval_secs(cfg.refresh_interval_secs);
+    if cfg.refresh_interval_secs != normalized_refresh_interval {
+        cfg.refresh_interval_secs = normalized_refresh_interval;
+        migrated = true;
+    }
+
     if migrated {
         save_config(&cfg)?;
     }
@@ -1891,15 +1988,6 @@ pub struct AnthropicOAuthVerification {
     pub plan_type: String,
 }
 
-fn error_is_timeout(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .map(|reqwest_error| reqwest_error.is_timeout())
-            .unwrap_or(false)
-    })
-}
-
 fn verification_error_priority(kind: &VerificationErrorKind) -> u8 {
     match kind {
         VerificationErrorKind::InsufficientAccess => 0,
@@ -1953,13 +2041,8 @@ fn validation_error_from_api_fetch(
             forbidden_message,
             unavailable_message,
         ),
-        ApiFetchError::Transport(error) => {
-            let kind = if error_is_timeout(error) {
-                VerificationErrorKind::UpstreamUnavailable
-            } else {
-                VerificationErrorKind::UpstreamUnavailable
-            };
-            VerificationError::new(kind, unavailable_message)
+        ApiFetchError::Transport(_) => {
+            VerificationError::new(VerificationErrorKind::UpstreamUnavailable, unavailable_message)
         }
         ApiFetchError::InvalidResponse(_) => VerificationError::new(
             VerificationErrorKind::InvalidResponse,
@@ -2326,6 +2409,8 @@ fn build_api_metric_snapshot(
         status_code: status_code.map(str::to_string),
         status_message,
         api_metrics: Some(metrics),
+        primary_reset_at: None,
+        secondary_reset_at: None,
     }
 }
 
@@ -2947,6 +3032,8 @@ fn parse_openai_costs_response(value: &Value, label: &str, source: &str) -> Resu
         status_code: None,
         status_message: None,
         api_metrics: None,
+        primary_reset_at: None,
+        secondary_reset_at: None,
     })
 }
 
@@ -2994,6 +3081,8 @@ fn parse_anthropic_usage_response(
         status_code: None,
         status_message: None,
         api_metrics: None,
+        primary_reset_at: None,
+        secondary_reset_at: None,
     })
 }
 
@@ -3047,6 +3136,8 @@ fn snapshot_from_value(
         status_code: None,
         status_message: None,
         api_metrics,
+        primary_reset_at: None,
+        secondary_reset_at: None,
     })
 }
 
@@ -3084,6 +3175,8 @@ fn env_fallback_snapshot(provider: &str, label: &str, prefix: &str) -> Option<Us
         status_code: None,
         status_message: None,
         api_metrics: None,
+        primary_reset_at: None,
+        secondary_reset_at: None,
     })
 }
 
@@ -3106,6 +3199,8 @@ fn error_snapshot(
         status_code: status_code.map(str::to_string),
         status_message: status_message.map(str::to_string),
         api_metrics: None,
+        primary_reset_at: None,
+        secondary_reset_at: None,
     }
 }
 
@@ -3148,6 +3243,8 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
             status_code: None,
             status_message: None,
             api_metrics: None,
+            primary_reset_at: None,
+            secondary_reset_at: None,
         },
         UsageSnapshot {
             provider: "anthropic".into(),
@@ -3161,6 +3258,8 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
             status_code: None,
             status_message: None,
             api_metrics: None,
+            primary_reset_at: None,
+            secondary_reset_at: None,
         },
     ]
 }
@@ -3236,6 +3335,8 @@ mod tests {
             status_code: None,
             status_message: None,
             api_metrics: None,
+            primary_reset_at: None,
+            secondary_reset_at: None,
         };
         let alerts = evaluate_alerts(&s, &cfg);
         assert!(alerts.iter().any(|a| a.code == "near_limit"));
@@ -3527,6 +3628,8 @@ mod tests {
         assert_eq!(snap.tokens_in, 63);
         assert!((snap.spent_usd - 37.0).abs() < f64::EPSILON);
         assert!((snap.limit_usd - 100.0).abs() < f64::EPSILON);
+        assert_eq!(snap.primary_reset_at.as_deref(), Some("2026-03-09T12:00:00Z"));
+        assert_eq!(snap.secondary_reset_at.as_deref(), Some("2026-03-12T00:00:00Z"));
     }
 
     #[test]
@@ -3539,6 +3642,31 @@ mod tests {
         let snap = parse_anthropic_oauth_usage_response(&value).unwrap();
         assert_eq!(snap.tokens_in, 24);
         assert!((snap.spent_usd - 24.0).abs() < f64::EPSILON);
+        assert!(snap.primary_reset_at.is_none());
+        assert!(snap.secondary_reset_at.is_none());
+    }
+
+    #[test]
+    fn parse_openai_oauth_usage_data_extracts_reset_times() {
+        let value: Value = serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 48.0,
+                    "resets_at": "2026-03-10T11:00:00Z"
+                },
+                "secondary_window": {
+                    "used_percent": 21.5,
+                    "reset_at": "2026-03-12T00:00:00Z"
+                }
+            }
+        });
+
+        let usage = parse_openai_oauth_usage_data(&value).unwrap();
+        assert!((usage.primary_percent - 48.0).abs() < f64::EPSILON);
+        assert!((usage.secondary_percent - 21.5).abs() < f64::EPSILON);
+        assert_eq!(usage.primary_reset_at.as_deref(), Some("2026-03-10T11:00:00Z"));
+        assert_eq!(usage.secondary_reset_at.as_deref(), Some("2026-03-12T00:00:00Z"));
     }
 
     #[test]

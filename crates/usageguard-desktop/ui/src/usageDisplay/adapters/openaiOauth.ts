@@ -4,6 +4,7 @@ import type {
   UsageDisplayContext,
   UsageSnapshot,
 } from '../types';
+import { formatResetTime } from './shared';
 
 function clampRatio(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -31,11 +32,12 @@ export const openaiOauthDisplayAdapter: UsageDisplayAdapter = {
     const primaryLeft = Math.round(remainingRatio(primaryUsed) * 100);
     const secondaryLeft = Math.round(remainingRatio(secondaryUsed) * 100);
 
+    const primaryReset = formatResetTime(snapshot.primary_reset_at);
+    const secondaryReset = formatResetTime(snapshot.secondary_reset_at);
     const titleLines = [
       label,
-      'ChatGPT OAuth',
-      `5h used: ${primaryUsed}% | left: ${primaryLeft}%`,
-      `week used: ${secondaryUsed}% | left: ${secondaryLeft}%`,
+      `5h used: ${primaryUsed}% | left: ${primaryLeft}%${primaryReset ? ` | resets: ${primaryReset}` : ''}`,
+      `week used: ${secondaryUsed}% | left: ${secondaryLeft}%${secondaryReset ? ` | resets: ${secondaryReset}` : ''}`,
     ];
     if (snapshot.status_message) {
       titleLines.push(`Status: ${snapshot.status_message}`);

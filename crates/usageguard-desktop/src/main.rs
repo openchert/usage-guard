@@ -12,15 +12,24 @@ use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use usageguard_core::{
-    evaluate_alerts, has_provider_account_api_key, load_config, provider_catalog,
-    provider_snapshots, save_config, set_provider_account_api_key, should_notify,
+    clamp_refresh_interval_secs, evaluate_alerts, has_provider_account_api_key, load_config,
+    provider_catalog, provider_snapshots, save_config, set_provider_account_api_key, should_notify,
     verify_anthropic_oauth_access_token, verify_openai_oauth_access_token, verify_provider_api_key,
-    AppConfig, ProviderAccount, ProviderCatalogEntry, UsageSnapshot,
+    AppConfig, ProviderAccount, ProviderCatalogEntry, UsageSnapshot, MAX_REFRESH_INTERVAL_SECS,
+    MIN_REFRESH_INTERVAL_SECS,
 };
+
+#[derive(Default)]
+struct RefreshState {
+    in_flight: bool,
+    queued: bool,
+}
 
 struct AppState {
     cfg: Mutex<AppConfig>,
     last_notified: Mutex<HashMap<String, String>>,
+    snapshots: Mutex<Vec<UsageSnapshot>>,
+    refresh: Mutex<RefreshState>,
 }
 
 const TRAY_TOGGLE_ID: &str = "tray.toggle";
@@ -60,15 +69,59 @@ struct ProviderAccountInput {
 
 #[tauri::command]
 fn get_snapshots(state: State<AppState>) -> Vec<UsageSnapshot> {
-    let cfg = state.cfg.lock().unwrap().clone();
-    let snapshots = provider_snapshots(&cfg);
-    fire_notifications(&snapshots, &cfg, &mut state.last_notified.lock().unwrap());
-    snapshots
+    state
+        .snapshots
+        .lock()
+        .expect("AppState snapshots lock poisoned")
+        .clone()
 }
 
 #[tauri::command]
 fn get_config(state: State<AppState>) -> AppConfig {
-    state.cfg.lock().unwrap().clone()
+    state.cfg.lock().expect("AppState cfg lock poisoned").clone()
+}
+
+#[tauri::command]
+fn get_refresh_interval_secs(state: State<AppState>) -> u32 {
+    state
+        .cfg
+        .lock()
+        .expect("AppState cfg lock poisoned")
+        .refresh_interval_secs
+}
+
+#[tauri::command]
+fn refresh_snapshots(app: AppHandle) {
+    spawn_snapshot_refresh(app);
+}
+
+fn validate_refresh_interval_secs(refresh_interval_secs: u32) -> Result<u32, String> {
+    let normalized = clamp_refresh_interval_secs(refresh_interval_secs);
+    if normalized != refresh_interval_secs {
+        return Err(format!(
+            "Refresh interval must be between {MIN_REFRESH_INTERVAL_SECS} and {MAX_REFRESH_INTERVAL_SECS} seconds."
+        ));
+    }
+    Ok(refresh_interval_secs)
+}
+
+#[tauri::command]
+fn set_refresh_interval_secs(
+    window: WebviewWindow,
+    refresh_interval_secs: u32,
+    state: State<AppState>,
+    app: AppHandle,
+) -> Result<u32, String> {
+    require_window_label(&window, SETTINGS_LABEL, "set_refresh_interval_secs")?;
+    let refresh_interval_secs = validate_refresh_interval_secs(refresh_interval_secs)?;
+
+    let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
+    guard.refresh_interval_secs = refresh_interval_secs;
+    save_config(&guard).map_err(|error| error.to_string())?;
+    drop(guard);
+
+    emit_widget_refresh(&app);
+    Ok(refresh_interval_secs)
 }
 
 fn normalize_optional(value: Option<String>) -> Option<String> {
@@ -270,6 +323,66 @@ fn emit_widget_refresh(app: &AppHandle) {
     }
 }
 
+fn spawn_snapshot_refresh(app: AppHandle) {
+    let should_spawn = {
+        let state = app.state::<AppState>();
+        let mut refresh = state.refresh.lock().expect("AppState refresh lock poisoned");
+        if refresh.in_flight {
+            refresh.queued = true;
+            false
+        } else {
+            refresh.in_flight = true;
+            refresh.queued = false;
+            true
+        }
+    };
+
+    if !should_spawn {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        loop {
+            let state = app.state::<AppState>();
+            let cfg = state.cfg.lock().expect("AppState cfg lock poisoned").clone();
+            let snapshots = provider_snapshots(&cfg);
+
+            {
+                let mut cache = state
+                    .snapshots
+                    .lock()
+                    .expect("AppState snapshots lock poisoned");
+                *cache = snapshots.clone();
+            }
+
+            fire_notifications(
+                &snapshots,
+                &cfg,
+                &mut state
+                    .last_notified
+                    .lock()
+                    .expect("AppState last_notified lock poisoned"),
+            );
+            emit_widget_refresh(&app);
+
+            let should_continue = {
+                let mut refresh = state.refresh.lock().expect("AppState refresh lock poisoned");
+                if refresh.queued {
+                    refresh.queued = false;
+                    true
+                } else {
+                    refresh.in_flight = false;
+                    false
+                }
+            };
+
+            if !should_continue {
+                break;
+            }
+        }
+    });
+}
+
 fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = win.set_always_on_top(true);
@@ -338,12 +451,15 @@ fn spawn_open_provider_settings(app: AppHandle) {
 #[tauri::command]
 fn update_config(
     window: WebviewWindow,
-    config: AppConfig,
+    mut config: AppConfig,
     state: State<AppState>,
+    app: AppHandle,
 ) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "update_config")?;
+    config.refresh_interval_secs = clamp_refresh_interval_secs(config.refresh_interval_secs);
     save_config(&config).map_err(|e| e.to_string())?;
-    *state.cfg.lock().unwrap() = config;
+    *state.cfg.lock().expect("AppState cfg lock poisoned") = config;
+    emit_widget_refresh(&app);
     Ok(())
 }
 
@@ -354,7 +470,7 @@ fn open_provider_settings(app: AppHandle) {
 
 #[tauri::command]
 fn get_provider_settings(state: State<AppState>) -> ProviderSettingsPayload {
-    provider_settings_payload(&state.cfg.lock().unwrap().clone())
+    provider_settings_payload(&state.cfg.lock().expect("AppState cfg lock poisoned").clone())
 }
 
 #[tauri::command]
@@ -365,7 +481,9 @@ fn save_provider_account(
     app: AppHandle,
 ) -> Result<ProviderSettingsPayload, String> {
     require_window_label(&window, SETTINGS_LABEL, "save_provider_account")?;
-    let mut cfg = state.cfg.lock().unwrap().clone();
+    // Clone out because apply_provider_account_save may perform HTTP validation,
+    // and we must not hold the mutex across network I/O.
+    let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned").clone();
     let catalog = provider_catalog();
     apply_provider_account_save(
         &mut cfg,
@@ -381,8 +499,8 @@ fn save_provider_account(
         |updated_cfg| save_config(updated_cfg).map_err(|error| error.to_string()),
     )?;
 
-    *state.cfg.lock().unwrap() = cfg.clone();
-    emit_widget_refresh(&app);
+    *state.cfg.lock().expect("AppState cfg lock poisoned") = cfg.clone();
+    spawn_snapshot_refresh(app);
     Ok(provider_settings_payload(&cfg))
 }
 
@@ -394,17 +512,18 @@ fn delete_provider_account(
     app: AppHandle,
 ) -> Result<ProviderSettingsPayload, String> {
     require_window_label(&window, SETTINGS_LABEL, "delete_provider_account")?;
-    let mut cfg = state.cfg.lock().unwrap().clone();
-    let before = cfg.provider_accounts.len();
-    cfg.provider_accounts.retain(|account| account.id != id);
-    if cfg.provider_accounts.len() == before {
-        return Err("Provider account not found".to_string());
-    }
-
-    save_config(&cfg).map_err(|e| e.to_string())?;
-    let _ = set_provider_account_api_key(&id, None);
-    *state.cfg.lock().unwrap() = cfg.clone();
-    emit_widget_refresh(&app);
+    let cfg = {
+        let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
+        let before = guard.provider_accounts.len();
+        guard.provider_accounts.retain(|account| account.id != id);
+        if guard.provider_accounts.len() == before {
+            return Err("Provider account not found".to_string());
+        }
+        save_config(&guard).map_err(|e| e.to_string())?;
+        let _ = set_provider_account_api_key(&id, None);
+        guard.clone()
+    };
+    spawn_snapshot_refresh(app);
     Ok(provider_settings_payload(&cfg))
 }
 
@@ -414,10 +533,9 @@ fn save_position_and_exit(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if let (Ok(pos), Ok(scale)) = (win.outer_position(), win.scale_factor()) {
             let state = app.state::<AppState>();
-            let mut cfg = state.cfg.lock().unwrap().clone();
-            cfg.widget_position = Some([pos.x as f64 / scale, pos.y as f64 / scale]);
-            let _ = save_config(&cfg);
-            *state.cfg.lock().unwrap() = cfg;
+            let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
+            guard.widget_position = Some([pos.x as f64 / scale, pos.y as f64 / scale]);
+            let _ = save_config(&guard);
         }
     }
     app.exit(0);
@@ -620,7 +738,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         TRAY_PROVIDERS_ID | CTX_PROVIDERS_ID => spawn_open_provider_settings(app.clone()),
         TRAY_QUIT_ID | CTX_QUIT_ID => save_position_and_exit(app),
         CTX_REFRESH_ID => {
-            emit_widget_refresh(app);
+            spawn_snapshot_refresh(app.clone());
         }
         CTX_ALWAYS_ON_TOP_ID => {
             if let Some(win) = app.get_webview_window("main") {
@@ -979,7 +1097,7 @@ async fn connect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<S
     )
     .map_err(|e| e.to_string())?;
 
-    emit_widget_refresh(&app);
+    spawn_snapshot_refresh(app);
     Ok(verified.plan_type)
 }
 
@@ -1023,7 +1141,7 @@ async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Resul
     )
     .map_err(|e| e.to_string())?;
 
-    emit_widget_refresh(&app);
+    spawn_snapshot_refresh(app);
     Ok(verified.plan_type)
 }
 
@@ -1031,7 +1149,7 @@ async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Resul
 fn disconnect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "disconnect_openai_oauth")?;
     usageguard_core::clear_openai_oauth_tokens();
-    emit_widget_refresh(&app);
+    spawn_snapshot_refresh(app);
     Ok(())
 }
 
@@ -1039,7 +1157,7 @@ fn disconnect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<(), 
 fn disconnect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "disconnect_anthropic_oauth")?;
     usageguard_core::clear_anthropic_oauth_tokens();
-    emit_widget_refresh(&app);
+    spawn_snapshot_refresh(app);
     Ok(())
 }
 
@@ -1058,7 +1176,7 @@ fn get_openai_oauth_status(state: State<AppState>) -> OAuthStatus {
     } else {
         None
     };
-    let label = state.cfg.lock().unwrap().openai_oauth_label.clone();
+    let label = state.cfg.lock().expect("AppState cfg lock poisoned").openai_oauth_label.clone();
     OAuthStatus {
         connected,
         plan_type,
@@ -1074,7 +1192,7 @@ fn get_anthropic_oauth_status(state: State<AppState>) -> OAuthStatus {
     } else {
         None
     };
-    let label = state.cfg.lock().unwrap().anthropic_oauth_label.clone();
+    let label = state.cfg.lock().expect("AppState cfg lock poisoned").anthropic_oauth_label.clone();
     OAuthStatus {
         connected,
         plan_type,
@@ -1088,6 +1206,7 @@ fn set_oauth_label(
     provider: String,
     label: String,
     state: State<AppState>,
+    app: AppHandle,
 ) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "set_oauth_label")?;
     let trimmed = label.trim().to_string();
@@ -1096,14 +1215,15 @@ fn set_oauth_label(
     } else {
         Some(trimmed)
     };
-    let mut cfg = state.cfg.lock().unwrap().clone();
+    let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
     match provider.as_str() {
-        "openai" => cfg.openai_oauth_label = label_opt,
-        "anthropic" => cfg.anthropic_oauth_label = label_opt,
+        "openai" => guard.openai_oauth_label = label_opt,
+        "anthropic" => guard.anthropic_oauth_label = label_opt,
         _ => return Err(format!("Unknown OAuth provider: {provider}")),
     }
-    save_config(&cfg).map_err(|e| e.to_string())?;
-    *state.cfg.lock().unwrap() = cfg;
+    save_config(&guard).map_err(|e| e.to_string())?;
+    drop(guard);
+    spawn_snapshot_refresh(app);
     Ok(())
 }
 
@@ -1346,6 +1466,8 @@ fn main() {
             app.manage(AppState {
                 cfg: Mutex::new(cfg),
                 last_notified: Mutex::new(HashMap::new()),
+                snapshots: Mutex::new(Vec::new()),
+                refresh: Mutex::new(RefreshState::default()),
             });
 
             // Restore last widget position, or default to bottom-right of the work area.
@@ -1431,11 +1553,15 @@ fn main() {
                 })
                 .build(app)?;
 
+            spawn_snapshot_refresh(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshots,
             get_config,
+            get_refresh_interval_secs,
+            refresh_snapshots,
             get_provider_settings,
             open_provider_settings,
             save_provider_account,
@@ -1451,6 +1577,7 @@ fn main() {
             get_openai_oauth_status,
             get_anthropic_oauth_status,
             set_oauth_label,
+            set_refresh_interval_secs,
         ])
         .run(tauri::generate_context!())
         .expect("error running tauri application");

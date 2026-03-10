@@ -39,6 +39,7 @@ The UI then converts usage into remaining quota for the display rings:
 - `24% used` becomes `76% left`
 
 The OpenAI OAuth hover text is adapter-specific and shows both used and remaining values.
+When the upstream response includes reset timestamps, the hover text also shows the next reset time for the `5h` and `week` windows.
 
 ## Anthropic OAuth display behavior
 
@@ -53,6 +54,7 @@ The Anthropic OAuth adapter also shows provider-specific hover text with:
 
 - current five-hour usage and remaining percentage
 - current seven-day usage and remaining percentage
+- reset timestamps for each bucket when Anthropic returns them
 
 ## API display behavior
 
@@ -94,6 +96,7 @@ User-safe error state is carried separately in:
 - `status_code`
 - `status_message`
 - `api_metrics` for typed `Today` / `30d` API card data when present
+- `primary_reset_at` / `secondary_reset_at` for OAuth quota reset timestamps when present
 
 That keeps the UI and CLI readable without leaking raw upstream response bodies.
 

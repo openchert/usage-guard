@@ -22,6 +22,8 @@ export interface UsageSnapshot {
   status_code?: string | null;
   status_message?: string | null;
   api_metrics?: ApiMetricCard | null;
+  primary_reset_at?: string | null;
+  secondary_reset_at?: string | null;
 }
 
 export interface UsageRingSpec {

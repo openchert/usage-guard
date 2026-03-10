@@ -4,6 +4,7 @@ import type {
   UsageDisplayContext,
   UsageSnapshot,
 } from '../types';
+import { formatResetTime } from './shared';
 
 function clampRatio(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -31,11 +32,12 @@ export const anthropicOauthDisplayAdapter: UsageDisplayAdapter = {
     const sessionLeft = Math.round(remainingRatio(sessionUsed) * 100);
     const weekLeft = Math.round(remainingRatio(weekUsed) * 100);
 
+    const primaryReset = formatResetTime(snapshot.primary_reset_at);
+    const secondaryReset = formatResetTime(snapshot.secondary_reset_at);
     const titleLines = [
       label,
-      'Claude OAuth',
-      `session used: ${sessionUsed}% | left: ${sessionLeft}%`,
-      `week used: ${weekUsed}% | left: ${weekLeft}%`,
+      `5H used: ${sessionUsed}% | left: ${sessionLeft}%${primaryReset ? ` | resets: ${primaryReset}` : ''}`,
+      `week used: ${weekUsed}% | left: ${weekLeft}%${secondaryReset ? ` | resets: ${secondaryReset}` : ''}`,
     ];
     if (snapshot.status_message) {
       titleLines.push(`Status: ${snapshot.status_message}`);

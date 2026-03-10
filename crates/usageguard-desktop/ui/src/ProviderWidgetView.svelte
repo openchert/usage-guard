@@ -9,12 +9,14 @@
   const CARD_GAP = 6;
   const WIDGET_H = 90;
   const WIDGET_PAD = 8;
-  const REFRESH_MS = 30_000;
+  const DEFAULT_REFRESH_INTERVAL_MS = 60_000;
   const REFRESH_EVENT = 'usageguard://refresh';
 
   let snapshots = [] as UsageSnapshot[];
   let isLoading = false;
+  let refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS;
   let refreshTimer: number | null = null;
+  let lastRenderedCardCount: number | null = null;
   let unlistenRefresh: (() => void) | null = null;
 
   function cardSpec(snapshot: UsageSnapshot) {
@@ -55,6 +57,31 @@
     });
   }
 
+  function normalizeRefreshIntervalMs(value: number): number {
+    if (!Number.isFinite(value) || value <= 0) return DEFAULT_REFRESH_INTERVAL_MS;
+    return Math.round(value) * 1000;
+  }
+
+  function resetRefreshTimer(): void {
+    if (refreshTimer !== null) window.clearInterval(refreshTimer);
+    refreshTimer = window.setInterval(() => void requestRefresh(), refreshIntervalMs);
+  }
+
+  async function loadRefreshInterval(): Promise<void> {
+    if (!invoke) return;
+
+    try {
+      const value = await invoke('get_refresh_interval_secs') as number;
+      const nextRefreshIntervalMs = normalizeRefreshIntervalMs(value);
+      if (nextRefreshIntervalMs !== refreshIntervalMs) {
+        refreshIntervalMs = nextRefreshIntervalMs;
+        resetRefreshTimer();
+      }
+    } catch (error) {
+      console.error('get_refresh_interval_secs failed:', error);
+    }
+  }
+
   async function loadSnapshots(): Promise<void> {
     if (!invoke || isLoading) return;
 
@@ -62,11 +89,24 @@
     try {
       const items = await invoke('get_snapshots') as UsageSnapshot[];
       snapshots = sorted(items);
-      await resizeToFit(snapshots.length);
+      if (lastRenderedCardCount !== snapshots.length) {
+        await resizeToFit(snapshots.length);
+        lastRenderedCardCount = snapshots.length;
+      }
     } catch (error) {
       console.error('get_snapshots failed:', error);
     } finally {
       isLoading = false;
+    }
+  }
+
+  async function requestRefresh(): Promise<void> {
+    if (!invoke) return;
+
+    try {
+      await invoke('refresh_snapshots');
+    } catch (error) {
+      console.error('refresh_snapshots failed:', error);
     }
   }
 
@@ -100,12 +140,15 @@
 
     if (listen) {
       unlistenRefresh = await listen(REFRESH_EVENT, () => {
+        void loadRefreshInterval();
         void loadSnapshots();
       });
     }
 
+    await loadRefreshInterval();
     await loadSnapshots();
-    refreshTimer = window.setInterval(() => void loadSnapshots(), REFRESH_MS);
+    resetRefreshTimer();
+    void requestRefresh();
   });
 
   onDestroy(() => {
