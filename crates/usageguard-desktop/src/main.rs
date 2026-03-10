@@ -38,6 +38,7 @@ const TRAY_QUIT_ID: &str = "tray.quit";
 const CTX_REFRESH_ID: &str = "widget.refresh";
 const CTX_PROVIDERS_ID: &str = "widget.providers";
 const CTX_ALWAYS_ON_TOP_ID: &str = "widget.always_on_top";
+const CTX_LIGHT_MODE_ID: &str = "widget.light_mode";
 const CTX_HIDE_ID: &str = "widget.hide";
 const CTX_QUIT_ID: &str = "widget.quit";
 const REFRESH_EVENT: &str = "usageguard://refresh";
@@ -529,12 +530,19 @@ fn delete_provider_account(
 
 /// Saves the current widget position to config, then exits.
 /// Called from every quit path so the position is always persisted.
+/// We save the right-bottom corner (not left-top) so that resizeToFit, which
+/// anchors the widget to its right-bottom edge, correctly restores the position
+/// regardless of how many provider cards are shown on next launch.
 fn save_position_and_exit(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        if let (Ok(pos), Ok(scale)) = (win.outer_position(), win.scale_factor()) {
+        if let (Ok(pos), Ok(size), Ok(scale)) =
+            (win.outer_position(), win.inner_size(), win.scale_factor())
+        {
+            let right = (pos.x as f64 + size.width as f64) / scale;
+            let bottom = (pos.y as f64 + size.height as f64) / scale;
             let state = app.state::<AppState>();
             let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
-            guard.widget_position = Some([pos.x as f64 / scale, pos.y as f64 / scale]);
+            guard.widget_position = Some([right, bottom]);
             let _ = save_config(&guard);
         }
     }
@@ -549,9 +557,25 @@ fn quit(app: AppHandle) {
 #[tauri::command]
 fn show_context_menu(window: WebviewWindow, x: f64, y: f64) -> Result<(), String> {
     let menu = create_widget_menu(&window).map_err(|e| e.to_string())?;
-    window
+    let result = window
         .popup_menu_at(&menu, tauri::LogicalPosition::new(x, y))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+
+    #[cfg(target_os = "windows")]
+    flush_context_menu(&window);
+
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn flush_context_menu(window: &WebviewWindow) {
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            // Win32 popup menus can linger visually unless the owner window
+            // receives a follow-up message after TrackPopupMenu returns.
+            win32::PostMessageW(hwnd.0 as isize, win32::WM_NULL, 0, 0);
+        }
+    }
 }
 
 /// Inline FFI bindings — no external crate needed, user32.dll is always present.
@@ -560,6 +584,7 @@ mod win32 {
     pub const SWP_NOACTIVATE: u32 = 0x0010;
     pub const SWP_NOZORDER: u32 = 0x0004;
     pub const SPI_GETWORKAREA: u32 = 0x0030;
+    pub const WM_NULL: u32 = 0x0000;
 
     #[repr(C)]
     pub struct Rect {
@@ -589,6 +614,8 @@ mod win32 {
             pv_param: *mut std::ffi::c_void,
             f_win_ini: u32,
         ) -> i32;
+
+        pub fn PostMessageW(hwnd: isize, msg: u32, w_param: usize, l_param: isize) -> i32;
     }
 }
 
@@ -689,6 +716,12 @@ fn create_tray_icon() -> tauri::image::Image<'static> {
 fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>> {
     let app = window.app_handle();
     let always_on_top = window.is_always_on_top().unwrap_or(true);
+    let light_mode = app
+        .state::<AppState>()
+        .cfg
+        .lock()
+        .expect("AppState cfg lock poisoned")
+        .light_mode;
     let first_sep = PredefinedMenuItem::separator(app)?;
     let second_sep = PredefinedMenuItem::separator(app)?;
     let third_sep = PredefinedMenuItem::separator(app)?;
@@ -712,6 +745,14 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
                 "Always on Top",
                 true,
                 always_on_top,
+                None::<&str>,
+            )?,
+            &CheckMenuItem::with_id(
+                app,
+                CTX_LIGHT_MODE_ID,
+                "Light Mode",
+                true,
+                light_mode,
                 None::<&str>,
             )?,
             &MenuItem::with_id(app, CTX_HIDE_ID, "Hide to Tray", true, None::<&str>)?,
@@ -745,6 +786,18 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
                 if let Ok(current) = win.is_always_on_top() {
                     let _ = win.set_always_on_top(!current);
                 }
+            }
+        }
+        CTX_LIGHT_MODE_ID => {
+            let state = app.state::<AppState>();
+            {
+                let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned");
+                cfg.light_mode = !cfg.light_mode;
+                let _ = save_config(&cfg);
+            }
+            emit_widget_refresh(app);
+            if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
+                let _ = win.emit(REFRESH_EVENT, ());
             }
         }
         CTX_HIDE_ID => {
@@ -1471,9 +1524,18 @@ fn main() {
             });
 
             // Restore last widget position, or default to bottom-right of the work area.
+            // widget_position stores the right-bottom corner so that resizeToFit (which
+            // anchors to the right-bottom edge) restores correctly regardless of card count.
             if let Some(win) = app.get_webview_window("main") {
-                if let Some([x, y]) = saved_position {
-                    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+                if let Some([right, bottom]) = saved_position {
+                    // Position the window so its right-bottom matches the saved corner.
+                    // resizeToFit will then keep right-bottom fixed while adjusting width.
+                    let widget_w = 244.0_f64;
+                    let widget_h = 100.0_f64;
+                    let _ = win.set_position(tauri::LogicalPosition::new(
+                        right - widget_w,
+                        bottom - widget_h,
+                    ));
                 } else if let Ok(Some(monitor)) = win.current_monitor() {
                     let scale = monitor.scale_factor();
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { currentWindow, invoke } from './tauri';
+  import { currentWindow, invoke, listen } from './tauri';
   import { providerMeta } from './providerTheme';
 
   interface ProviderCatalogEntry {
@@ -54,6 +54,17 @@
   let openaiEditLabel = '';
   let anthropicEditLabel = '';
   let confirmRemoveId: string | null = null;
+  let unlistenTheme: (() => void) | null = null;
+
+  const REFRESH_EVENT = 'usageguard://refresh';
+
+  async function applyTheme(): Promise<void> {
+    if (!invoke) return;
+    try {
+      const cfg = await invoke('get_config') as { light_mode: boolean };
+      document.documentElement.classList.toggle('light-mode', cfg.light_mode);
+    } catch { /* ignore */ }
+  }
 
   function defaultOpenAILabel(status: OAuthStatus): string {
     return status.label || (status.plan_type ? `ChatGPT ${status.plan_type}` : 'ChatGPT');
@@ -274,13 +285,20 @@
     }
   }
 
-  onMount(() => {
+  onMount(async () => {
     window.addEventListener('keydown', onKeydown);
+    void applyTheme();
     void loadSettings();
+    if (listen) {
+      unlistenTheme = await listen(REFRESH_EVENT, () => {
+        void applyTheme();
+      });
+    }
   });
 
   onDestroy(() => {
     window.removeEventListener('keydown', onKeydown);
+    unlistenTheme?.();
   });
 </script>
 
@@ -301,7 +319,7 @@
 
       <!-- ChatGPT OAuth -->
       <div class="oauth-row" class:oauth-connected={openaiOAuthStatus.connected}>
-        <div class="account-dot" style="--accent:{openaiOAuthStatus.connected ? '#10a37f' : 'rgba(255,255,255,0.18)'}"></div>
+        <div class="account-dot" style="--accent:{openaiOAuthStatus.connected ? '#10a37f' : 'rgba(130, 138, 165, 0.35)'}"></div>
         {#if isConnectingOpenAi}
           <span class="account-vendor" style="flex:1">Waiting for browser…</span>
         {:else if openaiOAuthStatus.connected}
@@ -324,7 +342,7 @@
 
       <!-- Claude OAuth -->
       <div class="oauth-row" class:oauth-connected={anthropicOAuthStatus.connected}>
-        <div class="account-dot" style="--accent:{anthropicOAuthStatus.connected ? '#d97a4e' : 'rgba(255,255,255,0.18)'}"></div>
+        <div class="account-dot" style="--accent:{anthropicOAuthStatus.connected ? '#d97a4e' : 'rgba(130, 138, 165, 0.35)'}"></div>
         {#if isConnectingAnthropic}
           <span class="account-vendor" style="flex:1">Waiting for browser…</span>
         {:else if anthropicOAuthStatus.connected}
@@ -456,10 +474,10 @@
     display: flex;
     flex-direction: column;
     height: 100%;
-    border: 1px solid rgba(255, 255, 255, 0.07);
+    border: 1px solid var(--border-panel);
     border-radius: 12px;
     background: var(--bg-surface);
-    color: #e4e8f3;
+    color: var(--text-hi);
     font-size: 12px;
     overflow: hidden;
   }
@@ -471,7 +489,7 @@
     gap: 6px;
     min-height: 36px;
     padding: 0 8px 0 12px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    border-bottom: 1px solid var(--divider-color);
     cursor: grab;
     user-select: none;
     -webkit-user-select: none;
@@ -483,7 +501,7 @@
     font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.01em;
-    color: rgba(229, 233, 243, 0.95);
+    color: var(--text-hi);
   }
 
   .bar-spacer { flex: 1; }
@@ -491,10 +509,10 @@
   .bar-btn {
     width: 22px;
     height: 22px;
-    border: 1px solid rgba(255, 255, 255, 0.09);
+    border: 1px solid var(--border-btn);
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.04);
-    color: rgba(210, 216, 232, 0.88);
+    background: var(--surface-btn);
+    color: var(--text-mid);
     font-size: 14px;
     line-height: 1;
     cursor: pointer;
@@ -502,7 +520,7 @@
     align-items: center;
     justify-content: center;
   }
-  .bar-btn:hover { background: rgba(255, 255, 255, 0.08); }
+  .bar-btn:hover { background: var(--surface-btn-hover); }
   .bar-btn-close { font-size: 16px; }
 
   /* Body */
@@ -521,14 +539,14 @@
     font-weight: 600;
     letter-spacing: 0.07em;
     text-transform: uppercase;
-    color: rgba(120, 128, 155, 0.7);
+    color: var(--text-lo);
     flex-shrink: 0;
   }
 
   .field-help {
     font-size: 10px;
     line-height: 1.35;
-    color: rgba(145, 153, 177, 0.82);
+    color: var(--text-lo);
   }
 
   /* OAuth rows */
@@ -537,23 +555,23 @@
     align-items: center;
     gap: 8px;
     padding: 6px 8px;
-    border: 1px solid rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-card);
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--surface-row);
     flex-shrink: 0;
   }
 
   .oauth-provider-label {
     flex: 1;
     font-size: 12px;
-    color: rgba(180, 186, 208, 0.8);
+    color: var(--text-mid);
   }
 
   .oauth-name {
     flex: 1;
     border: none;
     background: transparent;
-    color: rgba(229, 233, 243, 0.95);
+    color: var(--text-hi);
     font: inherit;
     font-size: 12px;
     font-weight: 600;
@@ -567,21 +585,21 @@
 
   .connect-btn {
     padding: 4px 10px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
+    border: 1px solid var(--border-btn);
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.06);
-    color: rgba(229, 233, 243, 0.9);
+    background: var(--surface-btn);
+    color: var(--text-hi);
     font: inherit;
     font-size: 11px;
     cursor: pointer;
     flex-shrink: 0;
   }
-  .connect-btn:hover { background: rgba(255, 255, 255, 0.1); }
+  .connect-btn:hover { background: var(--surface-btn-hover); }
 
   /* Account list */
   .placeholder {
     font-size: 11px;
-    color: rgba(120, 128, 155, 0.85);
+    color: var(--text-lo);
     padding: 4px 0;
   }
 
@@ -599,15 +617,15 @@
     align-items: center;
     gap: 8px;
     padding: 6px 8px;
-    border: 1px solid rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-card);
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--surface-row);
     cursor: pointer;
     transition: background 0.1s;
   }
   .account-row:hover, .account-row.active {
-    background: rgba(255, 255, 255, 0.05);
-    border-color: rgba(255, 255, 255, 0.09);
+    background: var(--surface-row-hover);
+    border-color: var(--border-row-hover);
   }
 
   .account-row.confirming {
@@ -639,16 +657,16 @@
 
   .confirm-no {
     padding: 3px 8px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--border-btn);
     border-radius: 999px;
     background: transparent;
-    color: rgba(150, 158, 182, 0.85);
+    color: var(--text-lo);
     font: inherit;
     font-size: 11px;
     cursor: pointer;
     flex-shrink: 0;
   }
-  .confirm-no:hover { color: rgba(200, 206, 224, 0.95); }
+  .confirm-no:hover { color: var(--text-mid); }
 
   .account-dot {
     width: 5px;
@@ -672,12 +690,12 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    color: rgba(229, 233, 243, 0.95);
+    color: var(--text-hi);
   }
 
   .account-vendor {
     font-size: 10px;
-    color: rgba(130, 138, 162, 0.88);
+    color: var(--text-lo);
     white-space: nowrap;
   }
 
@@ -710,7 +728,7 @@
   /* Divider */
   .divider {
     height: 1px;
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--divider-color);
     flex-shrink: 0;
   }
 
@@ -727,19 +745,19 @@
     font-weight: 600;
     letter-spacing: 0.07em;
     text-transform: uppercase;
-    color: rgba(120, 128, 155, 0.7);
+    color: var(--text-lo);
   }
 
   .link-btn {
     border: none;
     background: none;
-    color: rgba(130, 138, 162, 0.85);
+    color: var(--text-lo);
     font: inherit;
     font-size: 11px;
     cursor: pointer;
     padding: 0;
   }
-  .link-btn:hover { color: rgba(180, 186, 208, 0.95); }
+  .link-btn:hover { color: var(--text-mid); }
 
   .form-fields {
     display: flex;
@@ -762,17 +780,17 @@
 
   .field-label {
     font-size: 10px;
-    color: rgba(150, 158, 182, 0.75);
+    color: var(--text-lo);
   }
 
   input,
   select {
     width: 100%;
     padding: 6px 9px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--border-input);
     border-radius: 8px;
-    background: rgba(0, 0, 0, 0.35);
-    color: #e4e8f3;
+    background: var(--surface-input);
+    color: var(--text-hi);
     font: inherit;
     font-size: 12px;
     outline: none;
@@ -780,7 +798,7 @@
   }
   input:focus, select:focus {
     border-color: rgba(100, 140, 255, 0.45);
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--surface-input-focus);
   }
 
   select {
@@ -791,6 +809,10 @@
     background-repeat: no-repeat;
     background-position: right 8px center;
     cursor: pointer;
+  }
+
+  :global(.light-mode) select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='rgba(80,100,160,0.6)' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   }
 
   /* Footer */
@@ -816,16 +838,16 @@
 
   .save-btn {
     padding: 6px 16px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
+    border: 1px solid var(--border-btn);
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.07);
-    color: rgba(229, 233, 243, 0.95);
+    background: var(--surface-btn);
+    color: var(--text-hi);
     font: inherit;
     font-size: 12px;
     cursor: pointer;
     flex-shrink: 0;
     transition: background 0.1s;
   }
-  .save-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.11); }
+  .save-btn:hover:not(:disabled) { background: var(--surface-btn-hover); }
   .save-btn:disabled { opacity: 0.5; cursor: default; }
 </style>

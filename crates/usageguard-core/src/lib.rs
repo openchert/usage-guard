@@ -183,7 +183,7 @@ pub struct AppConfig {
     pub provider_accounts: Vec<ProviderAccount>,
     #[serde(default)]
     pub profiles: Vec<ProviderProfile>,
-    /// Last known widget position in logical pixels [x, y].
+    /// Last known widget right-bottom corner in logical pixels [right, bottom].
     /// Saved on quit and restored on next launch.
     #[serde(default)]
     pub widget_position: Option<[f64; 2]>,
@@ -193,6 +193,9 @@ pub struct AppConfig {
     /// User-defined display name for the Claude OAuth subscription connection.
     #[serde(default)]
     pub anthropic_oauth_label: Option<String>,
+    /// Whether the UI should display in light mode instead of the default dark mode.
+    #[serde(default)]
+    pub light_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -208,6 +211,7 @@ impl Default for AppConfig {
             widget_position: None,
             openai_oauth_label: None,
             anthropic_oauth_label: None,
+            light_mode: false,
         }
     }
 }

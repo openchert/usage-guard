@@ -82,6 +82,16 @@
     }
   }
 
+  async function applyTheme(): Promise<void> {
+    if (!invoke) return;
+    try {
+      const cfg = await invoke('get_config') as { light_mode: boolean };
+      document.documentElement.classList.toggle('light-mode', cfg.light_mode);
+    } catch (error) {
+      console.error('get_config (theme) failed:', error);
+    }
+  }
+
   async function loadSnapshots(): Promise<void> {
     if (!invoke || isLoading) return;
 
@@ -140,11 +150,13 @@
 
     if (listen) {
       unlistenRefresh = await listen(REFRESH_EVENT, () => {
+        void applyTheme();
         void loadRefreshInterval();
         void loadSnapshots();
       });
     }
 
+    await applyTheme();
     await loadRefreshInterval();
     await loadSnapshots();
     resetRefreshTimer();
@@ -204,7 +216,7 @@
     gap: 6px;
     height: 100%;
     padding: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.07);
+    border: 1px solid var(--border-panel);
     border-radius: 12px;
     background: var(--bg-surface);
     cursor: grab;
@@ -226,15 +238,15 @@
 
   .empty-copy {
     font-size: 11px;
-    color: rgba(133, 139, 160, 0.9);
+    color: var(--text-muted);
   }
 
   .provider-card {
     flex: 0 0 110px;
     padding: 9px 8px 8px;
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-card);
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--surface-card);
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -244,7 +256,7 @@
     font-size: 11px;
     font-weight: 600;
     line-height: 1.1;
-    color: rgba(229, 232, 242, 0.96);
+    color: var(--text-hi);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -283,7 +295,7 @@
     font-size: 9px;
     letter-spacing: 0.06em;
     text-transform: uppercase;
-    color: rgba(155, 162, 182, 0.7);
+    color: var(--text-lo);
   }
 
   .metric-value {

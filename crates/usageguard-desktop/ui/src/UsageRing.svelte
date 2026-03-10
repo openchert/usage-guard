@@ -58,7 +58,6 @@
       cy="50"
       r={radius}
       fill="none"
-      stroke={resolvedTheme.trackColor}
       stroke-width={resolvedTheme.thickness}
     />
 
@@ -107,7 +106,12 @@
     overflow: visible;
   }
 
-  .ring-track,
+  .ring-track {
+    stroke: var(--ring-track);
+    shape-rendering: geometricPrecision;
+    vector-effect: non-scaling-stroke;
+  }
+
   .ring-progress {
     shape-rendering: geometricPrecision;
     vector-effect: non-scaling-stroke;
