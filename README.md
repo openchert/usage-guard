@@ -88,10 +88,4 @@ The desktop crate builds the UI through Tauri's `beforeBuildCommand`, so Node.js
 ## Release Flow
 - GitHub Actions builds and publishes Windows x64 binaries on tag push (`v*`).
 - Release assets are attached to GitHub Releases as `usage-guard-windows-x64.zip` plus `SHA256SUMS`.
-
-Create a release build:
-
-```bash
-git tag v0.4.1
-git push origin v0.4.1
-```
+- The app version is read from the workspace `Cargo.toml`.
