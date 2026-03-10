@@ -54,6 +54,15 @@ export function appendResetLine(lines: string[], label: string, value?: string |
   }
 }
 
+function alertTitleLines(snapshot: UsageSnapshot): string[] {
+  return (snapshot.alerts ?? []).map((alert) => `[${alert.level.toUpperCase()}] ${alert.message}`);
+}
+
+export function buildCardTitle(snapshot: UsageSnapshot, lines: string[]): string {
+  const alerts = alertTitleLines(snapshot);
+  return [...alerts, ...(alerts.length > 0 ? [''] : []), ...lines].join('\n');
+}
+
 function weeklyRatio(snapshot: UsageSnapshot): number {
   if (snapshot.limit_usd != null && snapshot.limit_usd > 0 && snapshot.spent_usd != null) {
     return clampRatio(snapshot.spent_usd / snapshot.limit_usd);
@@ -100,7 +109,7 @@ export function buildGenericApiCard(
   return {
     kind: 'quota',
     displayLabel: label,
-    title: lines.join('\n'),
+    title: buildCardTitle(snapshot, lines),
     rings: [
       { label: '5h', ratio: shortWindowRatio(snapshot) },
       { ratio: weeklyRatio(snapshot) },
@@ -136,7 +145,7 @@ export function buildProviderApiTitle(
     lines.push(`Status: ${snapshot.status_message}`);
   }
 
-  return lines.join('\n');
+  return buildCardTitle(snapshot, lines);
 }
 
 function metricDetail(window?: ApiMetricWindow | null): string {
@@ -216,7 +225,7 @@ export function buildProviderApiMetricCard(
   return {
     kind: 'metrics',
     displayLabel: label,
-    title: titleLines.join('\n'),
+    title: buildCardTitle(snapshot, titleLines),
     stats: [
       metricStat('Today', metrics?.today),
       metricStat('30d', metrics?.rolling_30d),

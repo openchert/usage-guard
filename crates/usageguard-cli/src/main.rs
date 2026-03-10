@@ -1,3 +1,4 @@
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use usageguard_core::{
     evaluate_alerts, has_provider_api_key, load_config, provider_snapshots, save_config,
@@ -60,7 +61,7 @@ fn print_snapshot(s: &UsageSnapshot, cfg: &AppConfig) {
     if let Some(message) = &s.status_message {
         println!("Status: {}", message);
     }
-    let alerts = evaluate_alerts(s, cfg);
+    let alerts = evaluate_alerts(s, Utc::now(), cfg);
     if alerts.is_empty() {
         println!("Alerts: none\n");
     } else {
@@ -109,6 +110,8 @@ fn main() {
                 status_code: None,
                 status_message: None,
                 api_metrics: None,
+                primary_reset_at: None,
+                secondary_reset_at: None,
             };
             print_snapshot(&s, &cfg);
         }

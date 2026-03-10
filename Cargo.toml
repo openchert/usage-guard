@@ -10,7 +10,7 @@ resolver = "2"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
-authors = ["Lukas <lukas@usage-guard.local>"]
+authors = ["Lukas Reichert"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

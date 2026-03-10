@@ -22,6 +22,12 @@ const CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV: &str = "USAGEGUARD_CLAUDE_CREDENTIAL
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 15;
 pub const MIN_REFRESH_INTERVAL_SECS: u32 = 15;
 pub const MAX_REFRESH_INTERVAL_SECS: u32 = 900;
+const OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT: f64 = 90.0;
+const OAUTH_WEEKLY_NEAR_LIMIT_PERCENT: f64 = 80.0;
+const OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX: f64 = 20.0;
+const OAUTH_WEEKLY_UNUSED_PERCENT_MAX: f64 = 40.0;
+const OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES: i64 = 45;
+const OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS: i64 = 24;
 
 fn default_refresh_interval_secs() -> u32 {
     DEFAULT_REFRESH_INTERVAL_SECS
@@ -1200,18 +1206,10 @@ fn parse_openai_oauth_usage_data(value: &Value) -> Result<OpenAiOAuthUsageData> 
         ));
     }
 
-    let primary_reset_at = openai_oauth_window_reset_at(
-        value,
-        "primary_window",
-        "primaryWindow",
-        "short_window",
-    );
-    let secondary_reset_at = openai_oauth_window_reset_at(
-        value,
-        "secondary_window",
-        "secondaryWindow",
-        "long_window",
-    );
+    let primary_reset_at =
+        openai_oauth_window_reset_at(value, "primary_window", "primaryWindow", "short_window");
+    let secondary_reset_at =
+        openai_oauth_window_reset_at(value, "secondary_window", "secondaryWindow", "long_window");
 
     Ok(OpenAiOAuthUsageData {
         account_id,
@@ -1322,7 +1320,7 @@ fn openai_oauth_window_reset_at(
     camel_key: &str,
     fallback_key: &str,
 ) -> Option<String> {
-    [
+    let paths = [
         format!("/rate_limit/{primary_key}/resets_at"),
         format!("/rate_limit/{primary_key}/reset_at"),
         format!("/rate_limit/{primary_key}/resetsAt"),
@@ -1343,10 +1341,19 @@ fn openai_oauth_window_reset_at(
         format!("/{fallback_key}/reset_at"),
         format!("/{fallback_key}/resetsAt"),
         format!("/{fallback_key}/resetAt"),
-    ]
-    .iter()
-    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-    .map(str::to_string)
+    ];
+    paths.iter().find_map(|pointer| {
+        let val = value.pointer(pointer)?;
+        if let Some(s) = val.as_str() {
+            return Some(s.to_string());
+        }
+        // wham API returns reset_at as a Unix timestamp integer
+        if let Some(ts) = val.as_i64() {
+            return DateTime::from_timestamp(ts, 0)
+                .map(|dt| dt.to_rfc3339());
+        }
+        None
+    })
 }
 
 fn anthropic_oauth_bucket<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -1384,10 +1391,7 @@ fn parse_anthropic_oauth_usage_data(value: &Value) -> Result<AnthropicOAuthUsage
         "longTerm",
         "weekly",
     ];
-    let five_hour_percent = anthropic_oauth_bucket_percent(
-        value,
-        five_hour_keys,
-    );
+    let five_hour_percent = anthropic_oauth_bucket_percent(value, five_hour_keys);
     let seven_day_percent = anthropic_oauth_bucket_percent(value, seven_day_keys);
 
     if five_hour_percent.is_none() && seven_day_percent.is_none() {
@@ -1766,7 +1770,127 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn evaluate_alerts(snapshot: &UsageSnapshot, cfg: &AppConfig) -> Vec<Alert> {
+fn quota_percent_left(used_percent: f64) -> u32 {
+    (100.0 - used_percent.clamp(0.0, 100.0)).round() as u32
+}
+
+fn parse_reset_at(value: Option<&str>) -> Option<DateTime<Utc>> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
+
+fn time_until_reset(now: DateTime<Utc>, reset_at: Option<&str>) -> Option<Duration> {
+    let reset_at = parse_reset_at(reset_at)?;
+    let remaining = reset_at.signed_duration_since(now);
+    (remaining > Duration::zero()).then_some(remaining)
+}
+
+fn format_time_until_reset(duration: Duration) -> String {
+    let total_minutes = duration.num_minutes().max(1);
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+
+    match (hours, minutes) {
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h {minutes}m"),
+    }
+}
+
+fn push_oauth_window_alerts(
+    alerts: &mut Vec<Alert>,
+    now: DateTime<Utc>,
+    window_label: &str,
+    used_percent: f64,
+    reset_at: Option<&str>,
+    near_limit_percent: f64,
+    unused_percent_max: f64,
+    reminder_window: Duration,
+    exhausted_code: &str,
+    near_limit_code: &str,
+    reminder_code: &str,
+) {
+    let used_percent = used_percent.clamp(0.0, 100.0);
+    let used_display = used_percent.round() as u32;
+    let left_display = quota_percent_left(used_percent);
+
+    if used_percent >= 100.0 {
+        alerts.push(Alert {
+            level: "critical".into(),
+            code: exhausted_code.into(),
+            message: format!(
+                "{window_label} quota exhausted: {used_display}% used, {left_display}% left"
+            ),
+        });
+    } else if used_percent >= near_limit_percent {
+        alerts.push(Alert {
+            level: "warning".into(),
+            code: near_limit_code.into(),
+            message: format!(
+                "{window_label} quota nearly used up: {used_display}% used, {left_display}% left"
+            ),
+        });
+    }
+
+    if used_percent > unused_percent_max {
+        return;
+    }
+
+    let Some(remaining) = time_until_reset(now, reset_at) else {
+        return;
+    };
+    if remaining > reminder_window {
+        return;
+    }
+
+    alerts.push(Alert {
+        level: "info".into(),
+        code: reminder_code.into(),
+        message: format!(
+            "{window_label} quota resets in {} and only {used_display}% has been used",
+            format_time_until_reset(remaining)
+        ),
+    });
+}
+
+fn evaluate_oauth_alerts(snapshot: &UsageSnapshot, now: DateTime<Utc>) -> Vec<Alert> {
+    let mut alerts = vec![];
+    push_oauth_window_alerts(
+        &mut alerts,
+        now,
+        "5h",
+        snapshot.tokens_in as f64,
+        snapshot.primary_reset_at.as_deref(),
+        OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
+        OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
+        Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
+        "quota_5h_exhausted",
+        "quota_5h_near_limit",
+        "quota_5h_unused_before_reset",
+    );
+    push_oauth_window_alerts(
+        &mut alerts,
+        now,
+        "Week",
+        snapshot.spent_usd,
+        snapshot.secondary_reset_at.as_deref(),
+        OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
+        OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
+        Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
+        "quota_week_exhausted",
+        "quota_week_near_limit",
+        "quota_week_unused_before_reset",
+    );
+    alerts
+}
+
+fn evaluate_standard_alerts(snapshot: &UsageSnapshot, cfg: &AppConfig) -> Vec<Alert> {
     let mut alerts = vec![];
     let ratio = if snapshot.limit_usd > 0.0 {
         snapshot.spent_usd / snapshot.limit_usd
@@ -1805,6 +1929,18 @@ pub fn evaluate_alerts(snapshot: &UsageSnapshot, cfg: &AppConfig) -> Vec<Alert> 
     alerts
 }
 
+pub fn evaluate_alerts(
+    snapshot: &UsageSnapshot,
+    now: DateTime<Utc>,
+    cfg: &AppConfig,
+) -> Vec<Alert> {
+    if snapshot.source == "oauth" {
+        evaluate_oauth_alerts(snapshot, now)
+    } else {
+        evaluate_standard_alerts(snapshot, cfg)
+    }
+}
+
 pub fn is_quiet_hour(now: DateTime<Local>, quiet: &QuietHours) -> bool {
     if !quiet.enabled {
         return false;
@@ -1820,12 +1956,14 @@ pub fn is_quiet_hour(now: DateTime<Local>, quiet: &QuietHours) -> bool {
     }
 }
 
+pub fn should_notify_alert(alert: &Alert, now: DateTime<Local>, cfg: &AppConfig) -> bool {
+    alert.level == "critical" || !is_quiet_hour(now, &cfg.quiet_hours)
+}
+
 pub fn should_notify(alerts: &[Alert], now: DateTime<Local>, cfg: &AppConfig) -> bool {
-    if alerts.is_empty() {
-        return false;
-    }
-    let has_critical = alerts.iter().any(|a| a.level == "critical");
-    has_critical || !is_quiet_hour(now, &cfg.quiet_hours)
+    alerts
+        .iter()
+        .any(|alert| should_notify_alert(alert, now, cfg))
 }
 
 fn build_legacy_provider_specs() -> Vec<ProviderSpec<'static>> {
@@ -2045,9 +2183,10 @@ fn validation_error_from_api_fetch(
             forbidden_message,
             unavailable_message,
         ),
-        ApiFetchError::Transport(_) => {
-            VerificationError::new(VerificationErrorKind::UpstreamUnavailable, unavailable_message)
-        }
+        ApiFetchError::Transport(_) => VerificationError::new(
+            VerificationErrorKind::UpstreamUnavailable,
+            unavailable_message,
+        ),
         ApiFetchError::InvalidResponse(_) => VerificationError::new(
             VerificationErrorKind::InvalidResponse,
             invalid_response_message,
@@ -3342,8 +3481,159 @@ mod tests {
             primary_reset_at: None,
             secondary_reset_at: None,
         };
-        let alerts = evaluate_alerts(&s, &cfg);
+        let alerts = evaluate_alerts(&s, Utc::now(), &cfg);
         assert!(alerts.iter().any(|a| a.code == "near_limit"));
+    }
+
+    fn oauth_snapshot(
+        five_hour_used: u64,
+        week_used: f64,
+        five_hour_reset_at: Option<&str>,
+        week_reset_at: Option<&str>,
+    ) -> UsageSnapshot {
+        UsageSnapshot {
+            provider: "openai".into(),
+            account_label: "ChatGPT Plus".into(),
+            spent_usd: week_used,
+            limit_usd: 100.0,
+            tokens_in: five_hour_used,
+            tokens_out: 0,
+            inactive_hours: 0,
+            source: "oauth".into(),
+            status_code: None,
+            status_message: None,
+            api_metrics: None,
+            primary_reset_at: five_hour_reset_at.map(str::to_string),
+            secondary_reset_at: week_reset_at.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn oauth_five_hour_near_limit_alert_fires_at_threshold() {
+        let cfg = AppConfig::default();
+        let now = Utc::now();
+
+        let below_threshold = oauth_snapshot(89, 10.0, None, None);
+        let at_threshold = oauth_snapshot(90, 10.0, None, None);
+
+        assert!(!evaluate_alerts(&below_threshold, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_5h_near_limit"));
+        assert!(evaluate_alerts(&at_threshold, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_5h_near_limit"));
+    }
+
+    #[test]
+    fn oauth_week_near_limit_alert_fires_at_threshold() {
+        let cfg = AppConfig::default();
+        let now = Utc::now();
+
+        let below_threshold = oauth_snapshot(10, 79.0, None, None);
+        let at_threshold = oauth_snapshot(10, 80.0, None, None);
+
+        assert!(!evaluate_alerts(&below_threshold, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_week_near_limit"));
+        assert!(evaluate_alerts(&at_threshold, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_week_near_limit"));
+    }
+
+    #[test]
+    fn oauth_five_hour_use_before_reset_requires_time_and_usage_thresholds() {
+        let cfg = AppConfig::default();
+        let now = Utc::now();
+        let within_window = (now + Duration::minutes(45)).to_rfc3339();
+        let outside_window = (now + Duration::minutes(46)).to_rfc3339();
+
+        let within_threshold = oauth_snapshot(20, 10.0, Some(&within_window), None);
+        let too_late = oauth_snapshot(20, 10.0, Some(&outside_window), None);
+        let too_used = oauth_snapshot(21, 10.0, Some(&within_window), None);
+
+        assert!(evaluate_alerts(&within_threshold, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_5h_unused_before_reset"));
+        assert!(!evaluate_alerts(&too_late, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_5h_unused_before_reset"));
+        assert!(!evaluate_alerts(&too_used, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_5h_unused_before_reset"));
+    }
+
+    #[test]
+    fn oauth_week_use_before_reset_requires_time_and_usage_thresholds() {
+        let cfg = AppConfig::default();
+        let now = Utc::now();
+        let within_window = (now + Duration::hours(24)).to_rfc3339();
+        let outside_window = (now + Duration::hours(25)).to_rfc3339();
+
+        let within_threshold = oauth_snapshot(10, 40.0, None, Some(&within_window));
+        let too_late = oauth_snapshot(10, 40.0, None, Some(&outside_window));
+        let too_used = oauth_snapshot(10, 41.0, None, Some(&within_window));
+
+        assert!(evaluate_alerts(&within_threshold, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_week_unused_before_reset"));
+        assert!(!evaluate_alerts(&too_late, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_week_unused_before_reset"));
+        assert!(!evaluate_alerts(&too_used, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_week_unused_before_reset"));
+    }
+
+    #[test]
+    fn oauth_use_before_reset_skips_missing_or_invalid_reset_times() {
+        let cfg = AppConfig::default();
+        let now = Utc::now();
+
+        let missing_reset = oauth_snapshot(5, 10.0, None, None);
+        let invalid_reset = oauth_snapshot(5, 10.0, Some("not-a-timestamp"), None);
+
+        assert!(!evaluate_alerts(&missing_reset, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_5h_unused_before_reset"));
+        assert!(!evaluate_alerts(&invalid_reset, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_5h_unused_before_reset"));
+    }
+
+    #[test]
+    fn exhausted_alerts_bypass_quiet_hours_but_non_critical_alerts_do_not() {
+        let now = Local::now();
+        let current_hour = now.hour() as u8;
+        let cfg = AppConfig {
+            quiet_hours: QuietHours {
+                enabled: true,
+                start_hour: current_hour,
+                end_hour: (current_hour + 1) % 24,
+            },
+            ..AppConfig::default()
+        };
+
+        let critical = Alert {
+            level: "critical".into(),
+            code: "quota_5h_exhausted".into(),
+            message: "critical".into(),
+        };
+        let warning = Alert {
+            level: "warning".into(),
+            code: "quota_5h_near_limit".into(),
+            message: "warning".into(),
+        };
+        let info = Alert {
+            level: "info".into(),
+            code: "quota_week_unused_before_reset".into(),
+            message: "info".into(),
+        };
+
+        assert!(should_notify_alert(&critical, now, &cfg));
+        assert!(!should_notify_alert(&warning, now, &cfg));
+        assert!(!should_notify_alert(&info, now, &cfg));
+        assert!(should_notify(&[critical], now, &cfg));
+        assert!(!should_notify(&[warning, info], now, &cfg));
     }
 
     #[test]
@@ -3632,8 +3922,14 @@ mod tests {
         assert_eq!(snap.tokens_in, 63);
         assert!((snap.spent_usd - 37.0).abs() < f64::EPSILON);
         assert!((snap.limit_usd - 100.0).abs() < f64::EPSILON);
-        assert_eq!(snap.primary_reset_at.as_deref(), Some("2026-03-09T12:00:00Z"));
-        assert_eq!(snap.secondary_reset_at.as_deref(), Some("2026-03-12T00:00:00Z"));
+        assert_eq!(
+            snap.primary_reset_at.as_deref(),
+            Some("2026-03-09T12:00:00Z")
+        );
+        assert_eq!(
+            snap.secondary_reset_at.as_deref(),
+            Some("2026-03-12T00:00:00Z")
+        );
     }
 
     #[test]
@@ -3669,8 +3965,38 @@ mod tests {
         let usage = parse_openai_oauth_usage_data(&value).unwrap();
         assert!((usage.primary_percent - 48.0).abs() < f64::EPSILON);
         assert!((usage.secondary_percent - 21.5).abs() < f64::EPSILON);
-        assert_eq!(usage.primary_reset_at.as_deref(), Some("2026-03-10T11:00:00Z"));
-        assert_eq!(usage.secondary_reset_at.as_deref(), Some("2026-03-12T00:00:00Z"));
+        assert_eq!(
+            usage.primary_reset_at.as_deref(),
+            Some("2026-03-10T11:00:00Z")
+        );
+        assert_eq!(
+            usage.secondary_reset_at.as_deref(),
+            Some("2026-03-12T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_openai_oauth_usage_data_extracts_unix_timestamp_reset_times() {
+        // wham API returns reset_at as a Unix timestamp integer, not a string
+        let value: Value = serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 22.0,
+                    "reset_at": 1773188548i64
+                },
+                "secondary_window": {
+                    "used_percent": 29.0,
+                    "reset_at": 1773757308i64
+                }
+            }
+        });
+
+        let usage = parse_openai_oauth_usage_data(&value).unwrap();
+        assert!((usage.primary_percent - 22.0).abs() < f64::EPSILON);
+        assert!((usage.secondary_percent - 29.0).abs() < f64::EPSILON);
+        assert!(usage.primary_reset_at.is_some(), "primary reset_at should be parsed from Unix timestamp");
+        assert!(usage.secondary_reset_at.is_some(), "secondary reset_at should be parsed from Unix timestamp");
     }
 
     #[test]

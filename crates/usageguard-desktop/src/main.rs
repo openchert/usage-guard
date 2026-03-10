@@ -2,9 +2,9 @@
 
 mod icon_art;
 
-use chrono::Local;
+use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
@@ -13,10 +13,10 @@ use tauri::{
 };
 use usageguard_core::{
     clamp_refresh_interval_secs, evaluate_alerts, has_provider_account_api_key, load_config,
-    provider_catalog, provider_snapshots, save_config, set_provider_account_api_key, should_notify,
-    verify_anthropic_oauth_access_token, verify_openai_oauth_access_token, verify_provider_api_key,
-    AppConfig, ProviderAccount, ProviderCatalogEntry, UsageSnapshot, MAX_REFRESH_INTERVAL_SECS,
-    MIN_REFRESH_INTERVAL_SECS,
+    provider_catalog, provider_snapshots, save_config, set_provider_account_api_key,
+    should_notify_alert, verify_anthropic_oauth_access_token, verify_openai_oauth_access_token,
+    verify_provider_api_key, Alert, AppConfig, ProviderAccount, ProviderCatalogEntry,
+    UsageSnapshot, MAX_REFRESH_INTERVAL_SECS, MIN_REFRESH_INTERVAL_SECS,
 };
 
 #[derive(Default)]
@@ -25,10 +25,18 @@ struct RefreshState {
     queued: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SnapshotView {
+    #[serde(flatten)]
+    snapshot: UsageSnapshot,
+    #[serde(default)]
+    alerts: Vec<Alert>,
+}
+
 struct AppState {
     cfg: Mutex<AppConfig>,
-    last_notified: Mutex<HashMap<String, String>>,
-    snapshots: Mutex<Vec<UsageSnapshot>>,
+    notified_alerts: Mutex<HashSet<String>>,
+    snapshots: Mutex<Vec<SnapshotView>>,
     refresh: Mutex<RefreshState>,
 }
 
@@ -69,7 +77,7 @@ struct ProviderAccountInput {
 }
 
 #[tauri::command]
-fn get_snapshots(state: State<AppState>) -> Vec<UsageSnapshot> {
+fn get_snapshots(state: State<AppState>) -> Vec<SnapshotView> {
     state
         .snapshots
         .lock()
@@ -79,7 +87,11 @@ fn get_snapshots(state: State<AppState>) -> Vec<UsageSnapshot> {
 
 #[tauri::command]
 fn get_config(state: State<AppState>) -> AppConfig {
-    state.cfg.lock().expect("AppState cfg lock poisoned").clone()
+    state
+        .cfg
+        .lock()
+        .expect("AppState cfg lock poisoned")
+        .clone()
 }
 
 #[tauri::command]
@@ -324,10 +336,28 @@ fn emit_widget_refresh(app: &AppHandle) {
     }
 }
 
+fn snapshot_views(
+    snapshots: &[UsageSnapshot],
+    now: chrono::DateTime<Utc>,
+    cfg: &AppConfig,
+) -> Vec<SnapshotView> {
+    snapshots
+        .iter()
+        .cloned()
+        .map(|snapshot| SnapshotView {
+            alerts: evaluate_alerts(&snapshot, now, cfg),
+            snapshot,
+        })
+        .collect()
+}
+
 fn spawn_snapshot_refresh(app: AppHandle) {
     let should_spawn = {
         let state = app.state::<AppState>();
-        let mut refresh = state.refresh.lock().expect("AppState refresh lock poisoned");
+        let mut refresh = state
+            .refresh
+            .lock()
+            .expect("AppState refresh lock poisoned");
         if refresh.in_flight {
             refresh.queued = true;
             false
@@ -342,44 +372,53 @@ fn spawn_snapshot_refresh(app: AppHandle) {
         return;
     }
 
-    std::thread::spawn(move || {
-        loop {
-            let state = app.state::<AppState>();
-            let cfg = state.cfg.lock().expect("AppState cfg lock poisoned").clone();
-            let snapshots = provider_snapshots(&cfg);
+    std::thread::spawn(move || loop {
+        let state = app.state::<AppState>();
+        let cfg = state
+            .cfg
+            .lock()
+            .expect("AppState cfg lock poisoned")
+            .clone();
+        let snapshots = provider_snapshots(&cfg);
+        let now_local = Local::now();
+        let now_utc = now_local.with_timezone(&Utc);
+        let snapshot_views = snapshot_views(&snapshots, now_utc, &cfg);
 
-            {
-                let mut cache = state
-                    .snapshots
-                    .lock()
-                    .expect("AppState snapshots lock poisoned");
-                *cache = snapshots.clone();
+        {
+            let mut cache = state
+                .snapshots
+                .lock()
+                .expect("AppState snapshots lock poisoned");
+            *cache = snapshot_views.clone();
+        }
+
+        fire_notifications(
+            &snapshot_views,
+            now_local,
+            &cfg,
+            &mut state
+                .notified_alerts
+                .lock()
+                .expect("AppState notified_alerts lock poisoned"),
+        );
+        emit_widget_refresh(&app);
+
+        let should_continue = {
+            let mut refresh = state
+                .refresh
+                .lock()
+                .expect("AppState refresh lock poisoned");
+            if refresh.queued {
+                refresh.queued = false;
+                true
+            } else {
+                refresh.in_flight = false;
+                false
             }
+        };
 
-            fire_notifications(
-                &snapshots,
-                &cfg,
-                &mut state
-                    .last_notified
-                    .lock()
-                    .expect("AppState last_notified lock poisoned"),
-            );
-            emit_widget_refresh(&app);
-
-            let should_continue = {
-                let mut refresh = state.refresh.lock().expect("AppState refresh lock poisoned");
-                if refresh.queued {
-                    refresh.queued = false;
-                    true
-                } else {
-                    refresh.in_flight = false;
-                    false
-                }
-            };
-
-            if !should_continue {
-                break;
-            }
+        if !should_continue {
+            break;
         }
     });
 }
@@ -471,7 +510,13 @@ fn open_provider_settings(app: AppHandle) {
 
 #[tauri::command]
 fn get_provider_settings(state: State<AppState>) -> ProviderSettingsPayload {
-    provider_settings_payload(&state.cfg.lock().expect("AppState cfg lock poisoned").clone())
+    provider_settings_payload(
+        &state
+            .cfg
+            .lock()
+            .expect("AppState cfg lock poisoned")
+            .clone(),
+    )
 }
 
 #[tauri::command]
@@ -484,7 +529,11 @@ fn save_provider_account(
     require_window_label(&window, SETTINGS_LABEL, "save_provider_account")?;
     // Clone out because apply_provider_account_save may perform HTTP validation,
     // and we must not hold the mutex across network I/O.
-    let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned").clone();
+    let mut cfg = state
+        .cfg
+        .lock()
+        .expect("AppState cfg lock poisoned")
+        .clone();
     let catalog = provider_catalog();
     apply_provider_account_save(
         &mut cfg,
@@ -649,35 +698,76 @@ fn set_window_rect(window: tauri::WebviewWindow, x: i32, y: i32, w: i32, h: i32)
 }
 
 fn fire_notifications(
-    snapshots: &[UsageSnapshot],
+    snapshots: &[SnapshotView],
+    now: chrono::DateTime<Local>,
     cfg: &AppConfig,
-    last_notified: &mut HashMap<String, String>,
+    notified_alerts: &mut HashSet<String>,
 ) {
-    for s in snapshots {
-        if s.source == "demo" {
+    for (title, body) in collect_pending_notifications(snapshots, now, cfg, notified_alerts) {
+        emit_native_notification(&title, &body);
+    }
+}
+
+fn collect_pending_notifications(
+    snapshots: &[SnapshotView],
+    now: chrono::DateTime<Local>,
+    cfg: &AppConfig,
+    notified_alerts: &mut HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut active_signatures = HashSet::new();
+    let mut pending = Vec::new();
+
+    for snapshot_view in snapshots {
+        if snapshot_view.snapshot.source == "demo" {
             continue;
         }
-        let alerts = evaluate_alerts(s, cfg);
-        if !should_notify(&alerts, Local::now(), cfg) {
-            continue;
+
+        for alert in &snapshot_view.alerts {
+            let signature = alert_signature(&snapshot_view.snapshot, alert);
+            active_signatures.insert(signature.clone());
+
+            if notified_alerts.contains(&signature) || !should_notify_alert(alert, now, cfg) {
+                continue;
+            }
+
+            notified_alerts.insert(signature);
+            pending.push((
+                "UsageGuard".to_string(),
+                format!(
+                    "{}: {}",
+                    snapshot_view.snapshot.account_label, alert.message
+                ),
+            ));
         }
-        let sig = alerts
-            .iter()
-            .map(|a| format!("{}:{}", a.level, a.code))
-            .collect::<Vec<_>>()
-            .join(",");
-        let notification_key = format!("{}::{}", s.provider, s.account_label);
-        let changed = last_notified
-            .get(&notification_key)
-            .map(|x| x != &sig)
-            .unwrap_or(true);
-        if changed {
-            last_notified.insert(notification_key, sig);
-            emit_native_notification(
-                "UsageGuard",
-                &format!("{}: {}", s.account_label, alerts[0].message),
-            );
+    }
+
+    notified_alerts.retain(|signature| active_signatures.contains(signature));
+    pending
+}
+
+fn alert_signature(snapshot: &UsageSnapshot, alert: &Alert) -> String {
+    format!(
+        "{}::{}::{}::{}",
+        snapshot.provider,
+        snapshot.account_label,
+        alert.code,
+        alert_cycle_key(snapshot, alert)
+    )
+}
+
+fn alert_cycle_key(snapshot: &UsageSnapshot, alert: &Alert) -> String {
+    match alert.code.as_str() {
+        "quota_5h_exhausted" | "quota_5h_near_limit" | "quota_5h_unused_before_reset" => snapshot
+            .primary_reset_at
+            .clone()
+            .unwrap_or_else(|| "5h-stable".to_string()),
+        "quota_week_exhausted" | "quota_week_near_limit" | "quota_week_unused_before_reset" => {
+            snapshot
+                .secondary_reset_at
+                .clone()
+                .unwrap_or_else(|| "week-stable".to_string())
         }
+        _ => "stable".to_string(),
     }
 }
 
@@ -1229,7 +1319,12 @@ fn get_openai_oauth_status(state: State<AppState>) -> OAuthStatus {
     } else {
         None
     };
-    let label = state.cfg.lock().expect("AppState cfg lock poisoned").openai_oauth_label.clone();
+    let label = state
+        .cfg
+        .lock()
+        .expect("AppState cfg lock poisoned")
+        .openai_oauth_label
+        .clone();
     OAuthStatus {
         connected,
         plan_type,
@@ -1245,7 +1340,12 @@ fn get_anthropic_oauth_status(state: State<AppState>) -> OAuthStatus {
     } else {
         None
     };
-    let label = state.cfg.lock().expect("AppState cfg lock poisoned").anthropic_oauth_label.clone();
+    let label = state
+        .cfg
+        .lock()
+        .expect("AppState cfg lock poisoned")
+        .anthropic_oauth_label
+        .clone();
     OAuthStatus {
         connected,
         plan_type,
@@ -1283,11 +1383,14 @@ fn set_oauth_label(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_provider_account_save, parse_callback_code, AppConfig, ProviderAccount,
-        ProviderAccountInput, ProviderCatalogEntry, ANTHROPIC_OAUTH_PROVIDER,
+        alert_signature, apply_provider_account_save, collect_pending_notifications,
+        parse_callback_code, Alert, AppConfig, ProviderAccount, ProviderAccountInput,
+        ProviderCatalogEntry, SnapshotView, UsageSnapshot, ANTHROPIC_OAUTH_PROVIDER,
         OPENAI_OAUTH_PROVIDER,
     };
+    use chrono::Local;
     use std::cell::Cell;
+    use std::collections::HashSet;
 
     #[test]
     fn callback_requires_matching_state() {
@@ -1509,6 +1612,120 @@ mod tests {
         assert!(!persisted_key.get());
         assert!(!persisted_config.get());
     }
+
+    fn snapshot_view_with_alerts(
+        primary_reset_at: Option<&str>,
+        alerts: Vec<Alert>,
+    ) -> SnapshotView {
+        SnapshotView {
+            snapshot: UsageSnapshot {
+                provider: "openai".into(),
+                account_label: "ChatGPT Plus".into(),
+                spent_usd: 82.0,
+                limit_usd: 100.0,
+                tokens_in: 91,
+                tokens_out: 0,
+                inactive_hours: 0,
+                source: "oauth".into(),
+                status_code: None,
+                status_message: None,
+                api_metrics: None,
+                primary_reset_at: primary_reset_at.map(str::to_string),
+                secondary_reset_at: Some("2026-03-14T00:00:00Z".into()),
+            },
+            alerts,
+        }
+    }
+
+    #[test]
+    fn notification_state_does_not_reemit_unchanged_alerts() {
+        let cfg = AppConfig::default();
+        let now = Local::now();
+        let mut notified = HashSet::new();
+        let snapshot = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![Alert {
+                level: "warning".into(),
+                code: "quota_5h_near_limit".into(),
+                message: "5h quota nearly used up".into(),
+            }],
+        );
+
+        let first = collect_pending_notifications(
+            std::slice::from_ref(&snapshot),
+            now,
+            &cfg,
+            &mut notified,
+        );
+        let second = collect_pending_notifications(
+            std::slice::from_ref(&snapshot),
+            now,
+            &cfg,
+            &mut notified,
+        );
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn notification_state_rearms_after_alert_clears_and_returns() {
+        let cfg = AppConfig::default();
+        let now = Local::now();
+        let mut notified = HashSet::new();
+        let active = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![Alert {
+                level: "warning".into(),
+                code: "quota_5h_near_limit".into(),
+                message: "5h quota nearly used up".into(),
+            }],
+        );
+        let cleared = snapshot_view_with_alerts(Some("2026-03-10T12:00:00Z"), vec![]);
+
+        assert_eq!(
+            collect_pending_notifications(std::slice::from_ref(&active), now, &cfg, &mut notified)
+                .len(),
+            1
+        );
+        assert!(collect_pending_notifications(
+            std::slice::from_ref(&cleared),
+            now,
+            &cfg,
+            &mut notified
+        )
+        .is_empty());
+        assert_eq!(
+            collect_pending_notifications(std::slice::from_ref(&active), now, &cfg, &mut notified)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn notification_signature_rearms_for_new_reset_cycle() {
+        let current_cycle = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![Alert {
+                level: "warning".into(),
+                code: "quota_5h_near_limit".into(),
+                message: "5h quota nearly used up".into(),
+            }],
+        );
+        let next_cycle = snapshot_view_with_alerts(
+            Some("2026-03-10T17:00:00Z"),
+            vec![Alert {
+                level: "warning".into(),
+                code: "quota_5h_near_limit".into(),
+                message: "5h quota nearly used up".into(),
+            }],
+        );
+
+        let current_signature = alert_signature(&current_cycle.snapshot, &current_cycle.alerts[0]);
+        let next_signature = alert_signature(&next_cycle.snapshot, &next_cycle.alerts[0]);
+
+        assert_ne!(current_signature, next_signature);
+    }
 }
 
 fn main() {
@@ -1518,7 +1735,7 @@ fn main() {
             let saved_position = cfg.widget_position;
             app.manage(AppState {
                 cfg: Mutex::new(cfg),
-                last_notified: Mutex::new(HashMap::new()),
+                notified_alerts: Mutex::new(HashSet::new()),
                 snapshots: Mutex::new(Vec::new()),
                 refresh: Mutex::new(RefreshState::default()),
             });

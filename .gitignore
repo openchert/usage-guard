@@ -8,6 +8,8 @@
 /crates/usageguard-desktop/target_*/
 /crates/usageguard-cli/target_*/
 /docs/*
+!/docs/ALERTS.md
+!/docs/PROJECT.md
 !/docs/PROVIDERS.md
 !/docs/SECURITY.md
 /.claude/

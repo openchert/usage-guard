@@ -10,6 +10,12 @@ export interface ApiMetricCard {
   rolling_30d: ApiMetricWindow;
 }
 
+export interface Alert {
+  level: string;
+  code: string;
+  message: string;
+}
+
 export interface UsageSnapshot {
   provider: string;
   account_label: string;
@@ -24,6 +30,7 @@ export interface UsageSnapshot {
   api_metrics?: ApiMetricCard | null;
   primary_reset_at?: string | null;
   secondary_reset_at?: string | null;
+  alerts?: Alert[] | null;
 }
 
 export interface UsageRingSpec {

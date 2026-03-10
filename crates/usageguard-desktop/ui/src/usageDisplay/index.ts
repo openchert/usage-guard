@@ -1,7 +1,7 @@
 import { anthropicApiDisplayAdapter } from './adapters/anthropicApi';
-import { anthropicOauthDisplayAdapter } from './adapters/anthropicOauth';
+import { anthropicOauthDisplayAdapter } from './adapters/anthropicOauthAlert';
 import { genericApiDisplayAdapter } from './adapters/genericApi';
-import { openaiOauthDisplayAdapter } from './adapters/openaiOauth';
+import { openaiOauthDisplayAdapter } from './adapters/openaiOauthAlert';
 import { openaiApiDisplayAdapter } from './adapters/openaiApi';
 import type {
   UsageCardSpec,

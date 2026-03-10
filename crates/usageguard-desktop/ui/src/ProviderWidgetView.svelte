@@ -14,10 +14,13 @@
 
   let snapshots = [] as UsageSnapshot[];
   let isLoading = false;
+  let initialShown = false;
   let refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS;
   let refreshTimer: number | null = null;
   let lastRenderedCardCount: number | null = null;
   let unlistenRefresh: (() => void) | null = null;
+
+  type AlertLevel = 'critical' | 'warning' | 'info';
 
   function cardSpec(snapshot: UsageSnapshot) {
     return resolveUsageCard(snapshot, {
@@ -27,6 +30,18 @@
 
   function displayLabel(snapshot: UsageSnapshot): string {
     return cardSpec(snapshot).displayLabel;
+  }
+
+  function cardAlertLevel(snapshot: UsageSnapshot): AlertLevel | null {
+    const alerts = snapshot.alerts ?? [];
+    if (alerts.some((alert) => alert.level === 'critical')) return 'critical';
+    if (alerts.some((alert) => alert.level === 'warning')) return 'warning';
+    if (alerts.some((alert) => alert.level === 'info')) return 'info';
+    return null;
+  }
+
+  function alertBadgeLabel(level: AlertLevel): string {
+    return level === 'info' ? 'i' : '!';
   }
 
   function sorted(items: UsageSnapshot[]): UsageSnapshot[] {
@@ -110,6 +125,16 @@
     }
   }
 
+  async function showWindowOnce(): Promise<void> {
+    if (initialShown || !currentWindow) return;
+    initialShown = true;
+    try {
+      await currentWindow.show();
+    } catch (error) {
+      console.error('show window failed:', error);
+    }
+  }
+
   async function requestRefresh(): Promise<void> {
     if (!invoke) return;
 
@@ -149,10 +174,11 @@
     document.addEventListener('selectstart', onSelectStart);
 
     if (listen) {
-      unlistenRefresh = await listen(REFRESH_EVENT, () => {
-        void applyTheme();
-        void loadRefreshInterval();
-        void loadSnapshots();
+      unlistenRefresh = await listen(REFRESH_EVENT, async () => {
+        await applyTheme();
+        await loadRefreshInterval();
+        await loadSnapshots();
+        await showWindowOnce();
       });
     }
 
@@ -161,6 +187,9 @@
     await loadSnapshots();
     resetRefreshTimer();
     void requestRefresh();
+
+    // Fallback: show the window after 5 seconds even if no refresh event fires.
+    window.setTimeout(() => void showWindowOnce(), 5000);
   });
 
   onDestroy(() => {
@@ -180,7 +209,16 @@
     {#each snapshots as snapshot}
       {@const provider = providerMeta(snapshot.provider)}
       {@const card = cardSpec(snapshot)}
-      <div class="provider-card" class:provider-card-metrics={card.kind === 'metrics'} title={card.title}>
+      {@const alertLevel = cardAlertLevel(snapshot)}
+      <div
+        class="provider-card"
+        class:provider-card-metrics={card.kind === 'metrics'}
+        data-alert-level={alertLevel ?? undefined}
+        title={card.title}
+      >
+        {#if alertLevel}
+          <span class="alert-badge" aria-hidden="true">{alertBadgeLabel(alertLevel)}</span>
+        {/if}
         <span class="card-name">{card.displayLabel}</span>
         {#if card.kind === 'quota'}
           <div class="rings">
@@ -242,6 +280,7 @@
   }
 
   .provider-card {
+    position: relative;
     flex: 0 0 110px;
     padding: 9px 8px 8px;
     border: 1px solid var(--border-card);
@@ -250,6 +289,49 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+
+  .provider-card[data-alert-level='critical'] {
+    border-color: rgba(214, 84, 84, 0.95);
+    box-shadow: inset 0 0 0 1px rgba(214, 84, 84, 0.22);
+  }
+
+  .provider-card[data-alert-level='warning'] {
+    border-color: rgba(224, 170, 66, 0.95);
+    box-shadow: inset 0 0 0 1px rgba(224, 170, 66, 0.2);
+  }
+
+  .provider-card[data-alert-level='info'] {
+    border-color: rgba(94, 156, 255, 0.95);
+    box-shadow: inset 0 0 0 1px rgba(94, 156, 255, 0.18);
+  }
+
+  .alert-badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 14px;
+    height: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    color: #fff;
+    background: rgba(94, 156, 255, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+  }
+
+  .provider-card[data-alert-level='critical'] .alert-badge {
+    background: rgba(214, 84, 84, 0.95);
+  }
+
+  .provider-card[data-alert-level='warning'] .alert-badge {
+    background: rgba(224, 170, 66, 0.95);
+    color: rgba(36, 22, 0, 0.92);
   }
 
   .card-name {
