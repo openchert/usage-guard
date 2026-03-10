@@ -34,8 +34,27 @@ enum Command {
 
 fn print_snapshot(s: &UsageSnapshot, cfg: &AppConfig) {
     println!("Provider: {} ({})", s.provider, s.account_label);
-    println!("Spend: ${:.2} / ${:.2}", s.spent_usd, s.limit_usd);
-    println!("Tokens: in={} out={}", s.tokens_in, s.tokens_out);
+    if let Some(metrics) = &s.api_metrics {
+        println!(
+            "Today: spend=${:.2} tokens(in={}, out={})",
+            metrics.today.spend_usd, metrics.today.tokens_in, metrics.today.tokens_out
+        );
+        println!(
+            "30d: spend=${:.2} tokens(in={}, out={})",
+            metrics.rolling_30d.spend_usd,
+            metrics.rolling_30d.tokens_in,
+            metrics.rolling_30d.tokens_out
+        );
+        if let Some(requests) = metrics.today.requests {
+            println!("Today requests: {}", requests);
+        }
+        if let Some(requests) = metrics.rolling_30d.requests {
+            println!("30d requests: {}", requests);
+        }
+    } else {
+        println!("Spend: ${:.2} / ${:.2}", s.spent_usd, s.limit_usd);
+        println!("Tokens: in={} out={}", s.tokens_in, s.tokens_out);
+    }
     println!("Inactive: {}h", s.inactive_hours);
     println!("Source: {}", s.source);
     if let Some(message) = &s.status_message {
@@ -52,12 +71,22 @@ fn print_snapshot(s: &UsageSnapshot, cfg: &AppConfig) {
     }
 }
 
+fn load_config_or_exit() -> AppConfig {
+    match load_config() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Demo => {
-            let cfg = load_config().unwrap_or_default();
+            let cfg = load_config_or_exit();
             for s in provider_snapshots(&cfg) {
                 print_snapshot(&s, &cfg);
             }
@@ -67,7 +96,7 @@ fn main() {
             limit,
             inactive_hours,
         } => {
-            let cfg = load_config().unwrap_or_default();
+            let cfg = load_config_or_exit();
             let s = UsageSnapshot {
                 provider: "custom".into(),
                 account_label: "local".into(),
@@ -79,6 +108,7 @@ fn main() {
                 source: "cli".into(),
                 status_code: None,
                 status_message: None,
+                api_metrics: None,
             };
             print_snapshot(&s, &cfg);
         }
@@ -87,7 +117,7 @@ fn main() {
             openai_key,
             anthropic_key,
         } => {
-            let mut cfg = load_config().unwrap_or_default();
+            let mut cfg = load_config_or_exit();
             let has_openai_arg = openai_key.is_some();
             let has_anthropic_arg = anthropic_key.is_some();
 

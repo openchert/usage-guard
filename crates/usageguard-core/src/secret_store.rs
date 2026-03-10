@@ -53,6 +53,14 @@ impl Default for SecretPayload {
 
 pub struct SecretStore;
 
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 impl SecretStore {
     pub fn path() -> Result<PathBuf> {
         Ok(app_config_dir()?.join(SECRET_STORE_FILE_NAME))
@@ -229,15 +237,9 @@ fn decrypt_bytes(_encrypted: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
-
-    fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn with_test_dir(name: &str, test: impl FnOnce(&Path)) {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_env_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "usageguard_secret_store_{name}_{}",
             std::process::id()

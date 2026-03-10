@@ -19,10 +19,10 @@ Examples:
 This matters because each source can represent usage differently:
 
 - OpenAI OAuth returns `used_percent` from `wham/usage`
-- API providers may return spend, limits, tokens, or custom shapes
+- API providers may return rolling cost and usage aggregates instead of quota windows
 - some sources report consumed quota, others report remaining quota
 
-Each adapter is responsible for converting those raw semantics into the normalized card UI, hover text, and ring values.
+Each adapter is responsible for converting those raw semantics into the normalized card UI, hover text, and either quota rings or metric tiles.
 
 ## OpenAI OAuth display behavior
 
@@ -54,6 +54,30 @@ The Anthropic OAuth adapter also shows provider-specific hover text with:
 - current five-hour usage and remaining percentage
 - current seven-day usage and remaining percentage
 
+## API display behavior
+
+OpenAI API and Anthropic API cards do not reuse the OAuth `5h` / `week` quota model.
+
+Instead, they render compact metric panels with:
+
+- `Today` spend and activity
+- rolling `30d` spend and activity
+- token counts in tooltips
+- request counts when the provider exposes them
+
+These API cards are organization/admin monitoring only. Individual API keys are not supported for this built-in provider-reported view.
+
+Current provider mappings:
+
+- OpenAI API:
+  `organization/costs` drives spend
+  `organization/usage/completions` drives token and request counts
+- Anthropic API:
+  `organizations/cost_report` drives spend
+  `organizations/usage_report/messages` drives token counts
+
+The API hover text also explains the upstream source for each metric so billing-style spend and usage-report tokens are not conflated.
+
 ## Snapshot schema
 
 `UsageSnapshot` now keeps `source` as a stable origin instead of mixing error text into it.
@@ -69,6 +93,7 @@ User-safe error state is carried separately in:
 
 - `status_code`
 - `status_message`
+- `api_metrics` for typed `Today` / `30d` API card data when present
 
 That keeps the UI and CLI readable without leaking raw upstream response bodies.
 
@@ -88,6 +113,5 @@ Current built-in remote fetch sources:
 - Anthropic OAuth
 - OpenAI API
 - Anthropic API
-- Cursor API
 
 Environment/log fallbacks and demo data still exist as non-remote fallback paths where applicable.

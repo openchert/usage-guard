@@ -9,10 +9,9 @@ export interface ProviderTheme {
 export const PROVIDER_META: Record<string, ProviderTheme> = {
   openai: { label: 'OpenAI', color: '#1fa97c' },
   anthropic: { label: 'Anthropic', color: '#d97a4e' },
-  cursor: { label: 'Cursor', color: '#f08a59' },
 };
 
-export const PROVIDER_ORDER = ['openai', 'anthropic', 'cursor'];
+export const PROVIDER_ORDER = ['openai', 'anthropic'];
 
 export function providerMeta(provider: string): ProviderTheme {
   return PROVIDER_META[provider] ?? { label: provider, color: '#5a6680' };

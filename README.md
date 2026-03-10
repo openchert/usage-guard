@@ -6,12 +6,12 @@
 <p align="center">A local-first Windows widget and CLI for tracking AI spend, quotas, and subscription usage without dashboard noise.</p>
 <p align="center"><strong>Windows x64 release binaries | PowerShell one-line install | No Rust required for end users</strong></p>
 
-UsageGuard keeps provider usage visible in a small desktop surface instead of burying it across multiple dashboards. It supports subscription-backed OAuth sources, API-key providers, and local encrypted secret storage on Windows.
+UsageGuard keeps provider usage visible in a small desktop surface instead of burying it across multiple dashboards. It supports subscription-backed OAuth sources, organization/admin API monitoring keys, and local encrypted secret storage on Windows.
 
 ## Highlights
-- Frameless Windows widget with compact `5h` and `week` usage rings
+- Frameless Windows widget with provider-specific quota rings or API metric panels
 - ChatGPT and Claude subscription usage via browser OAuth
-- OpenAI, Anthropic, and Cursor API usage via built-in audited endpoints
+- OpenAI and Anthropic admin/API usage via built-in audited endpoints
 - Local DPAPI-encrypted secret storage for API keys and OAuth refresh tokens
 - CLI for config inspection and demo workflows
 
@@ -40,21 +40,22 @@ Compare the reported hash with the matching entry in `SHA256SUMS`.
 ## Supported Connections
 - OpenAI `oauth`: ChatGPT subscription usage via `https://chatgpt.com/backend-api/wham/usage`
 - Anthropic `oauth`: Claude subscription usage via `https://api.anthropic.com/api/oauth/usage`
-- OpenAI `api`: organization costs endpoint
-- Anthropic `api`: organizations usage endpoint
-- Cursor `api`: team spend endpoint
+- OpenAI `api`: `GET https://api.openai.com/v1/organization/costs` and `GET https://api.openai.com/v1/organization/usage/completions`
+- Anthropic `api`: `GET https://api.anthropic.com/v1/organizations/cost_report` and `GET https://api.anthropic.com/v1/organizations/usage_report/messages`
+
+API-key monitoring accepts organization/admin keys only. Individual API keys are not supported.
 
 ## Quick Start
 ### Desktop
 1. Open `usageguard-desktop`.
 2. Click the `+` button on the widget or open the native right-click menu.
 3. Choose **Manage Providers...**
-4. Connect ChatGPT or Claude with OAuth, or add a provider account with an API key.
+4. Connect ChatGPT or Claude with OAuth, or add an OpenAI or Anthropic organization monitoring account with an API key.
 
 ### CLI
 ```bash
 usageguard config --openai-key "sk-..."
-usageguard config --anthropic-key "sk-ant-..."
+usageguard config --anthropic-key "sk-ant-admin-..."
 usageguard demo
 ```
 
@@ -80,6 +81,7 @@ The desktop crate builds the UI through Tauri's `beforeBuildCommand`, so Node.js
 - If the install command succeeds but `usageguard` is not found, restart the terminal so `PATH` is reloaded.
 - If ChatGPT OAuth sign-in fails, make sure nothing else is using `localhost:1455`.
 - If Claude OAuth sign-in fails, make sure nothing else is using `localhost:45454`.
+- If an OpenAI or Anthropic API card shows an admin-access status, verify the key has org usage access and that Anthropic uses an `sk-ant-admin...` key.
 - If the widget shows `Status: Unable to load provider usage right now.`, verify the API key or reconnect the OAuth source.
 - If secure storage is unavailable, UsageGuard does not fall back to plaintext secret persistence.
 

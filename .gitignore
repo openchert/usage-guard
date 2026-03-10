@@ -1,10 +1,12 @@
 /target
+/target_*/
 /target_codex*/
 **/target_codex*/
 .DS_Store
 /dist
 /crates/usageguard-desktop/gen/
 /crates/usageguard-desktop/target_*/
+/crates/usageguard-cli/target_*/
 /docs/*
 !/docs/PROVIDERS.md
 !/docs/SECURITY.md

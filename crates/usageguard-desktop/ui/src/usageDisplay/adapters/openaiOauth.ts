@@ -42,6 +42,7 @@ export const openaiOauthDisplayAdapter: UsageDisplayAdapter = {
     }
 
     return {
+      kind: 'quota',
       displayLabel: label,
       title: titleLines.join('\n'),
       rings: [

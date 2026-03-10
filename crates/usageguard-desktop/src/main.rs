@@ -13,8 +13,9 @@ use tauri::{
 };
 use usageguard_core::{
     evaluate_alerts, has_provider_account_api_key, load_config, provider_catalog,
-    provider_snapshots, save_config, set_provider_account_api_key, should_notify, AppConfig,
-    ProviderAccount, ProviderCatalogEntry, UsageSnapshot,
+    provider_snapshots, save_config, set_provider_account_api_key, should_notify,
+    verify_anthropic_oauth_access_token, verify_openai_oauth_access_token, verify_provider_api_key,
+    AppConfig, ProviderAccount, ProviderCatalogEntry, UsageSnapshot,
 };
 
 struct AppState {
@@ -49,6 +50,7 @@ struct ProviderSettingsPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderAccountInput {
     id: Option<String>,
     provider: String,
@@ -87,6 +89,103 @@ fn normalize_required(value: &str, field: &str) -> Result<String, String> {
     } else {
         Ok(trimmed.to_string())
     }
+}
+
+fn apply_provider_account_save(
+    cfg: &mut AppConfig,
+    input: &ProviderAccountInput,
+    catalog: &[ProviderCatalogEntry],
+    has_api_key: impl Fn(&str) -> bool,
+    validate_api_key: impl Fn(&str, &str) -> Result<(), String>,
+    persist_api_key: impl Fn(&str, &str) -> Result<(), String>,
+    persist_config: impl Fn(&AppConfig) -> Result<(), String>,
+) -> Result<(), String> {
+    let provider = normalize_required(&input.provider, "Provider")?;
+    let label = normalize_required(&input.label, "Name")?;
+    let api_key = normalize_optional(input.api_key.clone());
+
+    let provider_meta = catalog
+        .iter()
+        .find(|entry| entry.id == provider)
+        .ok_or_else(|| "Unknown provider selected".to_string())?;
+
+    let existing_index = match input.id.as_ref() {
+        Some(id) => Some(
+            cfg.provider_accounts
+                .iter()
+                .position(|account| account.id == *id)
+                .ok_or_else(|| "Provider account not found".to_string())?,
+        ),
+        None => None,
+    };
+
+    if let Some(index) = existing_index {
+        let existing = &cfg.provider_accounts[index];
+        if existing.provider != provider {
+            return Err("Provider cannot be changed for an existing account".to_string());
+        }
+    }
+
+    if cfg
+        .provider_accounts
+        .iter()
+        .enumerate()
+        .any(|(index, account)| {
+            Some(index) != existing_index
+                && account.provider == provider
+                && account.label.eq_ignore_ascii_case(&label)
+        })
+    {
+        return Err(format!(
+            "A {} account named '{}' already exists",
+            provider_meta.label, label
+        ));
+    }
+
+    let account_id = existing_index
+        .and_then(|index| {
+            cfg.provider_accounts
+                .get(index)
+                .map(|account| account.id.clone())
+        })
+        .unwrap_or_else(|| make_account_id(&provider, &label));
+
+    if api_key.is_none() && !has_api_key(&account_id) {
+        return Err("API key is required".to_string());
+    }
+
+    if let Some(ref key) = api_key {
+        validate_api_key(&provider, key)?;
+    }
+
+    let original_cfg = cfg.clone();
+    let account = ProviderAccount {
+        id: account_id.clone(),
+        provider,
+        label,
+        endpoint: None,
+    };
+
+    if let Some(index) = existing_index {
+        cfg.provider_accounts[index] = account;
+    } else {
+        cfg.provider_accounts.push(account);
+    }
+
+    if let Err(error) = persist_config(cfg) {
+        *cfg = original_cfg;
+        return Err(error);
+    }
+
+    if let Some(ref key) = api_key {
+        if let Err(error) = persist_api_key(&account_id, key) {
+            *cfg = original_cfg.clone();
+            let _ = persist_config(&original_cfg);
+            return Err(error);
+        }
+    }
+
+    Ok(())
 }
 
 fn make_account_id(provider: &str, label: &str) -> String {
@@ -266,69 +365,22 @@ fn save_provider_account(
     app: AppHandle,
 ) -> Result<ProviderSettingsPayload, String> {
     require_window_label(&window, SETTINGS_LABEL, "save_provider_account")?;
-    let provider = normalize_required(&input.provider, "Provider")?;
-    let label = normalize_required(&input.label, "Name")?;
-    let api_key = normalize_optional(input.api_key);
-
-    let catalog = provider_catalog();
-    let provider_meta = catalog
-        .iter()
-        .find(|entry| entry.id == provider)
-        .ok_or_else(|| "Unknown provider selected".to_string())?;
-
     let mut cfg = state.cfg.lock().unwrap().clone();
-    let existing_index = input.id.as_ref().and_then(|id| {
-        cfg.provider_accounts
-            .iter()
-            .position(|account| account.id == *id)
-    });
+    let catalog = provider_catalog();
+    apply_provider_account_save(
+        &mut cfg,
+        &input,
+        &catalog,
+        has_provider_account_api_key,
+        |provider_id, key| {
+            verify_provider_api_key(provider_id, key).map_err(|error| error.to_string())
+        },
+        |account_id, key| {
+            set_provider_account_api_key(account_id, Some(key)).map_err(|error| error.to_string())
+        },
+        |updated_cfg| save_config(updated_cfg).map_err(|error| error.to_string()),
+    )?;
 
-    if cfg
-        .provider_accounts
-        .iter()
-        .enumerate()
-        .any(|(index, account)| {
-            Some(index) != existing_index
-                && account.provider == provider
-                && account.label.eq_ignore_ascii_case(&label)
-        })
-    {
-        return Err(format!(
-            "A {} account named '{}' already exists",
-            provider_meta.label, label
-        ));
-    }
-
-    let account_id = existing_index
-        .and_then(|index| {
-            cfg.provider_accounts
-                .get(index)
-                .map(|account| account.id.clone())
-        })
-        .unwrap_or_else(|| make_account_id(&provider, &label));
-
-    if api_key.is_none() && !has_provider_account_api_key(&account_id) {
-        return Err("API key is required".to_string());
-    }
-
-    if let Some(ref key) = api_key {
-        set_provider_account_api_key(&account_id, Some(key)).map_err(|e| e.to_string())?;
-    }
-
-    let account = ProviderAccount {
-        id: account_id,
-        provider,
-        label,
-        endpoint: None,
-    };
-
-    if let Some(index) = existing_index {
-        cfg.provider_accounts[index] = account;
-    } else {
-        cfg.provider_accounts.push(account);
-    }
-
-    save_config(&cfg).map_err(|e| e.to_string())?;
     *state.cfg.lock().unwrap() = cfg.clone();
     emit_widget_refresh(&app);
     Ok(provider_settings_payload(&cfg))
@@ -910,19 +962,25 @@ async fn authorize_with_oauth(
 async fn connect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<String, String> {
     require_window_label(&window, SETTINGS_LABEL, "connect_openai_oauth")?;
     let (_, access, refresh, expires_at) = authorize_with_oauth(OPENAI_OAUTH_PROVIDER).await?;
+    let verified = {
+        let access = access.clone();
+        tauri::async_runtime::spawn_blocking(move || verify_openai_oauth_access_token(&access, ""))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+    };
 
-    usageguard_core::set_openai_oauth_tokens(&access, expires_at, &refresh, "", "")
-        .map_err(|e| e.to_string())?;
-
-    let plan_type = tauri::async_runtime::spawn_blocking(usageguard_core::fetch_openai_oauth_usage)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|_| usageguard_core::get_openai_oauth_plan_type())
-        .unwrap_or_else(|| "connected".to_string());
+    usageguard_core::set_openai_oauth_tokens(
+        &access,
+        expires_at,
+        &refresh,
+        &verified.account_id,
+        &verified.plan_type,
+    )
+    .map_err(|e| e.to_string())?;
 
     emit_widget_refresh(&app);
-    Ok(plan_type)
+    Ok(verified.plan_type)
 }
 
 #[tauri::command]
@@ -944,26 +1002,29 @@ async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Resul
     let rate_limit_tier =
         oauth_response_string(&response, &["rateLimitTier", "rate_limit_tier", "tier"])
             .unwrap_or_default();
+    let verified = {
+        let access = access.clone();
+        let subscription_type = subscription_type.clone();
+        let rate_limit_tier = rate_limit_tier.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            verify_anthropic_oauth_access_token(&access, &subscription_type, &rate_limit_tier)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+    };
 
     usageguard_core::set_anthropic_oauth_tokens(
         &access,
         expires_at,
         &refresh,
-        &subscription_type,
-        &rate_limit_tier,
+        &verified.subscription_type,
+        &verified.rate_limit_tier,
     )
     .map_err(|e| e.to_string())?;
 
-    let plan_type =
-        tauri::async_runtime::spawn_blocking(usageguard_core::fetch_anthropic_oauth_usage)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|_| usageguard_core::get_anthropic_oauth_plan_type())
-            .unwrap_or_else(|| "connected".to_string());
-
     emit_widget_refresh(&app);
-    Ok(plan_type)
+    Ok(verified.plan_type)
 }
 
 #[tauri::command]
@@ -986,40 +1047,74 @@ fn disconnect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Result<(
 struct OAuthStatus {
     connected: bool,
     plan_type: Option<String>,
-}
-
-fn oauth_status(connected: bool, plan_type: Option<String>) -> OAuthStatus {
-    OAuthStatus {
-        connected,
-        plan_type,
-    }
+    label: Option<String>,
 }
 
 #[tauri::command]
-fn get_openai_oauth_status() -> OAuthStatus {
+fn get_openai_oauth_status(state: State<AppState>) -> OAuthStatus {
     let connected = usageguard_core::has_openai_oauth_session();
     let plan_type = if connected {
         usageguard_core::get_openai_oauth_plan_type().filter(|s| !s.is_empty())
     } else {
         None
     };
-    oauth_status(connected, plan_type)
+    let label = state.cfg.lock().unwrap().openai_oauth_label.clone();
+    OAuthStatus {
+        connected,
+        plan_type,
+        label,
+    }
 }
 
 #[tauri::command]
-fn get_anthropic_oauth_status() -> OAuthStatus {
+fn get_anthropic_oauth_status(state: State<AppState>) -> OAuthStatus {
     let connected = usageguard_core::has_anthropic_oauth_session();
     let plan_type = if connected {
         usageguard_core::get_anthropic_oauth_plan_type().filter(|s| !s.is_empty())
     } else {
         None
     };
-    oauth_status(connected, plan_type)
+    let label = state.cfg.lock().unwrap().anthropic_oauth_label.clone();
+    OAuthStatus {
+        connected,
+        plan_type,
+        label,
+    }
+}
+
+#[tauri::command]
+fn set_oauth_label(
+    window: WebviewWindow,
+    provider: String,
+    label: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    require_window_label(&window, SETTINGS_LABEL, "set_oauth_label")?;
+    let trimmed = label.trim().to_string();
+    let label_opt = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
+    let mut cfg = state.cfg.lock().unwrap().clone();
+    match provider.as_str() {
+        "openai" => cfg.openai_oauth_label = label_opt,
+        "anthropic" => cfg.anthropic_oauth_label = label_opt,
+        _ => return Err(format!("Unknown OAuth provider: {provider}")),
+    }
+    save_config(&cfg).map_err(|e| e.to_string())?;
+    *state.cfg.lock().unwrap() = cfg;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_callback_code, ANTHROPIC_OAUTH_PROVIDER, OPENAI_OAUTH_PROVIDER};
+    use super::{
+        apply_provider_account_save, parse_callback_code, AppConfig, ProviderAccount,
+        ProviderAccountInput, ProviderCatalogEntry, ANTHROPIC_OAUTH_PROVIDER,
+        OPENAI_OAUTH_PROVIDER,
+    };
+    use std::cell::Cell;
 
     #[test]
     fn callback_requires_matching_state() {
@@ -1064,12 +1159,189 @@ mod tests {
         .unwrap();
         assert_eq!(code, "claude-code");
     }
+
+    fn provider_catalog_fixture() -> Vec<ProviderCatalogEntry> {
+        vec![
+            ProviderCatalogEntry {
+                id: "openai".into(),
+                label: "OpenAI".into(),
+            },
+            ProviderCatalogEntry {
+                id: "anthropic".into(),
+                label: "Anthropic".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn provider_change_on_edit_is_rejected_server_side() {
+        let mut cfg = AppConfig::default();
+        cfg.provider_accounts.push(ProviderAccount {
+            id: "acct_openai_work".into(),
+            provider: "openai".into(),
+            label: "Work".into(),
+            endpoint: None,
+        });
+
+        let input = ProviderAccountInput {
+            id: Some("acct_openai_work".into()),
+            provider: "anthropic".into(),
+            label: "Work".into(),
+            api_key: None,
+        };
+
+        let error = apply_provider_account_save(
+            &mut cfg,
+            &input,
+            &provider_catalog_fixture(),
+            |_| true,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Provider cannot be changed"));
+    }
+
+    #[test]
+    fn provider_account_input_rejects_removed_individual_fields() {
+        let error = serde_json::from_value::<ProviderAccountInput>(serde_json::json!({
+            "provider": "openai",
+            "label": "Work",
+            "apiKey": "sk-test",
+            "accessMode": "individual",
+            "usageLogPath": "C:\\logs\\usage.ndjson"
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn label_only_edit_keeps_existing_key_without_validation() {
+        let mut cfg = AppConfig::default();
+        cfg.provider_accounts.push(ProviderAccount {
+            id: "acct_openai_work".into(),
+            provider: "openai".into(),
+            label: "Work".into(),
+            endpoint: None,
+        });
+        let validation_called = Cell::new(false);
+        let persist_key_called = Cell::new(false);
+
+        let input = ProviderAccountInput {
+            id: Some("acct_openai_work".into()),
+            provider: "openai".into(),
+            label: "Renamed".into(),
+            api_key: None,
+        };
+
+        apply_provider_account_save(
+            &mut cfg,
+            &input,
+            &provider_catalog_fixture(),
+            |_| true,
+            |_, _| {
+                validation_called.set(true);
+                Ok(())
+            },
+            |_, _| {
+                persist_key_called.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.provider_accounts[0].label, "Renamed");
+        assert!(!validation_called.get());
+        assert!(!persist_key_called.get());
+    }
+
+    #[test]
+    fn invalid_new_api_key_rejects_without_persisting() {
+        let mut cfg = AppConfig::default();
+        let persisted_key = Cell::new(false);
+        let persisted_config = Cell::new(false);
+
+        let input = ProviderAccountInput {
+            id: None,
+            provider: "openai".into(),
+            label: "Work".into(),
+            api_key: Some("bad-key".into()),
+        };
+
+        let error = apply_provider_account_save(
+            &mut cfg,
+            &input,
+            &provider_catalog_fixture(),
+            |_| false,
+            |_, _| Err("OpenAI API key is invalid. Nothing was saved.".into()),
+            |_, _| {
+                persisted_key.set(true);
+                Ok(())
+            },
+            |_| {
+                persisted_config.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("invalid"));
+        assert!(cfg.provider_accounts.is_empty());
+        assert!(!persisted_key.get());
+        assert!(!persisted_config.get());
+    }
+
+    #[test]
+    fn key_replacement_failure_keeps_old_key_and_config() {
+        let mut cfg = AppConfig::default();
+        cfg.provider_accounts.push(ProviderAccount {
+            id: "acct_openai_work".into(),
+            provider: "openai".into(),
+            label: "Work".into(),
+            endpoint: None,
+        });
+        let persisted_key = Cell::new(false);
+        let persisted_config = Cell::new(false);
+
+        let input = ProviderAccountInput {
+            id: Some("acct_openai_work".into()),
+            provider: "openai".into(),
+            label: "Work".into(),
+            api_key: Some("replacement".into()),
+        };
+
+        let error = apply_provider_account_save(
+            &mut cfg,
+            &input,
+            &provider_catalog_fixture(),
+            |_| true,
+            |_, _| Err("OpenAI API key is invalid. Nothing was saved.".into()),
+            |_, _| {
+                persisted_key.set(true);
+                Ok(())
+            },
+            |_| {
+                persisted_config.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("invalid"));
+        assert_eq!(cfg.provider_accounts[0].label, "Work");
+        assert!(!persisted_key.get());
+        assert!(!persisted_config.get());
+    }
 }
 
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let cfg = load_config().unwrap_or_default();
+            let cfg = load_config().map_err(|error| std::io::Error::other(error.to_string()))?;
             let saved_position = cfg.widget_position;
             app.manage(AppState {
                 cfg: Mutex::new(cfg),
@@ -1178,6 +1450,7 @@ fn main() {
             disconnect_anthropic_oauth,
             get_openai_oauth_status,
             get_anthropic_oauth_status,
+            set_oauth_label,
         ])
         .run(tauri::generate_context!())
         .expect("error running tauri application");

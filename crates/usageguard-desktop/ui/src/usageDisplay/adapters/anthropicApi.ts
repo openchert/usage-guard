@@ -1,4 +1,4 @@
-import { buildGenericApiCard, buildProviderApiTitle } from './shared';
+import { buildProviderApiMetricCard } from './shared';
 import type { UsageCardSpec, UsageDisplayAdapter } from '../types';
 
 export const anthropicApiDisplayAdapter: UsageDisplayAdapter = {
@@ -7,10 +7,9 @@ export const anthropicApiDisplayAdapter: UsageDisplayAdapter = {
     return snapshot.provider === 'anthropic' && snapshot.source === 'api';
   },
   toCard(snapshot, context): UsageCardSpec {
-    const card = buildGenericApiCard(snapshot, context);
-    return {
-      ...card,
-      title: buildProviderApiTitle('Anthropic', snapshot, context),
-    };
+    return buildProviderApiMetricCard('Anthropic', snapshot, context, {
+      spendSource: 'cost report',
+      tokenSource: 'messages usage report',
+    });
   },
 };

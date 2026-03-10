@@ -14,7 +14,7 @@ For normal operation, the app reads and writes secrets only through this encrypt
 
 The encrypted payload currently contains:
 
-- Provider API keys for OpenAI, Anthropic, and Cursor accounts
+- Provider API keys for OpenAI and Anthropic accounts
 - OpenAI OAuth refresh token
 - OpenAI OAuth `account_id`
 - OpenAI OAuth `plan_type`
@@ -30,9 +30,8 @@ Current built-in connection types are:
 
 - OpenAI `oauth`: ChatGPT subscription usage via `https://chatgpt.com/backend-api/wham/usage`
 - Anthropic `oauth`: Claude subscription usage via `https://api.anthropic.com/api/oauth/usage`
-- OpenAI `api`: `GET https://api.openai.com/v1/organization/costs`
-- Anthropic `api`: `GET https://api.anthropic.com/v1/organizations/usage`
-- Cursor `api`: `POST https://api.cursor.com/teams/spend`
+- OpenAI `api`: `GET https://api.openai.com/v1/organization/costs` and `GET https://api.openai.com/v1/organization/usage/completions`
+- Anthropic `api`: `GET https://api.anthropic.com/v1/organizations/cost_report` and `GET https://api.anthropic.com/v1/organizations/usage_report/messages`
 
 Outbound requests are limited to these built-in audited endpoints. Custom endpoint overrides and custom provider profiles are not used for outbound fetches.
 
@@ -71,9 +70,10 @@ If token refresh fails in a way that indicates expired or invalid OAuth state, U
 
 Built-in API providers use these authentication methods:
 
-- OpenAI API: `Authorization: Bearer <api key>`
-- Anthropic API: `x-api-key: <api key>` with `anthropic-version: 2023-06-01`
-- Cursor API: HTTP Basic auth using the API key as the username
+- OpenAI API: `Authorization: Bearer <api key>` with organization/admin usage access for the Administration endpoints
+- Anthropic API: `x-api-key: <api key>` with `anthropic-version: 2023-06-01`; organization monitoring requires an Admin API key (`sk-ant-admin...`)
+
+UsageGuard does not accept individual API keys for provider-reported historical usage. Individual-user monitoring is handled through the OAuth subscription flows instead.
 
 ## UI and command hardening
 

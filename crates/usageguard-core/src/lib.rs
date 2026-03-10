@@ -52,6 +52,37 @@ struct ClaudeDesktopOAuth {
     rate_limit_tier: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApiMetricWindow {
+    #[serde(default)]
+    pub spend_usd: f64,
+    #[serde(default)]
+    pub tokens_in: u64,
+    #[serde(default)]
+    pub tokens_out: u64,
+    #[serde(default)]
+    pub requests: Option<u64>,
+}
+
+impl Default for ApiMetricWindow {
+    fn default() -> Self {
+        Self {
+            spend_usd: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+            requests: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApiMetricCard {
+    #[serde(default)]
+    pub today: ApiMetricWindow,
+    #[serde(default)]
+    pub rolling_30d: ApiMetricWindow,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub provider: String,
@@ -66,6 +97,8 @@ pub struct UsageSnapshot {
     pub status_code: Option<String>,
     #[serde(default)]
     pub status_message: Option<String>,
+    #[serde(default)]
+    pub api_metrics: Option<ApiMetricCard>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,11 +129,9 @@ impl Default for QuietHours {
 pub struct ApiCredentials {
     pub openai_api_key: Option<String>,
     pub anthropic_api_key: Option<String>,
-    pub cursor_api_key: Option<String>,
 
     pub openai_costs_endpoint: Option<String>,
     pub anthropic_costs_endpoint: Option<String>,
-    pub cursor_costs_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +170,12 @@ pub struct AppConfig {
     /// Saved on quit and restored on next launch.
     #[serde(default)]
     pub widget_position: Option<[f64; 2]>,
+    /// User-defined display name for the ChatGPT OAuth subscription connection.
+    #[serde(default)]
+    pub openai_oauth_label: Option<String>,
+    /// User-defined display name for the Claude OAuth subscription connection.
+    #[serde(default)]
+    pub anthropic_oauth_label: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -151,6 +188,8 @@ impl Default for AppConfig {
             provider_accounts: vec![],
             profiles: vec![],
             widget_position: None,
+            openai_oauth_label: None,
+            anthropic_oauth_label: None,
         }
     }
 }
@@ -158,14 +197,12 @@ impl Default for AppConfig {
 #[derive(Clone, Copy)]
 enum HttpMethod {
     Get,
-    Post,
 }
 
 #[derive(Clone, Copy)]
 enum AuthMode {
     Bearer,
     Raw,
-    Basic,
 }
 
 #[derive(Clone)]
@@ -200,25 +237,15 @@ fn builtin_provider_templates() -> Vec<ProviderTemplate> {
             id: "anthropic",
             label: "Anthropic",
             env_prefix: "ANTHROPIC",
-            default_endpoint: Some("https://api.anthropic.com/v1/organizations/usage"),
+            default_endpoint: Some(
+                "https://api.anthropic.com/v1/organizations/usage_report/messages",
+            ),
             method: HttpMethod::Get,
             auth_header: "x-api-key",
             auth_mode: AuthMode::Raw,
             extra_headers: vec![("anthropic-version", "2023-06-01")],
             request_body: None,
             usage_log_env: Some("ANTHROPIC_USAGE_LOG"),
-        },
-        ProviderTemplate {
-            id: "cursor",
-            label: "Cursor",
-            env_prefix: "CURSOR",
-            default_endpoint: Some("https://api.cursor.com/teams/spend"),
-            method: HttpMethod::Post,
-            auth_header: "Authorization",
-            auth_mode: AuthMode::Basic,
-            extra_headers: vec![],
-            request_body: Some(serde_json::json!({})),
-            usage_log_env: Some("CURSOR_USAGE_LOG"),
         },
     ]
 }
@@ -678,12 +705,12 @@ pub fn get_openai_oauth_access_token() -> Option<String> {
 pub fn get_openai_oauth_plan_type() -> Option<String> {
     let session_plan = openai_session().lock().unwrap().plan_type.clone();
     if is_non_empty(&session_plan) {
-        return Some(session_plan);
+        return Some(openai_oauth_plan_label(&session_plan));
     }
 
     let stored = load_stored_openai_secret();
     if is_non_empty(&stored.plan_type) {
-        Some(stored.plan_type)
+        Some(openai_oauth_plan_label(&stored.plan_type))
     } else {
         None
     }
@@ -1043,11 +1070,44 @@ fn try_refresh_anthropic_oauth_token() -> Result<String> {
     Ok(new_access)
 }
 
-fn do_fetch_wham_usage(access_token: &str, account_id: &str) -> Result<UsageSnapshot> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .build()?;
+#[derive(Debug, Clone)]
+struct OpenAiOAuthUsageData {
+    account_id: String,
+    plan_type: String,
+    primary_percent: f64,
+    secondary_percent: f64,
+}
 
+#[derive(Debug, Clone)]
+struct AnthropicOAuthUsageData {
+    subscription_type: String,
+    rate_limit_tier: String,
+    session_used: f64,
+    week_used: f64,
+}
+
+fn openai_oauth_plan_label(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        return "Subscription".to_string();
+    }
+
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        None => "Subscription".to_string(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+fn anthropic_oauth_plan_label(value: Option<String>) -> String {
+    value.unwrap_or_else(|| "Subscription".to_string())
+}
+
+fn fetch_openai_oauth_usage_value(
+    access_token: &str,
+    account_id: &str,
+) -> std::result::Result<Value, ApiFetchError> {
+    let client = client_with_timeout().map_err(ApiFetchError::Transport)?;
     let mut req = client
         .get("https://chatgpt.com/backend-api/wham/usage")
         .bearer_auth(access_token)
@@ -1058,49 +1118,112 @@ fn do_fetch_wham_usage(access_token: &str, account_id: &str) -> Result<UsageSnap
         req = req.header("ChatGPT-Account-Id", account_id);
     }
 
-    let resp = req.send()?;
+    let resp = req
+        .send()
+        .map_err(|error| ApiFetchError::Transport(error.into()))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(anyhow!("HTTP {status}"));
+        let body = resp.text().unwrap_or_default();
+        return Err(ApiFetchError::Http { status, body });
     }
-    let value: Value = resp.json()?;
-    parse_wham_usage_response(&value)
+
+    resp.json()
+        .map_err(|error| ApiFetchError::InvalidResponse(error.into()))
 }
 
-fn do_fetch_anthropic_oauth_usage(access_token: &str) -> Result<UsageSnapshot> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .build()?;
-
+fn fetch_anthropic_oauth_usage_value(
+    access_token: &str,
+) -> std::result::Result<Value, ApiFetchError> {
+    let client = client_with_timeout().map_err(ApiFetchError::Transport)?;
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .bearer_auth(access_token)
         .header("Accept", "application/json")
         .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER)
         .header("User-Agent", "usageguard/0.1")
-        .send()?;
+        .send()
+        .map_err(|error| ApiFetchError::Transport(error.into()))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(anyhow!("HTTP {status}"));
+        let body = resp.text().unwrap_or_default();
+        return Err(ApiFetchError::Http { status, body });
     }
-    let value: Value = resp.json()?;
-    parse_anthropic_oauth_usage_response(&value)
+
+    resp.json()
+        .map_err(|error| ApiFetchError::InvalidResponse(error.into()))
 }
 
-fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
-    let plan_type = value["plan_type"].as_str().unwrap_or("unknown").to_string();
+fn parse_openai_oauth_usage_data(value: &Value) -> Result<OpenAiOAuthUsageData> {
     let account_id = value["account_id"]
         .as_str()
         .or_else(|| value["user_id"].as_str())
         .unwrap_or_default()
         .to_string();
+    let primary_percent = value
+        .pointer("/rate_limit/primary_window/used_percent")
+        .or_else(|| value.pointer("/primary_window/used_percent"))
+        .and_then(|entry| entry.as_f64());
+    let secondary_percent = value
+        .pointer("/rate_limit/secondary_window/used_percent")
+        .or_else(|| value.pointer("/secondary_window/used_percent"))
+        .and_then(|entry| entry.as_f64());
+
+    if primary_percent.is_none() && secondary_percent.is_none() {
+        return Err(anyhow!(
+            "OpenAI oauth usage response missing supported quota window data"
+        ));
+    }
+
+    Ok(OpenAiOAuthUsageData {
+        account_id,
+        plan_type: openai_oauth_plan_label(value["plan_type"].as_str().unwrap_or_default()),
+        primary_percent: primary_percent
+            .or(secondary_percent)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0),
+        secondary_percent: secondary_percent
+            .or(primary_percent)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0),
+    })
+}
+
+fn do_fetch_wham_usage(access_token: &str, account_id: &str) -> Result<UsageSnapshot> {
+    let value = fetch_openai_oauth_usage_value(access_token, account_id).map_err(|error| {
+        let detail = match &error {
+            ApiFetchError::Http { status, .. } => format!("HTTP {status}"),
+            ApiFetchError::Transport(error) | ApiFetchError::InvalidResponse(error) => {
+                error.to_string()
+            }
+        };
+        anyhow!(detail)
+    })?;
+    parse_wham_usage_response(&value)
+}
+
+fn do_fetch_anthropic_oauth_usage(access_token: &str) -> Result<UsageSnapshot> {
+    let value = fetch_anthropic_oauth_usage_value(access_token).map_err(|error| {
+        let detail = match &error {
+            ApiFetchError::Http { status, .. } => format!("HTTP {status}"),
+            ApiFetchError::Transport(error) | ApiFetchError::InvalidResponse(error) => {
+                error.to_string()
+            }
+        };
+        anyhow!(detail)
+    })?;
+    parse_anthropic_oauth_usage_response(&value)
+}
+
+fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
+    let usage = parse_openai_oauth_usage_data(value)?;
+    let plan_type = usage.plan_type.clone();
 
     let mut stored = load_stored_openai_secret();
-    if is_non_empty(&account_id) {
-        stored.account_id = account_id.clone();
+    if is_non_empty(&usage.account_id) {
+        stored.account_id = usage.account_id.clone();
     }
-    if is_non_empty(&plan_type) {
-        stored.plan_type = plan_type.clone();
+    if is_non_empty(&usage.plan_type) {
+        stored.plan_type = usage.plan_type.clone();
     }
     let _ = persist_openai_secret(&stored);
     update_in_memory_oauth_session(
@@ -1114,26 +1237,11 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
     // primary_window  = shorter window (e.g. 5 hours)  → maps to the "5h" ring
     // secondary_window = longer window (e.g. 1 week)   → maps to the "week" ring
     // Try nested path first (/rate_limit/…), then flat path (/primary_window/…)
-    let primary_percent = value
-        .pointer("/rate_limit/primary_window/used_percent")
-        .or_else(|| value.pointer("/primary_window/used_percent"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    let secondary_percent = value
-        .pointer("/rate_limit/secondary_window/used_percent")
-        .or_else(|| value.pointer("/secondary_window/used_percent"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(primary_percent); // fall back to primary if secondary is absent/null
+    let primary_percent = usage.primary_percent;
+    let secondary_percent = usage.secondary_percent;
 
     // Capitalise first letter: "pro" → "Pro"
-    let plan_display: String = {
-        let mut chars = plan_type.chars();
-        match chars.next() {
-            None => String::new(),
-            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        }
-    };
+    let plan_display = plan_type;
 
     // Ring encoding for oauth snapshots (read back in WidgetView fiveHourRatio /
     // weekRatio).  We store both windows as plain 0–100 percentages:
@@ -1150,6 +1258,7 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
         source: "oauth".to_string(),
         status_code: None,
         status_message: None,
+        api_metrics: None,
     })
 }
 
@@ -1176,31 +1285,7 @@ fn anthropic_oauth_bucket_percent(value: &Value, keys: &[&str]) -> Option<f64> {
     })
 }
 
-fn parse_anthropic_oauth_usage_response(value: &Value) -> Result<UsageSnapshot> {
-    let mut stored = load_stored_anthropic_secret();
-    if let Some(subscription_type) = pick_str(
-        value,
-        &[
-            "subscriptionType",
-            "subscription_type",
-            "planType",
-            "plan_type",
-        ],
-    ) {
-        stored.subscription_type = subscription_type.to_string();
-    }
-    if let Some(rate_limit_tier) = pick_str(value, &["rateLimitTier", "rate_limit_tier", "tier"]) {
-        stored.rate_limit_tier = rate_limit_tier.to_string();
-    }
-    let _ = persist_anthropic_secret(&stored);
-    update_in_memory_anthropic_session(
-        None,
-        None,
-        None,
-        is_non_empty(&stored.subscription_type).then_some(stored.subscription_type.clone()),
-        is_non_empty(&stored.rate_limit_tier).then_some(stored.rate_limit_tier.clone()),
-    );
-
+fn parse_anthropic_oauth_usage_data(value: &Value) -> Result<AnthropicOAuthUsageData> {
     let five_hour_percent = anthropic_oauth_bucket_percent(
         value,
         &["five_hour", "fiveHour", "5_hour", "short_term", "shortTerm"],
@@ -1219,24 +1304,79 @@ fn parse_anthropic_oauth_usage_response(value: &Value) -> Result<UsageSnapshot> 
         ],
     );
 
-    let session_used = five_hour_percent.or(seven_day_percent).unwrap_or(0.0);
-    let week_used = seven_day_percent.or(five_hour_percent).unwrap_or(0.0);
-    let account_label = get_anthropic_oauth_plan_type()
-        .map(|plan_type| format!("Claude {plan_type}"))
-        .unwrap_or_else(|| "Claude".to_string());
+    if five_hour_percent.is_none() && seven_day_percent.is_none() {
+        return Err(anyhow!(
+            "Anthropic oauth usage response missing supported utilization buckets"
+        ));
+    }
 
-    Ok(UsageSnapshot {
+    Ok(AnthropicOAuthUsageData {
+        subscription_type: pick_str(
+            value,
+            &[
+                "subscriptionType",
+                "subscription_type",
+                "planType",
+                "plan_type",
+            ],
+        )
+        .unwrap_or_default()
+        .to_string(),
+        rate_limit_tier: pick_str(value, &["rateLimitTier", "rate_limit_tier", "tier"])
+            .unwrap_or_default()
+            .to_string(),
+        session_used: five_hour_percent
+            .or(seven_day_percent)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0),
+        week_used: seven_day_percent
+            .or(five_hour_percent)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0),
+    })
+}
+
+fn anthropic_oauth_snapshot_from_usage(
+    usage: &AnthropicOAuthUsageData,
+    plan_type: Option<String>,
+) -> UsageSnapshot {
+    UsageSnapshot {
         provider: "anthropic".into(),
-        account_label,
-        spent_usd: week_used,
+        account_label: format!("Claude {}", anthropic_oauth_plan_label(plan_type)),
+        spent_usd: usage.week_used,
         limit_usd: 100.0,
-        tokens_in: session_used.round() as u64,
+        tokens_in: usage.session_used.round() as u64,
         tokens_out: 0,
         inactive_hours: 0,
         source: "oauth".to_string(),
         status_code: None,
         status_message: None,
-    })
+        api_metrics: None,
+    }
+}
+
+fn parse_anthropic_oauth_usage_response(value: &Value) -> Result<UsageSnapshot> {
+    let usage = parse_anthropic_oauth_usage_data(value)?;
+    let mut stored = load_stored_anthropic_secret();
+    if is_non_empty(&usage.subscription_type) {
+        stored.subscription_type = usage.subscription_type.clone();
+    }
+    if is_non_empty(&usage.rate_limit_tier) {
+        stored.rate_limit_tier = usage.rate_limit_tier.clone();
+    }
+    let _ = persist_anthropic_secret(&stored);
+    update_in_memory_anthropic_session(
+        None,
+        None,
+        None,
+        is_non_empty(&stored.subscription_type).then_some(stored.subscription_type.clone()),
+        is_non_empty(&stored.rate_limit_tier).then_some(stored.rate_limit_tier.clone()),
+    );
+
+    Ok(anthropic_oauth_snapshot_from_usage(
+        &usage,
+        anthropic_plan_type_from_fields(&stored.subscription_type, &stored.rate_limit_tier),
+    ))
 }
 
 fn resolve_provider_api_key(provider_id: &str, env_var: &str) -> Option<String> {
@@ -1256,6 +1396,7 @@ struct ProviderSpec<'a> {
     extra_headers: Vec<(&'a str, String)>,
     request_body: Option<Value>,
     usage_log_env: Option<&'a str>,
+    allow_env_fallback: bool,
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -1266,7 +1407,6 @@ fn legacy_endpoint(cfg: &ApiCredentials, provider_id: &str) -> Option<String> {
     match provider_id {
         "openai" => cfg.openai_costs_endpoint.clone(),
         "anthropic" => cfg.anthropic_costs_endpoint.clone(),
-        "cursor" => cfg.cursor_costs_endpoint.clone(),
         _ => None,
     }
 }
@@ -1275,7 +1415,6 @@ fn clear_legacy_endpoint(cfg: &mut ApiCredentials, provider_id: &str) {
     match provider_id {
         "openai" => cfg.openai_costs_endpoint = None,
         "anthropic" => cfg.anthropic_costs_endpoint = None,
-        "cursor" => cfg.cursor_costs_endpoint = None,
         _ => {}
     }
 }
@@ -1303,7 +1442,6 @@ fn migrate_secret_payload(cfg: &mut AppConfig) -> Result<bool> {
     for (provider_id, key_slot) in [
         ("openai", &mut cfg.api.openai_api_key),
         ("anthropic", &mut cfg.api.anthropic_api_key),
-        ("cursor", &mut cfg.api.cursor_api_key),
     ] {
         if let Some(value) = key_slot.take().filter(|value| is_non_empty(value)) {
             payload
@@ -1426,6 +1564,41 @@ fn migrate_legacy_provider_accounts(cfg: &mut AppConfig) -> bool {
     migrated
 }
 
+fn reject_legacy_individual_accounts(raw: &Value, path: &std::path::Path) -> Result<()> {
+    let Some(accounts) = raw
+        .get("provider_accounts")
+        .and_then(|value| value.as_array())
+    else {
+        return Ok(());
+    };
+
+    for account in accounts {
+        let access_mode = account
+            .get("access_mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if access_mode != "individual" {
+            continue;
+        }
+
+        let provider = account
+            .get("provider")
+            .and_then(|value| value.as_str())
+            .unwrap_or("provider");
+        let label = account
+            .get("label")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("unnamed account");
+        anyhow::bail!(
+            "Config contains unsupported individual API account '{label}' for {provider}. Remove it from {} and restart UsageGuard.",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 pub fn load_config() -> Result<AppConfig> {
     let path = config_path()?;
     if !path.exists() {
@@ -1433,7 +1606,10 @@ pub fn load_config() -> Result<AppConfig> {
     }
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("Unable to read config file: {}", path.display()))?;
-    let mut cfg = serde_json::from_str::<AppConfig>(&raw)
+    let raw_value = serde_json::from_str::<Value>(&raw)
+        .with_context(|| format!("Invalid config JSON: {}", path.display()))?;
+    reject_legacy_individual_accounts(&raw_value, &path)?;
+    let mut cfg = serde_json::from_value::<AppConfig>(raw_value)
         .with_context(|| format!("Invalid config JSON: {}", path.display()))?;
 
     let mut migrated = false;
@@ -1451,7 +1627,7 @@ pub fn load_config() -> Result<AppConfig> {
         }
     }
 
-    for provider_id in ["openai", "anthropic", "cursor"] {
+    for provider_id in ["openai", "anthropic"] {
         if legacy_endpoint(&cfg.api, provider_id).is_some() {
             clear_legacy_endpoint(&mut cfg.api, provider_id);
             migrated = true;
@@ -1561,7 +1737,6 @@ fn build_legacy_provider_specs() -> Vec<ProviderSpec<'static>> {
             api_key: match template.id {
                 "openai" => resolve_provider_api_key("openai", "OPENAI_API_KEY"),
                 "anthropic" => resolve_provider_api_key("anthropic", "ANTHROPIC_API_KEY"),
-                "cursor" => resolve_provider_api_key("cursor", "CURSOR_API_KEY"),
                 _ => None,
             },
             endpoint: None,
@@ -1576,6 +1751,7 @@ fn build_legacy_provider_specs() -> Vec<ProviderSpec<'static>> {
                 .collect(),
             request_body: template.request_body.clone(),
             usage_log_env: template.usage_log_env,
+            allow_env_fallback: true,
         })
         .collect()
 }
@@ -1600,6 +1776,7 @@ fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec
             .collect(),
         request_body: template.request_body.clone(),
         usage_log_env: None,
+        allow_env_fallback: false,
     })
 }
 
@@ -1607,10 +1784,24 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
     let mut items: Vec<UsageSnapshot> = vec![];
 
     // OAuth subscriptions first (consumer plans before API-key sources)
-    if let Some(s) = fetch_openai_oauth_usage() {
+    if let Some(mut s) = fetch_openai_oauth_usage() {
+        if let Some(label) = cfg
+            .openai_oauth_label
+            .as_deref()
+            .filter(|l| !l.trim().is_empty())
+        {
+            s.account_label = label.to_string();
+        }
         items.push(s);
     }
-    if let Some(s) = fetch_anthropic_oauth_usage() {
+    if let Some(mut s) = fetch_anthropic_oauth_usage() {
+        if let Some(label) = cfg
+            .anthropic_oauth_label
+            .as_deref()
+            .filter(|l| !l.trim().is_empty())
+        {
+            s.account_label = label.to_string();
+        }
         items.push(s);
     }
 
@@ -1632,6 +1823,977 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
     items
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationErrorKind {
+    InvalidCredential,
+    InsufficientAccess,
+    UpstreamUnavailable,
+    InvalidResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationError {
+    kind: VerificationErrorKind,
+    message: String,
+}
+
+impl VerificationError {
+    fn new(kind: VerificationErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> &VerificationErrorKind {
+        &self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for VerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VerificationError {}
+
+#[derive(Debug)]
+enum ApiFetchError {
+    Http {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    Transport(anyhow::Error),
+    InvalidResponse(anyhow::Error),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ApiWindowRollup {
+    today: ApiMetricWindow,
+    rolling_30d: ApiMetricWindow,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiOAuthVerification {
+    pub account_id: String,
+    pub plan_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnthropicOAuthVerification {
+    pub subscription_type: String,
+    pub rate_limit_tier: String,
+    pub plan_type: String,
+}
+
+fn error_is_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .map(|reqwest_error| reqwest_error.is_timeout())
+            .unwrap_or(false)
+    })
+}
+
+fn verification_error_priority(kind: &VerificationErrorKind) -> u8 {
+    match kind {
+        VerificationErrorKind::InsufficientAccess => 0,
+        VerificationErrorKind::InvalidCredential => 1,
+        VerificationErrorKind::InvalidResponse => 2,
+        VerificationErrorKind::UpstreamUnavailable => 3,
+    }
+}
+
+fn preferred_verification_error(
+    left: VerificationError,
+    right: VerificationError,
+) -> VerificationError {
+    if verification_error_priority(left.kind()) <= verification_error_priority(right.kind()) {
+        left
+    } else {
+        right
+    }
+}
+
+fn validation_error_for_http_status(
+    status: reqwest::StatusCode,
+    invalid_message: impl Into<String>,
+    forbidden_message: impl Into<String>,
+    unavailable_message: impl Into<String>,
+) -> VerificationError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        VerificationError::new(VerificationErrorKind::InvalidCredential, invalid_message)
+    } else if status == reqwest::StatusCode::FORBIDDEN {
+        VerificationError::new(VerificationErrorKind::InsufficientAccess, forbidden_message)
+    } else {
+        VerificationError::new(
+            VerificationErrorKind::UpstreamUnavailable,
+            unavailable_message,
+        )
+    }
+}
+
+fn validation_error_from_api_fetch(
+    error: &ApiFetchError,
+    invalid_message: impl Into<String>,
+    forbidden_message: impl Into<String>,
+    unavailable_message: impl Into<String>,
+    invalid_response_message: impl Into<String>,
+) -> VerificationError {
+    let unavailable_message = unavailable_message.into();
+    match error {
+        ApiFetchError::Http { status, .. } => validation_error_for_http_status(
+            *status,
+            invalid_message,
+            forbidden_message,
+            unavailable_message,
+        ),
+        ApiFetchError::Transport(error) => {
+            let kind = if error_is_timeout(error) {
+                VerificationErrorKind::UpstreamUnavailable
+            } else {
+                VerificationErrorKind::UpstreamUnavailable
+            };
+            VerificationError::new(kind, unavailable_message)
+        }
+        ApiFetchError::InvalidResponse(_) => VerificationError::new(
+            VerificationErrorKind::InvalidResponse,
+            invalid_response_message,
+        ),
+    }
+}
+
+fn utc_day_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid midnight")
+        .and_utc()
+}
+
+fn rolling_30d_window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) {
+    let today_start = utc_day_start(now);
+    let rolling_start = today_start - Duration::days(29);
+    let next_day_start = today_start + Duration::days(1);
+    (rolling_start, today_start, next_day_start)
+}
+
+fn apply_rollup_value(
+    rollup: &mut ApiWindowRollup,
+    bucket_start: DateTime<Utc>,
+    today_start: DateTime<Utc>,
+    spend_usd: f64,
+    tokens_in: u64,
+    tokens_out: u64,
+    requests: Option<u64>,
+) {
+    rollup.rolling_30d.spend_usd += spend_usd;
+    rollup.rolling_30d.tokens_in += tokens_in;
+    rollup.rolling_30d.tokens_out += tokens_out;
+    if let Some(count) = requests {
+        let next = rollup.rolling_30d.requests.unwrap_or(0) + count;
+        rollup.rolling_30d.requests = Some(next);
+    }
+
+    if bucket_start >= today_start {
+        rollup.today.spend_usd += spend_usd;
+        rollup.today.tokens_in += tokens_in;
+        rollup.today.tokens_out += tokens_out;
+        if let Some(count) = requests {
+            let next = rollup.today.requests.unwrap_or(0) + count;
+            rollup.today.requests = Some(next);
+        }
+    }
+}
+
+fn client_with_timeout() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(Into::into)
+}
+
+fn fetch_json_value(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    method: HttpMethod,
+    auth: Option<(&str, AuthMode, &str)>,
+    headers: &[(&str, String)],
+    request_body: Option<&Value>,
+    query: &[(&str, String)],
+) -> std::result::Result<Value, ApiFetchError> {
+    let mut req = match method {
+        HttpMethod::Get => client.get(url),
+    };
+    if let Some((header, auth_mode, key)) = auth {
+        req = apply_auth(req, header, auth_mode, key);
+    }
+    if !query.is_empty() {
+        req = req.query(query);
+    }
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
+    if let Some(body) = request_body {
+        req = req.json(body);
+    }
+
+    let res = req
+        .send()
+        .map_err(|error| ApiFetchError::Transport(error.into()))?;
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().unwrap_or_default();
+        return Err(ApiFetchError::Http { status, body });
+    }
+
+    res.json()
+        .map_err(|error| ApiFetchError::InvalidResponse(error.into()))
+}
+
+fn openai_cost_amount_usd(row: &Value) -> Option<f64> {
+    row.get("amount")
+        .and_then(|amount| amount.get("value"))
+        .and_then(|value| value.as_f64())
+        .or_else(|| pick_f64(row, &["cost_usd", "spent_usd", "amount_usd"]))
+}
+
+fn parse_openai_cost_rollup(value: &Value, today_start: DateTime<Utc>) -> Result<ApiWindowRollup> {
+    let buckets = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .context("OpenAI costs response missing data buckets")?;
+    let mut rollup = ApiWindowRollup::default();
+
+    for bucket in buckets {
+        let bucket_start = bucket
+            .get("start_time")
+            .and_then(|entry| entry.as_i64())
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+            .context("OpenAI cost bucket missing start_time")?;
+        let spend_usd = bucket
+            .get("results")
+            .and_then(|results| results.as_array())
+            .map(|results| {
+                results
+                    .iter()
+                    .filter_map(openai_cost_amount_usd)
+                    .sum::<f64>()
+            })
+            .unwrap_or_else(|| openai_cost_amount_usd(bucket).unwrap_or(0.0));
+
+        apply_rollup_value(
+            &mut rollup,
+            bucket_start,
+            today_start,
+            spend_usd,
+            0,
+            0,
+            None,
+        );
+    }
+
+    Ok(rollup)
+}
+
+fn openai_usage_row_requests(row: &Value) -> Option<u64> {
+    pick_u64(
+        row,
+        &[
+            "num_model_requests",
+            "model_requests",
+            "requests",
+            "request_count",
+        ],
+    )
+}
+
+fn parse_openai_usage_rollup(value: &Value, today_start: DateTime<Utc>) -> Result<ApiWindowRollup> {
+    let buckets = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .context("OpenAI usage response missing data buckets")?;
+    let mut rollup = ApiWindowRollup::default();
+
+    for bucket in buckets {
+        let bucket_start = bucket
+            .get("start_time")
+            .and_then(|entry| entry.as_i64())
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+            .context("OpenAI usage bucket missing start_time")?;
+
+        let (tokens_in, tokens_out, requests) = bucket
+            .get("results")
+            .and_then(|results| results.as_array())
+            .map(|results| {
+                results.iter().fold((0_u64, 0_u64, None), |acc, row| {
+                    let tokens_in = acc.0
+                        + pick_u64(row, &["input_tokens", "tokens_in", "total_input_tokens"])
+                            .unwrap_or(0);
+                    let tokens_out = acc.1
+                        + pick_u64(row, &["output_tokens", "tokens_out", "total_output_tokens"])
+                            .unwrap_or(0);
+                    let requests = match (acc.2, openai_usage_row_requests(row)) {
+                        (Some(existing), Some(next)) => Some(existing + next),
+                        (Some(existing), None) => Some(existing),
+                        (None, Some(next)) => Some(next),
+                        (None, None) => None,
+                    };
+                    (tokens_in, tokens_out, requests)
+                })
+            })
+            .unwrap_or((
+                pick_u64(bucket, &["input_tokens", "tokens_in", "total_input_tokens"]).unwrap_or(0),
+                pick_u64(
+                    bucket,
+                    &["output_tokens", "tokens_out", "total_output_tokens"],
+                )
+                .unwrap_or(0),
+                openai_usage_row_requests(bucket),
+            ));
+
+        apply_rollup_value(
+            &mut rollup,
+            bucket_start,
+            today_start,
+            0.0,
+            tokens_in,
+            tokens_out,
+            requests,
+        );
+    }
+
+    Ok(rollup)
+}
+
+fn parse_iso_datetime(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_anthropic_bucket_start(bucket: &Value) -> Option<DateTime<Utc>> {
+    pick_str(bucket, &["starting_at", "start_time"])
+        .and_then(parse_iso_datetime)
+        .or_else(|| {
+            bucket
+                .get("start_time")
+                .and_then(|value| value.as_i64())
+                .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+        })
+}
+
+fn anthropic_amount_minor_to_usd(row: &Value) -> Option<f64> {
+    row.get("amount")
+        .and_then(|amount| amount.as_str())
+        .and_then(|amount| amount.parse::<f64>().ok())
+        .map(|minor| minor / 100.0)
+        .or_else(|| pick_f64(row, &["cost_usd", "amount_usd", "spent_usd"]))
+}
+
+fn parse_anthropic_cost_rollup(
+    value: &Value,
+    today_start: DateTime<Utc>,
+) -> Result<ApiWindowRollup> {
+    let buckets = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .context("Anthropic cost report missing data buckets")?;
+    let mut rollup = ApiWindowRollup::default();
+
+    for bucket in buckets {
+        let bucket_start =
+            parse_anthropic_bucket_start(bucket).context("Anthropic cost bucket missing start")?;
+        let spend_usd = bucket
+            .get("results")
+            .and_then(|results| results.as_array())
+            .map(|results| {
+                results
+                    .iter()
+                    .filter_map(anthropic_amount_minor_to_usd)
+                    .sum::<f64>()
+            })
+            .unwrap_or_else(|| anthropic_amount_minor_to_usd(bucket).unwrap_or(0.0));
+
+        apply_rollup_value(
+            &mut rollup,
+            bucket_start,
+            today_start,
+            spend_usd,
+            0,
+            0,
+            None,
+        );
+    }
+
+    Ok(rollup)
+}
+
+fn anthropic_usage_input_tokens(row: &Value) -> u64 {
+    pick_u64(row, &["input_tokens", "tokens_in", "total_input_tokens"]).unwrap_or(0)
+        + pick_u64(row, &["uncached_input_tokens"]).unwrap_or(0)
+        + pick_u64(row, &["cache_read_input_tokens"]).unwrap_or(0)
+        + row
+            .pointer("/cache_creation_input_tokens/ephemeral_1h_input_tokens")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+        + row
+            .pointer("/cache_creation_input_tokens/ephemeral_5m_input_tokens")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+        + pick_u64(
+            row,
+            &[
+                "cache_creation_input_tokens",
+                "cache_creation_ephemeral_1h_input_tokens",
+                "cache_creation_ephemeral_5m_input_tokens",
+            ],
+        )
+        .unwrap_or(0)
+}
+
+fn parse_anthropic_usage_rollup(
+    value: &Value,
+    today_start: DateTime<Utc>,
+) -> Result<ApiWindowRollup> {
+    let buckets = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .context("Anthropic usage report missing data buckets")?;
+    let mut rollup = ApiWindowRollup::default();
+
+    for bucket in buckets {
+        let bucket_start =
+            parse_anthropic_bucket_start(bucket).context("Anthropic usage bucket missing start")?;
+
+        let (tokens_in, tokens_out) = bucket
+            .get("results")
+            .and_then(|results| results.as_array())
+            .map(|results| {
+                results.iter().fold((0_u64, 0_u64), |acc, row| {
+                    let tokens_in = acc.0 + anthropic_usage_input_tokens(row);
+                    let tokens_out = acc.1
+                        + pick_u64(row, &["output_tokens", "tokens_out", "total_output_tokens"])
+                            .unwrap_or(0);
+                    (tokens_in, tokens_out)
+                })
+            })
+            .unwrap_or((
+                anthropic_usage_input_tokens(bucket),
+                pick_u64(
+                    bucket,
+                    &["output_tokens", "tokens_out", "total_output_tokens"],
+                )
+                .unwrap_or(0),
+            ));
+
+        apply_rollup_value(
+            &mut rollup,
+            bucket_start,
+            today_start,
+            0.0,
+            tokens_in,
+            tokens_out,
+            None,
+        );
+    }
+
+    Ok(rollup)
+}
+
+fn build_api_metric_snapshot(
+    provider: &str,
+    label: &str,
+    source: &str,
+    metrics: ApiMetricCard,
+    inactive_hours: u32,
+    status_code: Option<&str>,
+    status_message: Option<String>,
+) -> UsageSnapshot {
+    UsageSnapshot {
+        provider: provider.to_string(),
+        account_label: label.to_string(),
+        spent_usd: metrics.rolling_30d.spend_usd,
+        limit_usd: 0.0,
+        tokens_in: metrics.rolling_30d.tokens_in,
+        tokens_out: metrics.rolling_30d.tokens_out,
+        inactive_hours,
+        source: source.to_string(),
+        status_code: status_code.map(str::to_string),
+        status_message,
+        api_metrics: Some(metrics),
+    }
+}
+
+fn openai_admin_status_from_error(error: &ApiFetchError) -> (&'static str, String) {
+    match error {
+        ApiFetchError::Http { status, .. } if *status == reqwest::StatusCode::UNAUTHORIZED => (
+            "admin_api_key_required",
+            "OpenAI Admin API key or equivalent org usage permission required.".to_string(),
+        ),
+        ApiFetchError::Http { status, .. } if *status == reqwest::StatusCode::FORBIDDEN => (
+            "admin_api_access_denied",
+            "OpenAI Admin API key lacks organization usage access.".to_string(),
+        ),
+        ApiFetchError::InvalidResponse(_) => (
+            "api_invalid_response",
+            "OpenAI usage endpoint returned unusable data.".to_string(),
+        ),
+        _ => (
+            "api_usage_unavailable",
+            "Unable to load OpenAI API usage right now.".to_string(),
+        ),
+    }
+}
+
+fn anthropic_admin_status_from_error(error: &ApiFetchError) -> (&'static str, String) {
+    match error {
+        ApiFetchError::Http { status, .. } if *status == reqwest::StatusCode::UNAUTHORIZED => (
+            "admin_api_key_required",
+            "Anthropic Admin API key required for organization usage.".to_string(),
+        ),
+        ApiFetchError::Http { status, .. } if *status == reqwest::StatusCode::FORBIDDEN => (
+            "admin_api_access_denied",
+            "Anthropic Admin API key lacks organization usage access.".to_string(),
+        ),
+        ApiFetchError::InvalidResponse(_) => (
+            "api_invalid_response",
+            "Anthropic usage endpoint returned unusable data.".to_string(),
+        ),
+        _ => (
+            "api_usage_unavailable",
+            "Unable to load Anthropic API usage right now.".to_string(),
+        ),
+    }
+}
+
+fn push_partial_status(target: &mut Vec<String>, prefix: &str, error: &ApiFetchError) {
+    let detail = match error {
+        ApiFetchError::Http { status, body } => {
+            if body.trim().is_empty() {
+                format!("HTTP {status}")
+            } else {
+                format!("HTTP {status}")
+            }
+        }
+        ApiFetchError::Transport(error) | ApiFetchError::InvalidResponse(error) => {
+            error.to_string()
+        }
+    };
+    target.push(format!("{prefix}: {detail}"));
+}
+
+fn strict_openai_api_validation_error(error: &ApiFetchError) -> VerificationError {
+    validation_error_from_api_fetch(
+        error,
+        "OpenAI API key is invalid. Nothing was saved.",
+        "OpenAI API key does not have organization usage access. Nothing was saved.",
+        "OpenAI verification could not reach the usage service right now. Nothing was saved.",
+        "OpenAI verification returned unusable usage data. Nothing was saved.",
+    )
+}
+
+fn strict_anthropic_api_validation_error(error: &ApiFetchError) -> VerificationError {
+    validation_error_from_api_fetch(
+        error,
+        "Anthropic API key is invalid. Nothing was saved.",
+        "Anthropic API key does not have organization usage access. Nothing was saved.",
+        "Anthropic verification could not reach the usage service right now. Nothing was saved.",
+        "Anthropic verification returned unusable usage data. Nothing was saved.",
+    )
+}
+
+fn strict_openai_oauth_validation_error(error: &ApiFetchError) -> VerificationError {
+    validation_error_from_api_fetch(
+        error,
+        "ChatGPT sign-in could not be verified. Sign in again. Nothing was saved.",
+        "ChatGPT subscription usage access was denied. Nothing was saved.",
+        "ChatGPT verification could not reach the usage service right now. Nothing was saved.",
+        "ChatGPT verification returned unusable subscription data. Nothing was saved.",
+    )
+}
+
+fn strict_anthropic_oauth_validation_error(error: &ApiFetchError) -> VerificationError {
+    validation_error_from_api_fetch(
+        error,
+        "Claude sign-in could not be verified. Sign in again. Nothing was saved.",
+        "Claude subscription usage access was denied. Nothing was saved.",
+        "Claude verification could not reach the usage service right now. Nothing was saved.",
+        "Claude verification returned unusable subscription data. Nothing was saved.",
+    )
+}
+
+fn verify_openai_organization_api_key(api_key: &str) -> std::result::Result<(), VerificationError> {
+    let client = client_with_timeout().map_err(|error| {
+        VerificationError::new(
+            VerificationErrorKind::UpstreamUnavailable,
+            format!("OpenAI verification could not start: {error}. Nothing was saved."),
+        )
+    })?;
+    let (rolling_start, today_start, _) = rolling_30d_window(Utc::now());
+    let query = vec![
+        ("start_time", rolling_start.timestamp().to_string()),
+        ("bucket_width", "1d".to_string()),
+        ("limit", "30".to_string()),
+    ];
+
+    let cost_result = fetch_json_value(
+        &client,
+        "https://api.openai.com/v1/organization/costs",
+        HttpMethod::Get,
+        Some(("Authorization", AuthMode::Bearer, api_key)),
+        &[],
+        None,
+        &query,
+    )
+    .and_then(|value| {
+        parse_openai_cost_rollup(&value, today_start).map_err(ApiFetchError::InvalidResponse)
+    })
+    .map_err(|error| strict_openai_api_validation_error(&error));
+
+    let usage_result = fetch_json_value(
+        &client,
+        "https://api.openai.com/v1/organization/usage/completions",
+        HttpMethod::Get,
+        Some(("Authorization", AuthMode::Bearer, api_key)),
+        &[],
+        None,
+        &query,
+    )
+    .and_then(|value| {
+        parse_openai_usage_rollup(&value, today_start).map_err(ApiFetchError::InvalidResponse)
+    })
+    .map_err(|error| strict_openai_api_validation_error(&error));
+
+    strict_api_rollups(cost_result, usage_result).map(|_| ())
+}
+
+fn verify_anthropic_organization_api_key(
+    api_key: &str,
+) -> std::result::Result<(), VerificationError> {
+    if !api_key.trim().starts_with("sk-ant-admin") {
+        return Err(VerificationError::new(
+            VerificationErrorKind::InvalidCredential,
+            "Anthropic Admin API key required for organization usage. Nothing was saved.",
+        ));
+    }
+
+    let client = client_with_timeout().map_err(|error| {
+        VerificationError::new(
+            VerificationErrorKind::UpstreamUnavailable,
+            format!("Anthropic verification could not start: {error}. Nothing was saved."),
+        )
+    })?;
+    let (rolling_start, today_start, next_day_start) = rolling_30d_window(Utc::now());
+    let query = vec![
+        ("starting_at", rolling_start.to_rfc3339()),
+        ("ending_at", next_day_start.to_rfc3339()),
+        ("granularity", "1d".to_string()),
+    ];
+    let headers = vec![("anthropic-version", "2023-06-01".to_string())];
+
+    let usage_result = fetch_json_value(
+        &client,
+        "https://api.anthropic.com/v1/organizations/usage_report/messages",
+        HttpMethod::Get,
+        Some(("x-api-key", AuthMode::Raw, api_key)),
+        &headers,
+        None,
+        &query,
+    )
+    .and_then(|value| {
+        parse_anthropic_usage_rollup(&value, today_start).map_err(ApiFetchError::InvalidResponse)
+    })
+    .map_err(|error| strict_anthropic_api_validation_error(&error));
+
+    let cost_result = fetch_json_value(
+        &client,
+        "https://api.anthropic.com/v1/organizations/cost_report",
+        HttpMethod::Get,
+        Some(("x-api-key", AuthMode::Raw, api_key)),
+        &headers,
+        None,
+        &query,
+    )
+    .and_then(|value| {
+        parse_anthropic_cost_rollup(&value, today_start).map_err(ApiFetchError::InvalidResponse)
+    })
+    .map_err(|error| strict_anthropic_api_validation_error(&error));
+
+    strict_api_rollups(cost_result, usage_result).map(|_| ())
+}
+
+fn strict_api_rollups(
+    cost_result: std::result::Result<ApiWindowRollup, VerificationError>,
+    usage_result: std::result::Result<ApiWindowRollup, VerificationError>,
+) -> std::result::Result<(ApiWindowRollup, ApiWindowRollup), VerificationError> {
+    match (cost_result, usage_result) {
+        (Ok(cost), Ok(usage)) => Ok((cost, usage)),
+        (Err(left), Ok(_)) => Err(left),
+        (Ok(_), Err(right)) => Err(right),
+        (Err(left), Err(right)) => Err(preferred_verification_error(left, right)),
+    }
+}
+
+pub fn verify_provider_api_key(
+    provider_id: &str,
+    api_key: &str,
+) -> std::result::Result<(), VerificationError> {
+    match provider_id {
+        "openai" => verify_openai_organization_api_key(api_key),
+        "anthropic" => verify_anthropic_organization_api_key(api_key),
+        _ => Err(VerificationError::new(
+            VerificationErrorKind::InvalidResponse,
+            format!("Unsupported provider '{provider_id}'. Nothing was saved."),
+        )),
+    }
+}
+
+pub fn verify_openai_oauth_access_token(
+    access_token: &str,
+    account_id_hint: &str,
+) -> std::result::Result<OpenAiOAuthVerification, VerificationError> {
+    let value = fetch_openai_oauth_usage_value(access_token, account_id_hint)
+        .map_err(|error| strict_openai_oauth_validation_error(&error))?;
+    let usage = parse_openai_oauth_usage_data(&value).map_err(|_| {
+        VerificationError::new(
+            VerificationErrorKind::InvalidResponse,
+            "ChatGPT verification returned unusable subscription data. Nothing was saved.",
+        )
+    })?;
+
+    Ok(OpenAiOAuthVerification {
+        account_id: usage.account_id,
+        plan_type: usage.plan_type,
+    })
+}
+
+pub fn verify_anthropic_oauth_access_token(
+    access_token: &str,
+    subscription_type_hint: &str,
+    rate_limit_tier_hint: &str,
+) -> std::result::Result<AnthropicOAuthVerification, VerificationError> {
+    let value = fetch_anthropic_oauth_usage_value(access_token)
+        .map_err(|error| strict_anthropic_oauth_validation_error(&error))?;
+    let usage = parse_anthropic_oauth_usage_data(&value).map_err(|_| {
+        VerificationError::new(
+            VerificationErrorKind::InvalidResponse,
+            "Claude verification returned unusable subscription data. Nothing was saved.",
+        )
+    })?;
+
+    let mut subscription_type = usage.subscription_type;
+    let mut rate_limit_tier = usage.rate_limit_tier;
+    if !is_non_empty(&subscription_type) && is_non_empty(subscription_type_hint) {
+        subscription_type = subscription_type_hint.to_string();
+    }
+    if !is_non_empty(&rate_limit_tier) && is_non_empty(rate_limit_tier_hint) {
+        rate_limit_tier = rate_limit_tier_hint.to_string();
+    }
+    if !is_non_empty(&subscription_type) || !is_non_empty(&rate_limit_tier) {
+        if let Some((local_subscription_type, local_rate_limit_tier)) =
+            load_local_claude_oauth_metadata()
+        {
+            if !is_non_empty(&subscription_type) {
+                subscription_type = local_subscription_type;
+            }
+            if !is_non_empty(&rate_limit_tier) {
+                rate_limit_tier = local_rate_limit_tier;
+            }
+        }
+    }
+
+    Ok(AnthropicOAuthVerification {
+        plan_type: anthropic_oauth_plan_label(anthropic_plan_type_from_fields(
+            &subscription_type,
+            &rate_limit_tier,
+        )),
+        subscription_type,
+        rate_limit_tier,
+    })
+}
+
+fn fetch_openai_api_snapshot(label: &str, api_key: &str) -> Result<UsageSnapshot> {
+    let client = client_with_timeout()?;
+    let (rolling_start, today_start, _) = rolling_30d_window(Utc::now());
+    let query = vec![
+        ("start_time", rolling_start.timestamp().to_string()),
+        ("bucket_width", "1d".to_string()),
+        ("limit", "30".to_string()),
+    ];
+
+    let cost_result = fetch_json_value(
+        &client,
+        "https://api.openai.com/v1/organization/costs",
+        HttpMethod::Get,
+        Some(("Authorization", AuthMode::Bearer, api_key)),
+        &[],
+        None,
+        &query,
+    )
+    .and_then(|value| {
+        parse_openai_cost_rollup(&value, today_start).map_err(ApiFetchError::InvalidResponse)
+    });
+
+    let usage_result = fetch_json_value(
+        &client,
+        "https://api.openai.com/v1/organization/usage/completions",
+        HttpMethod::Get,
+        Some(("Authorization", AuthMode::Bearer, api_key)),
+        &[],
+        None,
+        &query,
+    )
+    .and_then(|value| {
+        parse_openai_usage_rollup(&value, today_start).map_err(ApiFetchError::InvalidResponse)
+    });
+
+    match (&cost_result, &usage_result) {
+        (Err(error), Err(_)) => {
+            let (status_code, status_message) = openai_admin_status_from_error(error);
+            return Ok(error_snapshot(
+                "openai",
+                label,
+                "api",
+                Some(status_code),
+                Some(&status_message),
+            ));
+        }
+        _ => {}
+    }
+
+    let mut metrics = ApiMetricCard::default();
+    let mut status_parts = Vec::new();
+
+    match cost_result {
+        Ok(rollup) => {
+            metrics.today.spend_usd = rollup.today.spend_usd;
+            metrics.rolling_30d.spend_usd = rollup.rolling_30d.spend_usd;
+        }
+        Err(error) => push_partial_status(&mut status_parts, "Cost data unavailable", &error),
+    }
+
+    match usage_result {
+        Ok(rollup) => {
+            metrics.today.tokens_in = rollup.today.tokens_in;
+            metrics.today.tokens_out = rollup.today.tokens_out;
+            metrics.today.requests = rollup.today.requests;
+            metrics.rolling_30d.tokens_in = rollup.rolling_30d.tokens_in;
+            metrics.rolling_30d.tokens_out = rollup.rolling_30d.tokens_out;
+            metrics.rolling_30d.requests = rollup.rolling_30d.requests;
+        }
+        Err(error) => {
+            push_partial_status(&mut status_parts, "Completions usage unavailable", &error)
+        }
+    }
+
+    Ok(build_api_metric_snapshot(
+        "openai",
+        label,
+        "api",
+        metrics,
+        0,
+        (!status_parts.is_empty()).then_some("api_partial_data"),
+        (!status_parts.is_empty()).then_some(status_parts.join(" ")),
+    ))
+}
+
+fn fetch_anthropic_api_snapshot(label: &str, api_key: &str) -> Result<UsageSnapshot> {
+    if !api_key.trim().starts_with("sk-ant-admin") {
+        return Ok(error_snapshot(
+            "anthropic",
+            label,
+            "api",
+            Some("admin_api_key_required"),
+            Some("Anthropic Admin API key required for organization usage."),
+        ));
+    }
+
+    let client = client_with_timeout()?;
+    let (rolling_start, today_start, next_day_start) = rolling_30d_window(Utc::now());
+    let query = vec![
+        ("starting_at", rolling_start.to_rfc3339()),
+        ("ending_at", next_day_start.to_rfc3339()),
+        ("granularity", "1d".to_string()),
+    ];
+    let headers = vec![("anthropic-version", "2023-06-01".to_string())];
+
+    let usage_result = fetch_json_value(
+        &client,
+        "https://api.anthropic.com/v1/organizations/usage_report/messages",
+        HttpMethod::Get,
+        Some(("x-api-key", AuthMode::Raw, api_key)),
+        &headers,
+        None,
+        &query,
+    )
+    .and_then(|value| {
+        parse_anthropic_usage_rollup(&value, today_start).map_err(ApiFetchError::InvalidResponse)
+    });
+
+    let cost_result = fetch_json_value(
+        &client,
+        "https://api.anthropic.com/v1/organizations/cost_report",
+        HttpMethod::Get,
+        Some(("x-api-key", AuthMode::Raw, api_key)),
+        &headers,
+        None,
+        &query,
+    )
+    .and_then(|value| {
+        parse_anthropic_cost_rollup(&value, today_start).map_err(ApiFetchError::InvalidResponse)
+    });
+
+    match (&cost_result, &usage_result) {
+        (Err(error), Err(_)) => {
+            let (status_code, status_message) = anthropic_admin_status_from_error(error);
+            return Ok(error_snapshot(
+                "anthropic",
+                label,
+                "api",
+                Some(status_code),
+                Some(&status_message),
+            ));
+        }
+        _ => {}
+    }
+
+    let mut metrics = ApiMetricCard::default();
+    let mut status_parts = Vec::new();
+
+    match cost_result {
+        Ok(rollup) => {
+            metrics.today.spend_usd = rollup.today.spend_usd;
+            metrics.rolling_30d.spend_usd = rollup.rolling_30d.spend_usd;
+        }
+        Err(error) => push_partial_status(&mut status_parts, "Cost report unavailable", &error),
+    }
+
+    match usage_result {
+        Ok(rollup) => {
+            metrics.today.tokens_in = rollup.today.tokens_in;
+            metrics.today.tokens_out = rollup.today.tokens_out;
+            metrics.rolling_30d.tokens_in = rollup.rolling_30d.tokens_in;
+            metrics.rolling_30d.tokens_out = rollup.rolling_30d.tokens_out;
+        }
+        Err(error) => push_partial_status(&mut status_parts, "Messages usage unavailable", &error),
+    }
+
+    Ok(build_api_metric_snapshot(
+        "anthropic",
+        label,
+        "api",
+        metrics,
+        0,
+        (!status_parts.is_empty()).then_some("api_partial_data"),
+        (!status_parts.is_empty()).then_some(status_parts.join(" ")),
+    ))
+}
+
 fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
     if let Some(log_env) = spec.usage_log_env {
         if let Ok(path) = std::env::var(log_env) {
@@ -1641,22 +2803,32 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
         }
     }
 
-    let endpoint = spec
-        .endpoint
-        .or_else(|| spec.default_endpoint.map(|v| v.to_string()));
+    if let Some(key) = spec.api_key {
+        let result = match spec.id {
+            "openai" => fetch_openai_api_snapshot(spec.label, &key),
+            "anthropic" => fetch_anthropic_api_snapshot(spec.label, &key),
+            _ => {
+                let endpoint = spec
+                    .endpoint
+                    .or_else(|| spec.default_endpoint.map(|v| v.to_string()));
+                match endpoint {
+                    Some(url) => snapshot_from_http_json(
+                        &url,
+                        spec.method,
+                        Some((spec.auth_header, spec.auth_mode, key.as_str())),
+                        &spec.extra_headers,
+                        spec.request_body.as_ref(),
+                        spec.id,
+                        spec.label,
+                        "api",
+                    ),
+                    None => Err(anyhow!("No endpoint configured")),
+                }
+            }
+        };
 
-    if let (Some(url), Some(key)) = (endpoint, spec.api_key) {
-        match snapshot_from_http_json(
-            &url,
-            spec.method,
-            Some((spec.auth_header, spec.auth_mode, key.as_str())),
-            &spec.extra_headers,
-            spec.request_body.as_ref(),
-            spec.id,
-            spec.label,
-            "api",
-        ) {
-            Ok(s) => return Some(s),
+        match result {
+            Ok(snapshot) => return Some(snapshot),
             Err(_error) => {
                 return Some(error_snapshot(
                     spec.id,
@@ -1669,7 +2841,17 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
         }
     }
 
-    env_fallback_snapshot(spec.id, spec.label, spec.env_prefix)
+    if spec.allow_env_fallback {
+        env_fallback_snapshot(spec.id, spec.label, spec.env_prefix)
+    } else {
+        Some(error_snapshot(
+            spec.id,
+            spec.label,
+            "api",
+            Some("api_key_missing"),
+            Some("API key missing for configured account."),
+        ))
+    }
 }
 
 fn snapshot_from_http_json(
@@ -1688,7 +2870,6 @@ fn snapshot_from_http_json(
 
     let mut req = match method {
         HttpMethod::Get => client.get(url),
-        HttpMethod::Post => client.post(url),
     };
     if let Some((header, auth_mode, key)) = auth {
         req = apply_auth(req, header, auth_mode, key);
@@ -1714,12 +2895,6 @@ fn snapshot_from_http_json(
             return Ok(s);
         }
     }
-    if provider == "cursor" {
-        if let Ok(s) = parse_cursor_spend_response(&value, label, source) {
-            return Ok(s);
-        }
-    }
-
     snapshot_from_value(&value, provider, label, source)
 }
 
@@ -1733,10 +2908,6 @@ fn apply_auth(
         AuthMode::Bearer if header.eq_ignore_ascii_case("authorization") => req.bearer_auth(key),
         AuthMode::Bearer => req.header(header, format!("Bearer {key}")),
         AuthMode::Raw => req.header(header, key),
-        AuthMode::Basic if header.eq_ignore_ascii_case("authorization") => {
-            req.basic_auth(key, Some(""))
-        }
-        AuthMode::Basic => req.header(header, key),
     }
 }
 
@@ -1775,6 +2946,7 @@ fn parse_openai_costs_response(value: &Value, label: &str, source: &str) -> Resu
         source: source.to_string(),
         status_code: None,
         status_message: None,
+        api_metrics: None,
     })
 }
 
@@ -1821,36 +2993,7 @@ fn parse_anthropic_usage_response(
         source: source.to_string(),
         status_code: None,
         status_message: None,
-    })
-}
-
-fn parse_cursor_spend_response(value: &Value, label: &str, source: &str) -> Result<UsageSnapshot> {
-    let rows = value
-        .get("items")
-        .and_then(|items| items.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let spent_usd = pick_f64(value, &["spent_usd", "cost_usd", "total_cost_usd"])
-        .or_else(|| pick_f64(value, &["total_cents"]).map(|cents| cents / 100.0))
-        .unwrap_or_else(|| {
-            rows.iter()
-                .filter_map(|row| pick_f64(row, &["total_cents", "cents", "cost_cents"]))
-                .map(|cents| cents / 100.0)
-                .sum()
-        });
-
-    Ok(UsageSnapshot {
-        provider: "cursor".into(),
-        account_label: label.to_string(),
-        spent_usd,
-        limit_usd: pick_f64(value, &["limit_usd", "budget_usd"]).unwrap_or(0.0),
-        tokens_in: 0,
-        tokens_out: 0,
-        inactive_hours: derive_inactive_hours(value),
-        source: source.to_string(),
-        status_code: None,
-        status_message: None,
+        api_metrics: None,
     })
 }
 
@@ -1877,6 +3020,11 @@ fn snapshot_from_value(
     label: &str,
     source: &str,
 ) -> Result<UsageSnapshot> {
+    let api_metrics = value
+        .get("api_metrics")
+        .cloned()
+        .and_then(|entry| serde_json::from_value::<ApiMetricCard>(entry).ok());
+
     Ok(UsageSnapshot {
         provider: provider.to_string(),
         account_label: label.to_string(),
@@ -1898,6 +3046,7 @@ fn snapshot_from_value(
         source: source.to_string(),
         status_code: None,
         status_message: None,
+        api_metrics,
     })
 }
 
@@ -1934,6 +3083,7 @@ fn env_fallback_snapshot(provider: &str, label: &str, prefix: &str) -> Option<Us
         source: "env".to_string(),
         status_code: None,
         status_message: None,
+        api_metrics: None,
     })
 }
 
@@ -1955,6 +3105,7 @@ fn error_snapshot(
         source: source.to_string(),
         status_code: status_code.map(str::to_string),
         status_message: status_message.map(str::to_string),
+        api_metrics: None,
     }
 }
 
@@ -1996,6 +3147,7 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
             source: "demo".into(),
             status_code: None,
             status_message: None,
+            api_metrics: None,
         },
         UsageSnapshot {
             provider: "anthropic".into(),
@@ -2008,6 +3160,7 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
             source: "demo".into(),
             status_code: None,
             status_message: None,
+            api_metrics: None,
         },
     ]
 }
@@ -2015,15 +3168,9 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn with_claude_credentials_override(name: &str, body: &str, test: impl FnOnce()) {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = crate::secret_store::test_env_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "usageguard_core_claude_plan_{name}_{}",
             std::process::id()
@@ -2050,6 +3197,30 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    fn with_test_config_dir(name: &str, test: impl FnOnce()) {
+        let _guard = crate::secret_store::test_env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "usageguard_core_validation_{name}_{}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&config_root).unwrap();
+        std::env::set_var("USAGEGUARD_CONFIG_DIR_OVERRIDE", &config_root);
+        clear_in_memory_oauth_session();
+        clear_in_memory_anthropic_session();
+        let _ = SecretStore::clear();
+
+        test();
+
+        clear_in_memory_oauth_session();
+        clear_in_memory_anthropic_session();
+        let _ = SecretStore::clear();
+        std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn near_limit_alert() {
         let cfg = AppConfig::default();
@@ -2064,6 +3235,7 @@ mod tests {
             source: "test".into(),
             status_code: None,
             status_message: None,
+            api_metrics: None,
         };
         let alerts = evaluate_alerts(&s, &cfg);
         assert!(alerts.iter().any(|a| a.code == "near_limit"));
@@ -2085,16 +3257,251 @@ mod tests {
         assert_eq!(snap.tokens_in, 111);
         assert_eq!(snap.tokens_out, 222);
         assert_eq!(snap.inactive_hours, 3);
+        assert!(snap.api_metrics.is_none());
     }
 
     #[test]
-    fn parse_cursor_total_cents() {
+    fn parse_openai_cost_rollup_aggregates_today_and_30d() {
+        let today_start = chrono::NaiveDate::from_ymd_opt(2026, 3, 9)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let yesterday_start = today_start - Duration::days(1);
         let value: Value = serde_json::json!({
-            "total_cents": 1234
+            "data": [
+                {
+                    "start_time": today_start.timestamp(),
+                    "results": [
+                        { "amount": { "value": 1.25 } },
+                        { "amount": { "value": 0.75 } }
+                    ]
+                },
+                {
+                    "start_time": yesterday_start.timestamp(),
+                    "results": [
+                        { "amount": { "value": 2.50 } }
+                    ]
+                }
+            ]
         });
 
-        let snap = parse_cursor_spend_response(&value, "Cursor", "api").unwrap();
-        assert!((snap.spent_usd - 12.34).abs() < f64::EPSILON);
+        let rollup = parse_openai_cost_rollup(&value, today_start).unwrap();
+        assert!((rollup.today.spend_usd - 2.0).abs() < f64::EPSILON);
+        assert!((rollup.rolling_30d.spend_usd - 4.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_openai_usage_rollup_aggregates_tokens_and_requests() {
+        let today_start = chrono::NaiveDate::from_ymd_opt(2026, 3, 9)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let previous_start = today_start - Duration::days(2);
+        let value: Value = serde_json::json!({
+            "data": [
+                {
+                    "start_time": today_start.timestamp(),
+                    "results": [
+                        { "input_tokens": 150, "output_tokens": 60, "num_model_requests": 3 },
+                        { "input_tokens": 50, "output_tokens": 15, "num_model_requests": 1 }
+                    ]
+                },
+                {
+                    "start_time": previous_start.timestamp(),
+                    "results": [
+                        { "input_tokens": 400, "output_tokens": 80, "num_model_requests": 5 }
+                    ]
+                }
+            ]
+        });
+
+        let rollup = parse_openai_usage_rollup(&value, today_start).unwrap();
+        assert_eq!(rollup.today.tokens_in, 200);
+        assert_eq!(rollup.today.tokens_out, 75);
+        assert_eq!(rollup.today.requests, Some(4));
+        assert_eq!(rollup.rolling_30d.tokens_in, 600);
+        assert_eq!(rollup.rolling_30d.tokens_out, 155);
+        assert_eq!(rollup.rolling_30d.requests, Some(9));
+    }
+
+    #[test]
+    fn parse_anthropic_usage_rollup_aggregates_message_tokens() {
+        let today_start = chrono::NaiveDate::from_ymd_opt(2026, 3, 9)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let previous_start = today_start - Duration::days(1);
+        let value: Value = serde_json::json!({
+            "data": [
+                {
+                    "starting_at": today_start.to_rfc3339(),
+                    "results": [
+                        {
+                            "uncached_input_tokens": 100,
+                            "cache_read_input_tokens": 25,
+                            "cache_creation_input_tokens": {
+                                "ephemeral_1h_input_tokens": 10,
+                                "ephemeral_5m_input_tokens": 5
+                            },
+                            "output_tokens": 30
+                        }
+                    ]
+                },
+                {
+                    "starting_at": previous_start.to_rfc3339(),
+                    "results": [
+                        {
+                            "uncached_input_tokens": 70,
+                            "output_tokens": 12
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let rollup = parse_anthropic_usage_rollup(&value, today_start).unwrap();
+        assert_eq!(rollup.today.tokens_in, 140);
+        assert_eq!(rollup.today.tokens_out, 30);
+        assert_eq!(rollup.rolling_30d.tokens_in, 210);
+        assert_eq!(rollup.rolling_30d.tokens_out, 42);
+    }
+
+    #[test]
+    fn parse_anthropic_cost_rollup_converts_minor_units_to_usd() {
+        let today_start = chrono::NaiveDate::from_ymd_opt(2026, 3, 9)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let previous_start = today_start - Duration::days(3);
+        let value: Value = serde_json::json!({
+            "data": [
+                {
+                    "starting_at": today_start.to_rfc3339(),
+                    "results": [
+                        { "amount": "12345" },
+                        { "amount": "55" }
+                    ]
+                },
+                {
+                    "starting_at": previous_start.to_rfc3339(),
+                    "results": [
+                        { "amount": "200" }
+                    ]
+                }
+            ]
+        });
+
+        let rollup = parse_anthropic_cost_rollup(&value, today_start).unwrap();
+        assert!((rollup.today.spend_usd - 124.0).abs() < f64::EPSILON);
+        assert!((rollup.rolling_30d.spend_usd - 126.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn admin_status_mapping_is_provider_specific() {
+        let openai = ApiFetchError::Http {
+            status: reqwest::StatusCode::FORBIDDEN,
+            body: String::new(),
+        };
+        let anthropic = ApiFetchError::Http {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: String::new(),
+        };
+
+        let (openai_code, openai_message) = openai_admin_status_from_error(&openai);
+        let (anthropic_code, anthropic_message) = anthropic_admin_status_from_error(&anthropic);
+
+        assert_eq!(openai_code, "admin_api_access_denied");
+        assert!(openai_message.contains("OpenAI Admin API key"));
+        assert_eq!(anthropic_code, "admin_api_key_required");
+        assert!(anthropic_message.contains("Anthropic Admin API key"));
+    }
+
+    #[test]
+    fn strict_validation_classifies_invalid_credentials() {
+        let error = strict_openai_api_validation_error(&ApiFetchError::Http {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: String::new(),
+        });
+
+        assert_eq!(error.kind(), &VerificationErrorKind::InvalidCredential);
+        assert!(error.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn strict_validation_classifies_upstream_outages() {
+        let error = strict_openai_api_validation_error(&ApiFetchError::Http {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: String::new(),
+        });
+
+        assert_eq!(error.kind(), &VerificationErrorKind::UpstreamUnavailable);
+        assert!(error.to_string().contains("Nothing was saved"));
+    }
+
+    #[test]
+    fn strict_validation_classifies_invalid_provider_data() {
+        let error = strict_anthropic_api_validation_error(&ApiFetchError::InvalidResponse(
+            anyhow!("missing buckets"),
+        ));
+
+        assert_eq!(error.kind(), &VerificationErrorKind::InvalidResponse);
+        assert!(error.to_string().contains("unusable"));
+    }
+
+    #[test]
+    fn strict_rollup_validation_prefers_more_actionable_errors() {
+        let result = strict_api_rollups(
+            Err(strict_openai_api_validation_error(&ApiFetchError::Http {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body: String::new(),
+            })),
+            Err(strict_openai_api_validation_error(&ApiFetchError::Http {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                body: String::new(),
+            })),
+        );
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), &VerificationErrorKind::InvalidCredential);
+    }
+
+    #[test]
+    fn load_config_rejects_legacy_individual_accounts() {
+        with_test_config_dir("legacy_individual_account", || {
+            let path = config_path().unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::json!({
+                    "near_limit_ratio": 0.85,
+                    "inactive_threshold_hours": 24,
+                    "quiet_hours": {
+                        "start_hour": 0,
+                        "end_hour": 8
+                    },
+                    "api": {},
+                    "provider_accounts": [
+                        {
+                            "id": "acct_openai_personal",
+                            "provider": "openai",
+                            "label": "Personal",
+                            "access_mode": "individual"
+                        }
+                    ]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let error = load_config().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("unsupported individual API account"));
+        });
     }
 
     #[test]
@@ -2132,6 +3539,38 @@ mod tests {
         let snap = parse_anthropic_oauth_usage_response(&value).unwrap();
         assert_eq!(snap.tokens_in, 24);
         assert!((snap.spent_usd - 24.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_openai_oauth_usage_data_requires_supported_windows() {
+        let value: Value = serde_json::json!({
+            "plan_type": "plus"
+        });
+
+        let error = parse_openai_oauth_usage_data(&value).unwrap_err();
+        assert!(error.to_string().contains("quota window"));
+    }
+
+    #[test]
+    fn parse_anthropic_oauth_usage_data_requires_supported_buckets() {
+        let value: Value = serde_json::json!({
+            "subscriptionType": "pro"
+        });
+
+        let error = parse_anthropic_oauth_usage_data(&value).unwrap_err();
+        assert!(error.to_string().contains("utilization buckets"));
+    }
+
+    #[test]
+    fn failed_oauth_verification_parse_does_not_persist_secrets() {
+        with_test_config_dir("oauth_parse_failure", || {
+            let value: Value = serde_json::json!({});
+
+            let _ = parse_openai_oauth_usage_data(&value).unwrap_err();
+
+            assert_eq!(SecretStore::load_or_default(), SecretPayload::default());
+            assert!(!has_openai_oauth_session());
+        });
     }
 
     #[test]

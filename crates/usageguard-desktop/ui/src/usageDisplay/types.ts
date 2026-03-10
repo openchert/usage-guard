@@ -1,3 +1,15 @@
+export interface ApiMetricWindow {
+  spend_usd: number;
+  tokens_in: number;
+  tokens_out: number;
+  requests?: number | null;
+}
+
+export interface ApiMetricCard {
+  today: ApiMetricWindow;
+  rolling_30d: ApiMetricWindow;
+}
+
 export interface UsageSnapshot {
   provider: string;
   account_label: string;
@@ -9,6 +21,7 @@ export interface UsageSnapshot {
   source: string;
   status_code?: string | null;
   status_message?: string | null;
+  api_metrics?: ApiMetricCard | null;
 }
 
 export interface UsageRingSpec {
@@ -16,11 +29,28 @@ export interface UsageRingSpec {
   ratio: number;
 }
 
-export interface UsageCardSpec {
+interface UsageCardBase {
   displayLabel: string;
   title: string;
+}
+
+export interface QuotaUsageCardSpec extends UsageCardBase {
+  kind: 'quota';
   rings: UsageRingSpec[];
 }
+
+export interface MetricStatSpec {
+  label: string;
+  value: string;
+  detail?: string;
+}
+
+export interface MetricsUsageCardSpec extends UsageCardBase {
+  kind: 'metrics';
+  stats: MetricStatSpec[];
+}
+
+export type UsageCardSpec = QuotaUsageCardSpec | MetricsUsageCardSpec;
 
 export interface UsageDisplayContext {
   providerLabel: string;

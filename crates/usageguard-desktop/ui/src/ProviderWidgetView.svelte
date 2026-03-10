@@ -125,18 +125,29 @@
     {#each snapshots as snapshot}
       {@const provider = providerMeta(snapshot.provider)}
       {@const card = cardSpec(snapshot)}
-      <div class="provider-card" title={card.title}>
+      <div class="provider-card" class:provider-card-metrics={card.kind === 'metrics'} title={card.title}>
         <span class="card-name">{card.displayLabel}</span>
-        <div class="rings">
-          {#each card.rings as ring}
-            <UsageRing
-              ratio={ring.ratio}
-              accent={provider.color}
-              label={ring.label ?? ''}
-              theme={provider.usageRing}
-            />
-          {/each}
-        </div>
+        {#if card.kind === 'quota'}
+          <div class="rings">
+            {#each card.rings as ring}
+              <UsageRing
+                ratio={ring.ratio}
+                accent={provider.color}
+                label={ring.label ?? ''}
+                theme={provider.usageRing}
+              />
+            {/each}
+          </div>
+        {:else}
+          <div class="metric-grid">
+            {#each card.stats as stat}
+              <div class="metric-tile">
+                <span class="metric-value" style={`--metric-accent:${provider.color}`}>{stat.value}</span>
+                <span class="metric-label">{stat.label}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
       </div>
     {/each}
   {/if}
@@ -202,5 +213,40 @@
     align-items: center;
     gap: 12px;
     flex: 1;
+  }
+
+  .provider-card-metrics {
+    gap: 4px;
+  }
+
+  .metric-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    flex: 1;
+    align-items: center;
+  }
+
+  .metric-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .metric-label {
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(155, 162, 182, 0.7);
+  }
+
+  .metric-value {
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--metric-accent);
   }
 </style>
