@@ -34,11 +34,12 @@ export const openaiOauthDisplayAdapter: UsageDisplayAdapter = {
 
     const primaryReset = formatResetTime(snapshot.primary_reset_at);
     const secondaryReset = formatResetTime(snapshot.secondary_reset_at);
-    const titleLines = [
-      label,
-      `5h used: ${primaryUsed}% | left: ${primaryLeft}%${primaryReset ? ` | resets: ${primaryReset}` : ''}`,
-      `week used: ${secondaryUsed}% | left: ${secondaryLeft}%${secondaryReset ? ` | resets: ${secondaryReset}` : ''}`,
-    ];
+    const titleLines = [label];
+    titleLines.push(`5h used: ${primaryUsed}% | left: ${primaryLeft}%`);
+    if (primaryReset) titleLines.push(`  resets: ${primaryReset}`);
+    titleLines.push('─────────────────────');
+    titleLines.push(`week used: ${secondaryUsed}% | left: ${secondaryLeft}%`);
+    if (secondaryReset) titleLines.push(`  resets: ${secondaryReset}`);
     if (snapshot.status_message) {
       titleLines.push(`Status: ${snapshot.status_message}`);
     }

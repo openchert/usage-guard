@@ -34,11 +34,12 @@ export const anthropicOauthDisplayAdapter: UsageDisplayAdapter = {
 
     const primaryReset = formatResetTime(snapshot.primary_reset_at);
     const secondaryReset = formatResetTime(snapshot.secondary_reset_at);
-    const titleLines = [
-      label,
-      `5H used: ${sessionUsed}% | left: ${sessionLeft}%${primaryReset ? ` | resets: ${primaryReset}` : ''}`,
-      `week used: ${weekUsed}% | left: ${weekLeft}%${secondaryReset ? ` | resets: ${secondaryReset}` : ''}`,
-    ];
+    const titleLines = [label];
+    titleLines.push(`5h used: ${sessionUsed}% | left: ${sessionLeft}%`);
+    if (primaryReset) titleLines.push(`  resets: ${primaryReset}`);
+    titleLines.push('─────────────────────');
+    titleLines.push(`week used: ${weekUsed}% | left: ${weekLeft}%`);
+    if (secondaryReset) titleLines.push(`  resets: ${secondaryReset}`);
     if (snapshot.status_message) {
       titleLines.push(`Status: ${snapshot.status_message}`);
     }
