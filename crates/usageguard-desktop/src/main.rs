@@ -51,9 +51,11 @@ struct AppState {
 
 const TRAY_TOGGLE_ID: &str = "tray.toggle";
 const TRAY_PROVIDERS_ID: &str = "tray.providers";
+const TRAY_START_WITH_WINDOWS_ID: &str = "tray.start_with_windows";
 const TRAY_QUIT_ID: &str = "tray.quit";
 const CTX_REFRESH_ID: &str = "widget.refresh";
 const CTX_PROVIDERS_ID: &str = "widget.providers";
+const CTX_START_WITH_WINDOWS_ID: &str = "widget.start_with_windows";
 const CTX_ALWAYS_ON_TOP_ID: &str = "widget.always_on_top";
 const CTX_LIGHT_MODE_ID: &str = "widget.light_mode";
 const CTX_HIDE_ID: &str = "widget.hide";
@@ -65,6 +67,10 @@ const RELEASE_CHECK_TITLE: &str = "UsageGuard update available";
 const TEST_ALERT_CODE: &str = "manual_test_alert";
 const TEST_ALERT_MESSAGE: &str = "Test alert: notifications and widget badges are working.";
 const TEST_ALERT_DURATION: Duration = Duration::from_secs(10);
+#[cfg(target_os = "windows")]
+const WINDOWS_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(target_os = "windows")]
+const WINDOWS_RUN_VALUE_NAME: &str = "UsageGuard";
 
 #[derive(Debug, Clone, Serialize)]
 struct ProviderAccountView {
@@ -1058,6 +1064,89 @@ fn create_tray_icon() -> tauri::image::Image<'static> {
     tauri::image::Image::new(data, size, size)
 }
 
+#[cfg(target_os = "windows")]
+fn windows_startup_command() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve current executable: {error}"))?;
+    Ok(format!("\"{}\"", exe.display()))
+}
+
+#[cfg(target_os = "windows")]
+fn run_reg_command(args: &[&str]) -> Result<std::process::Output, String> {
+    std::process::Command::new("reg")
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to run reg.exe: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn reg_command_error(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", output.status)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_start_with_windows_enabled() -> bool {
+    run_reg_command(&["query", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE_NAME])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_start_with_windows_enabled() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn set_start_with_windows_enabled(enabled: bool) -> Result<(), String> {
+    if enabled {
+        let startup_command = windows_startup_command()?;
+        let output = run_reg_command(&[
+            "add",
+            WINDOWS_RUN_KEY,
+            "/v",
+            WINDOWS_RUN_VALUE_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+            startup_command.as_str(),
+            "/f",
+        ])?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(reg_command_error(&output))
+        }
+    } else {
+        if !is_start_with_windows_enabled() {
+            return Ok(());
+        }
+
+        let output =
+            run_reg_command(&["delete", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE_NAME, "/f"])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(reg_command_error(&output))
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_start_with_windows_enabled(_enabled: bool) -> Result<(), String> {
+    Ok(())
+}
+
 fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>> {
     let app = window.app_handle();
     let always_on_top = window.is_always_on_top().unwrap_or(true);
@@ -1071,40 +1160,150 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
     let second_sep = PredefinedMenuItem::separator(app)?;
     let third_sep = PredefinedMenuItem::separator(app)?;
 
-    Menu::with_items(
-        app,
-        &[
-            &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
-            &first_sep,
-            &MenuItem::with_id(
-                app,
-                CTX_PROVIDERS_ID,
-                "Manage Providers...",
-                true,
-                None::<&str>,
-            )?,
-            &second_sep,
-            &CheckMenuItem::with_id(
-                app,
-                CTX_ALWAYS_ON_TOP_ID,
-                "Always on Top",
-                true,
-                always_on_top,
-                None::<&str>,
-            )?,
-            &CheckMenuItem::with_id(
-                app,
-                CTX_LIGHT_MODE_ID,
-                "Light Mode",
-                true,
-                light_mode,
-                None::<&str>,
-            )?,
-            &MenuItem::with_id(app, CTX_HIDE_ID, "Hide to Tray", true, None::<&str>)?,
-            &third_sep,
-            &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
-        ],
-    )
+    #[cfg(target_os = "windows")]
+    {
+        let startup_enabled = is_start_with_windows_enabled();
+        let startup_toggle = CheckMenuItem::with_id(
+            app,
+            CTX_START_WITH_WINDOWS_ID,
+            "Start with Windows",
+            true,
+            startup_enabled,
+            None::<&str>,
+        )?;
+
+        Menu::with_items(
+            app,
+            &[
+                &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
+                &first_sep,
+                &MenuItem::with_id(
+                    app,
+                    CTX_PROVIDERS_ID,
+                    "Manage Providers...",
+                    true,
+                    None::<&str>,
+                )?,
+                &second_sep,
+                &startup_toggle,
+                &CheckMenuItem::with_id(
+                    app,
+                    CTX_ALWAYS_ON_TOP_ID,
+                    "Always on Top",
+                    true,
+                    always_on_top,
+                    None::<&str>,
+                )?,
+                &CheckMenuItem::with_id(
+                    app,
+                    CTX_LIGHT_MODE_ID,
+                    "Light Mode",
+                    true,
+                    light_mode,
+                    None::<&str>,
+                )?,
+                &MenuItem::with_id(app, CTX_HIDE_ID, "Hide to Tray", true, None::<&str>)?,
+                &third_sep,
+                &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
+            ],
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Menu::with_items(
+            app,
+            &[
+                &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
+                &first_sep,
+                &MenuItem::with_id(
+                    app,
+                    CTX_PROVIDERS_ID,
+                    "Manage Providers...",
+                    true,
+                    None::<&str>,
+                )?,
+                &second_sep,
+                &CheckMenuItem::with_id(
+                    app,
+                    CTX_ALWAYS_ON_TOP_ID,
+                    "Always on Top",
+                    true,
+                    always_on_top,
+                    None::<&str>,
+                )?,
+                &CheckMenuItem::with_id(
+                    app,
+                    CTX_LIGHT_MODE_ID,
+                    "Light Mode",
+                    true,
+                    light_mode,
+                    None::<&str>,
+                )?,
+                &MenuItem::with_id(app, CTX_HIDE_ID, "Hide to Tray", true, None::<&str>)?,
+                &third_sep,
+                &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
+            ],
+        )
+    }
+}
+
+fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let first_sep = PredefinedMenuItem::separator(app)?;
+    let second_sep = PredefinedMenuItem::separator(app)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let third_sep = PredefinedMenuItem::separator(app)?;
+        let startup_enabled = is_start_with_windows_enabled();
+        let startup_toggle = CheckMenuItem::with_id(
+            app,
+            TRAY_START_WITH_WINDOWS_ID,
+            "Start with Windows",
+            true,
+            startup_enabled,
+            None::<&str>,
+        )?;
+
+        Menu::with_items(
+            app,
+            &[
+                &MenuItem::with_id(app, TRAY_TOGGLE_ID, "Show / Hide", true, None::<&str>)?,
+                &first_sep,
+                &MenuItem::with_id(
+                    app,
+                    TRAY_PROVIDERS_ID,
+                    "Manage Providers...",
+                    true,
+                    None::<&str>,
+                )?,
+                &second_sep,
+                &startup_toggle,
+                &third_sep,
+                &MenuItem::with_id(app, TRAY_QUIT_ID, "Quit UsageGuard", true, None::<&str>)?,
+            ],
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Menu::with_items(
+            app,
+            &[
+                &MenuItem::with_id(app, TRAY_TOGGLE_ID, "Show / Hide", true, None::<&str>)?,
+                &first_sep,
+                &MenuItem::with_id(
+                    app,
+                    TRAY_PROVIDERS_ID,
+                    "Manage Providers...",
+                    true,
+                    None::<&str>,
+                )?,
+                &second_sep,
+                &MenuItem::with_id(app, TRAY_QUIT_ID, "Quit UsageGuard", true, None::<&str>)?,
+            ],
+        )
+    }
 }
 
 fn toggle_window(app: &AppHandle) {
@@ -1122,6 +1321,13 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         TRAY_TOGGLE_ID => toggle_window(app),
         TRAY_PROVIDERS_ID | CTX_PROVIDERS_ID => spawn_open_provider_settings(app.clone()),
+        TRAY_START_WITH_WINDOWS_ID | CTX_START_WITH_WINDOWS_ID => {
+            let enabled = !is_start_with_windows_enabled();
+            if let Err(error) = set_start_with_windows_enabled(enabled) {
+                eprintln!("failed to update Start with Windows: {error}");
+                emit_native_notification("UsageGuard", "Could not update Start with Windows.");
+            }
+        }
         TRAY_QUIT_ID | CTX_QUIT_ID => save_position_and_exit(app),
         CTX_REFRESH_ID => {
             spawn_snapshot_refresh(app.clone());
@@ -2226,24 +2432,7 @@ fn main() {
 
             app.on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()));
 
-            let sep = PredefinedMenuItem::separator(app)?;
-            let providers_sep = PredefinedMenuItem::separator(app)?;
-            let menu = Menu::with_items(
-                app,
-                &[
-                    &MenuItem::with_id(app, TRAY_TOGGLE_ID, "Show / Hide", true, None::<&str>)?,
-                    &sep,
-                    &MenuItem::with_id(
-                        app,
-                        TRAY_PROVIDERS_ID,
-                        "Manage Providers...",
-                        true,
-                        None::<&str>,
-                    )?,
-                    &providers_sep,
-                    &MenuItem::with_id(app, TRAY_QUIT_ID, "Quit UsageGuard", true, None::<&str>)?,
-                ],
-            )?;
+            let menu = create_tray_menu(&app.handle())?;
 
             TrayIconBuilder::new()
                 .icon(create_tray_icon())
@@ -2261,6 +2450,10 @@ fn main() {
                     }
                 })
                 .build(app)?;
+
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+            }
 
             spawn_snapshot_refresh(app.handle().clone());
             spawn_release_check(app.handle().clone());

@@ -4,6 +4,14 @@ $Repo = 'openchert/usage-guard'
 $ApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
 $DefaultInstallRoot = Join-Path $env:LOCALAPPDATA 'Programs\usageguard'
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { Join-Path $DefaultInstallRoot 'bin' }
+$DesktopExePath = Join-Path $InstallDir 'usageguard-desktop.exe'
+$CliExePath = Join-Path $InstallDir 'usageguard.exe'
+$StartMenuShortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\UsageGuard.lnk'
+$RunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$RunValueName = 'UsageGuard'
+$WasAlreadyInstalled = Test-Path $DesktopExePath
+$ExistingAutostartValue = (Get-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue).$RunValueName
+$HadAutostart = -not [string]::IsNullOrWhiteSpace($ExistingAutostartValue)
 
 $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
 if ($arch -ne 'x64') {
@@ -33,8 +41,8 @@ try {
   Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
 
   New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-  Copy-Item (Join-Path $tmp 'usageguard.exe') (Join-Path $InstallDir 'usageguard.exe') -Force
-  Copy-Item (Join-Path $tmp 'usageguard-desktop.exe') (Join-Path $InstallDir 'usageguard-desktop.exe') -Force
+  Copy-Item (Join-Path $tmp 'usageguard.exe') $CliExePath -Force
+  Copy-Item (Join-Path $tmp 'usageguard-desktop.exe') $DesktopExePath -Force
 
   Write-Host "Installed to $InstallDir"
 
@@ -44,6 +52,54 @@ try {
     $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $InstallDir } else { "$userPath;$InstallDir" }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     Write-Host "Added $InstallDir to user PATH. Restart terminal to use commands globally."
+  }
+
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($StartMenuShortcutPath)
+    $shortcut.TargetPath = $DesktopExePath
+    $shortcut.WorkingDirectory = $InstallDir
+    $shortcut.IconLocation = $DesktopExePath
+    $shortcut.Description = 'UsageGuard desktop widget'
+    $shortcut.Save()
+    Write-Host 'Added a Start Menu shortcut so UsageGuard appears in Windows Search.'
+  }
+  catch {
+    Write-Warning "Could not create the Start Menu shortcut: $($_.Exception.Message)"
+  }
+
+  try {
+    $startupCommand = '"' + $DesktopExePath + '"'
+    if ($HadAutostart -or -not $WasAlreadyInstalled) {
+      New-Item -Path $RunKeyPath -Force | Out-Null
+      New-ItemProperty -Path $RunKeyPath -Name $RunValueName -PropertyType String -Value $startupCommand -Force | Out-Null
+      if ($HadAutostart) {
+        Write-Host 'Updated the existing Start with Windows entry.'
+      }
+      else {
+        Write-Host 'Enabled Start with Windows for this user. You can turn it off later from the app menu.'
+      }
+    }
+    else {
+      Write-Host 'Start with Windows remains disabled on this existing install.'
+    }
+  }
+  catch {
+    Write-Warning "Could not update the Start with Windows setting: $($_.Exception.Message)"
+  }
+
+  try {
+    $running = Get-Process -Name 'usageguard-desktop' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $running) {
+      Start-Process -FilePath $DesktopExePath -WorkingDirectory $InstallDir | Out-Null
+      Write-Host 'Launched UsageGuard.'
+    }
+    else {
+      Write-Host 'UsageGuard is already running; skipped auto-launch.'
+    }
+  }
+  catch {
+    Write-Warning "Could not launch UsageGuard automatically: $($_.Exception.Message)"
   }
 
   Write-Host ''

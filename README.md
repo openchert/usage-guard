@@ -12,12 +12,12 @@ UsageGuard keeps provider usage visible in a small desktop widget instead of bur
 - Shows compact cards with hover details for usage, spend, tokens, requests, reset times, and status
 - Sends native desktop notifications and shows in-widget alert badges for quota, budget, and inactivity issues
 - Supports browser sign-in for ChatGPT and Claude, plus multiple OpenAI and Anthropic monitoring accounts
-- Includes widget controls for `Light Mode`, `Always on Top`, `Hide to Tray`, `Refresh`, and tray show/hide
+- Includes widget and tray controls for `Light Mode`, `Always on Top`, `Start with Windows`, `Hide to Tray`, `Refresh`, and show/hide
 - Stores API keys and refresh tokens securely on Windows and includes an optional CLI
 
 ## Install
 ### Windows
-The installer downloads the latest Windows release from GitHub, extracts the binaries, and adds them to your user `PATH`.
+The installer downloads the latest Windows release from GitHub, extracts the binaries, adds them to your user `PATH`, creates a Start Menu shortcut so UsageGuard appears in Windows Search, enables `Start with Windows` on first install, and launches the widget.
 
 Windows PowerShell:
 
@@ -27,9 +27,15 @@ irm https://raw.githubusercontent.com/openchert/usage-guard/main/install.ps1 | i
 
 Windows CMD:
 
-```powershell
-curl -L https://raw.githubusercontent.com/openchert/usage-guard/main/install.ps1 -o install-usageguard.ps1
-powershell -ExecutionPolicy Bypass -File .\install-usageguard.ps1
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm 'https://raw.githubusercontent.com/openchert/usage-guard/main/install.ps1' | iex"
+```
+
+If you prefer `curl.exe`, download the script first and then run it:
+
+```cmd
+curl.exe -L https://raw.githubusercontent.com/openchert/usage-guard/main/install.ps1 -o "%TEMP%\install-usageguard.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\install-usageguard.ps1"
 ```
 
 Manual install:
@@ -37,6 +43,8 @@ Manual install:
 1. Download `usage-guard-windows-x64.zip` from GitHub Releases.
 2. Extract the archive.
 3. Run `usageguard-desktop.exe` for the widget or `usageguard.exe` for the CLI.
+
+Manual ZIP installs do not add the Windows Search shortcut or the `Start with Windows` entry automatically.
 
 ## Supported Connections
 - ChatGPT subscription usage through browser sign-in
@@ -72,6 +80,7 @@ usageguard demo
 
 ## Updates
 - On Windows, update by running the same install command or script again. It always pulls the latest GitHub release and replaces the installed binaries.
+- Re-running the installer refreshes the Start Menu shortcut and preserves an existing disabled `Start with Windows` setting.
 - The desktop app now checks GitHub Releases in the background on startup and shows a native notification when a newer version is available.
 
 ## Security
@@ -85,6 +94,7 @@ See [`docs/PROVIDERS.md`](docs/PROVIDERS.md) for the provider/source display mod
 
 ## Troubleshooting
 - If the install command succeeds but `usageguard` is not found, restart the terminal so `PATH` is reloaded.
+- If you use `curl.exe`, remember it only downloads `install.ps1`; you still need to run the second `powershell -File ...` command, or use the one-line CMD install command above.
 - If `irm` is unavailable, use `Invoke-RestMethod`, `Invoke-WebRequest`, `curl.exe`, or the manual ZIP install above.
 - If ChatGPT OAuth sign-in fails, make sure nothing else is using `localhost:1455`.
 - If Claude OAuth sign-in fails, make sure nothing else is using `localhost:45454`.
