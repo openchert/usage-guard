@@ -23,6 +23,7 @@ $assetName = 'usage-guard-windows-x64.zip'
 Write-Host 'Installing prebuilt UsageGuard binaries for Windows x64. Rust is not required.'
 Write-Host 'Fetching latest release metadata...'
 $release = Invoke-RestMethod -Uri $ApiUrl
+$InstalledVersion = if ([string]::IsNullOrWhiteSpace($release.tag_name)) { 'unknown-version' } else { $release.tag_name }
 $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
 
 if (-not $asset) {
@@ -44,7 +45,7 @@ try {
   Copy-Item (Join-Path $tmp 'usageguard.exe') $CliExePath -Force
   Copy-Item (Join-Path $tmp 'usageguard-desktop.exe') $DesktopExePath -Force
 
-  Write-Host "Installed to $InstallDir"
+  Write-Host "Installed UsageGuard $InstalledVersion to $InstallDir"
 
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   $pathEntries = if ([string]::IsNullOrWhiteSpace($userPath)) { @() } else { $userPath.Split(';') }
@@ -103,6 +104,7 @@ try {
   }
 
   Write-Host ''
+  Write-Host "Installed version: $InstalledVersion"
   Write-Host 'Try:'
   Write-Host '  usageguard demo'
   Write-Host '  usageguard-desktop'

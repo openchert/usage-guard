@@ -47,6 +47,10 @@ struct AppState {
     snapshots: Mutex<Vec<SnapshotView>>,
     manual_alerts: Mutex<HashMap<String, ManualAlert>>,
     refresh: Mutex<RefreshState>,
+    #[cfg(target_os = "windows")]
+    start_with_windows_enabled: Mutex<bool>,
+    #[cfg(target_os = "windows")]
+    tray_start_with_windows_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
 }
 
 const TRAY_TOGGLE_ID: &str = "tray.toggle";
@@ -1107,6 +1111,40 @@ fn is_start_with_windows_enabled() -> bool {
 }
 
 #[cfg(target_os = "windows")]
+fn cached_start_with_windows_enabled(app: &AppHandle) -> bool {
+    *app.state::<AppState>()
+        .start_with_windows_enabled
+        .lock()
+        .expect("AppState start_with_windows_enabled lock poisoned")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cached_start_with_windows_enabled(_app: &AppHandle) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn set_cached_start_with_windows_enabled(app: &AppHandle, enabled: bool) {
+    *app.state::<AppState>()
+        .start_with_windows_enabled
+        .lock()
+        .expect("AppState start_with_windows_enabled lock poisoned") = enabled;
+
+    if let Some(item) = app
+        .state::<AppState>()
+        .tray_start_with_windows_item
+        .lock()
+        .expect("AppState tray_start_with_windows_item lock poisoned")
+        .as_ref()
+    {
+        let _ = item.set_checked(enabled);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_cached_start_with_windows_enabled(_app: &AppHandle, _enabled: bool) {}
+
+#[cfg(target_os = "windows")]
 fn set_start_with_windows_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
         let startup_command = windows_startup_command()?;
@@ -1162,7 +1200,7 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
 
     #[cfg(target_os = "windows")]
     {
-        let startup_enabled = is_start_with_windows_enabled();
+        let startup_enabled = cached_start_with_windows_enabled(&app);
         let startup_toggle = CheckMenuItem::with_id(
             app,
             CTX_START_WITH_WINDOWS_ID,
@@ -1255,7 +1293,7 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     #[cfg(target_os = "windows")]
     {
         let third_sep = PredefinedMenuItem::separator(app)?;
-        let startup_enabled = is_start_with_windows_enabled();
+        let startup_enabled = cached_start_with_windows_enabled(app);
         let startup_toggle = CheckMenuItem::with_id(
             app,
             TRAY_START_WITH_WINDOWS_ID,
@@ -1264,6 +1302,11 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             startup_enabled,
             None::<&str>,
         )?;
+        *app.state::<AppState>()
+            .tray_start_with_windows_item
+            .lock()
+            .expect("AppState tray_start_with_windows_item lock poisoned") =
+            Some(startup_toggle.clone());
 
         Menu::with_items(
             app,
@@ -1322,10 +1365,12 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         TRAY_TOGGLE_ID => toggle_window(app),
         TRAY_PROVIDERS_ID | CTX_PROVIDERS_ID => spawn_open_provider_settings(app.clone()),
         TRAY_START_WITH_WINDOWS_ID | CTX_START_WITH_WINDOWS_ID => {
-            let enabled = !is_start_with_windows_enabled();
+            let enabled = !cached_start_with_windows_enabled(app);
             if let Err(error) = set_start_with_windows_enabled(enabled) {
                 eprintln!("failed to update Start with Windows: {error}");
                 emit_native_notification("UsageGuard", "Could not update Start with Windows.");
+            } else {
+                set_cached_start_with_windows_enabled(app, enabled);
             }
         }
         TRAY_QUIT_ID | CTX_QUIT_ID => save_position_and_exit(app),
@@ -2368,12 +2413,18 @@ fn main() {
         .setup(|app| {
             let cfg = load_config().map_err(|error| std::io::Error::other(error.to_string()))?;
             let saved_position = cfg.widget_position;
+            #[cfg(target_os = "windows")]
+            let startup_enabled = is_start_with_windows_enabled();
             app.manage(AppState {
                 cfg: Mutex::new(cfg),
                 notified_alerts: Mutex::new(HashSet::new()),
                 snapshots: Mutex::new(Vec::new()),
                 manual_alerts: Mutex::new(HashMap::new()),
                 refresh: Mutex::new(RefreshState::default()),
+                #[cfg(target_os = "windows")]
+                start_with_windows_enabled: Mutex::new(startup_enabled),
+                #[cfg(target_os = "windows")]
+                tray_start_with_windows_item: Mutex::new(None),
             });
 
             // Restore last widget position, or default to bottom-right of the work area.
