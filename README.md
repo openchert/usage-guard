@@ -92,6 +92,9 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) for storage, OAuth, and threat-model 
 See [`docs/ALERTS.md`](docs/ALERTS.md) for alert thresholds, native notifications, and widget badges.
 See [`docs/PROVIDERS.md`](docs/PROVIDERS.md) for the provider/source display model.
 
+## License
+MIT. See [`LICENSE`](LICENSE).
+
 ## Troubleshooting
 - If the install command succeeds but `usageguard` is not found, restart the terminal so `PATH` is reloaded.
 - If you use `curl.exe`, remember it only downloads `install.ps1`; you still need to run the second `powershell -File ...` command, or use the one-line CMD install command above.
