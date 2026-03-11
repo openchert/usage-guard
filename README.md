@@ -4,7 +4,6 @@
 
 <h1 align="center">UsageGuard</h1>
 <p align="center">A local-first Windows widget and CLI for tracking AI spend, quotas, and subscription usage without dashboard noise.</p>
-<p align="center"><strong>Windows x64 release | Linux/macOS source-only for now | No Rust required on Windows</strong></p>
 
 UsageGuard keeps provider usage visible in a small desktop widget instead of burying it across multiple dashboards. It runs locally on Windows and stores your credentials securely on your machine.
 

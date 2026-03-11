@@ -2,6 +2,7 @@
 /target_*/
 /target_codex*/
 **/target_codex*/
+/.codex-target*/
 .DS_Store
 /dist
 /crates/usageguard-desktop/gen/
