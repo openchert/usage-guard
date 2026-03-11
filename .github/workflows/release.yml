@@ -30,6 +30,9 @@ jobs:
       - name: Install desktop UI dependencies
         run: npm ci --prefix crates/usageguard-desktop/ui
 
+      - name: Build desktop UI
+        run: npm run build --prefix crates/usageguard-desktop/ui
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
