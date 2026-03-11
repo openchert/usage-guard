@@ -2451,10 +2451,6 @@ fn main() {
                 })
                 .build(app)?;
 
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-            }
-
             spawn_snapshot_refresh(app.handle().clone());
             spawn_release_check(app.handle().clone());
 

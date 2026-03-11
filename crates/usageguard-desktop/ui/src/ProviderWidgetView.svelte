@@ -12,11 +12,23 @@
   const DEFAULT_REFRESH_INTERVAL_MS = 60_000;
   const REFRESH_EVENT = 'usageguard://refresh';
 
+  interface OAuthStatus {
+    connected: boolean;
+  }
+
+  interface WidgetConfig {
+    light_mode: boolean;
+    provider_accounts?: Array<unknown>;
+  }
+
   let snapshots = [] as UsageSnapshot[];
   let isLoading = false;
+  let bootstrapComplete = false;
+  let hasConfiguredSources = false;
   let initialShown = false;
   let refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS;
   let refreshTimer: number | null = null;
+  let startupRevealTimer: number | null = null;
   let lastRenderedCardCount: number | null = null;
   let unlistenRefresh: (() => void) | null = null;
 
@@ -100,10 +112,29 @@
   async function applyTheme(): Promise<void> {
     if (!invoke) return;
     try {
-      const cfg = await invoke('get_config') as { light_mode: boolean };
+      const cfg = await invoke('get_config') as WidgetConfig;
       document.documentElement.classList.toggle('light-mode', cfg.light_mode);
     } catch (error) {
       console.error('get_config (theme) failed:', error);
+    }
+  }
+
+  async function loadConfiguredSources(): Promise<void> {
+    if (!invoke) return;
+
+    try {
+      const [cfg, openaiStatus, anthropicStatus] = await Promise.all([
+        invoke('get_config') as Promise<WidgetConfig>,
+        invoke('get_openai_oauth_status') as Promise<OAuthStatus>,
+        invoke('get_anthropic_oauth_status') as Promise<OAuthStatus>,
+      ]);
+      hasConfiguredSources =
+        (cfg.provider_accounts?.length ?? 0) > 0
+        || openaiStatus.connected
+        || anthropicStatus.connected;
+    } catch (error) {
+      console.error('widget startup state check failed:', error);
+      hasConfiguredSources = false;
     }
   }
 
@@ -133,6 +164,14 @@
     } catch (error) {
       console.error('show window failed:', error);
     }
+  }
+
+  async function revealWhenReady(): Promise<void> {
+    if (bootstrapComplete) return;
+    if (hasConfiguredSources && snapshots.length === 0) return;
+
+    bootstrapComplete = true;
+    await showWindowOnce();
   }
 
   async function requestRefresh(): Promise<void> {
@@ -178,18 +217,29 @@
         await applyTheme();
         await loadRefreshInterval();
         await loadSnapshots();
-        await showWindowOnce();
+        await revealWhenReady();
       });
     }
 
     await applyTheme();
     await loadRefreshInterval();
-    await loadSnapshots();
+    await loadConfiguredSources();
+
+    if (!hasConfiguredSources) {
+      await loadSnapshots();
+      await revealWhenReady();
+    }
+
     resetRefreshTimer();
     void requestRefresh();
 
-    // Fallback: show the window after 5 seconds even if no refresh event fires.
-    window.setTimeout(() => void showWindowOnce(), 5000);
+    // Fallback: keep the widget hidden until startup state is known.
+    startupRevealTimer = window.setTimeout(() => {
+      void (async () => {
+        await loadSnapshots();
+        await revealWhenReady();
+      })();
+    }, 8000);
   });
 
   onDestroy(() => {
@@ -197,11 +247,12 @@
     document.removeEventListener('selectstart', onSelectStart);
     unlistenRefresh?.();
     if (refreshTimer !== null) window.clearInterval(refreshTimer);
+    if (startupRevealTimer !== null) window.clearTimeout(startupRevealTimer);
   });
 </script>
 
 <div class="widget-shell" on:mousedown={startDrag} role="presentation">
-  {#if snapshots.length === 0 && !isLoading}
+  {#if bootstrapComplete && snapshots.length === 0 && !isLoading && !hasConfiguredSources}
     <div class="empty-state">
       <span class="empty-copy">Right-click to connect a provider</span>
     </div>
