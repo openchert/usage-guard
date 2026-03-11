@@ -4,8 +4,10 @@ mod icon_art;
 
 use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -33,10 +35,17 @@ struct SnapshotView {
     alerts: Vec<Alert>,
 }
 
+#[derive(Debug, Clone)]
+struct ManualAlert {
+    alert: Alert,
+    expires_at: Instant,
+}
+
 struct AppState {
     cfg: Mutex<AppConfig>,
     notified_alerts: Mutex<HashSet<String>>,
     snapshots: Mutex<Vec<SnapshotView>>,
+    manual_alerts: Mutex<HashMap<String, ManualAlert>>,
     refresh: Mutex<RefreshState>,
 }
 
@@ -51,6 +60,11 @@ const CTX_HIDE_ID: &str = "widget.hide";
 const CTX_QUIT_ID: &str = "widget.quit";
 const REFRESH_EVENT: &str = "usageguard://refresh";
 const SETTINGS_LABEL: &str = "settings";
+const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/openchert/usage-guard/releases/latest";
+const RELEASE_CHECK_TITLE: &str = "UsageGuard update available";
+const TEST_ALERT_CODE: &str = "manual_test_alert";
+const TEST_ALERT_MESSAGE: &str = "Test alert: notifications and widget badges are working.";
+const TEST_ALERT_DURATION: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize)]
 struct ProviderAccountView {
@@ -74,6 +88,13 @@ struct ProviderAccountInput {
     provider: String,
     label: String,
     api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TestAlertInput {
+    provider: String,
+    account_label: String,
 }
 
 #[tauri::command]
@@ -336,6 +357,122 @@ fn emit_widget_refresh(app: &AppHandle) {
     }
 }
 
+fn snapshot_key(snapshot: &UsageSnapshot) -> String {
+    format!("{}::{}", snapshot.provider, snapshot.account_label)
+}
+
+fn prune_manual_alerts(manual_alerts: &mut HashMap<String, ManualAlert>) {
+    let now = Instant::now();
+    manual_alerts.retain(|_, manual_alert| manual_alert.expires_at > now);
+}
+
+fn active_manual_alerts(state: &AppState) -> HashMap<String, ManualAlert> {
+    let mut manual_alerts = state
+        .manual_alerts
+        .lock()
+        .expect("AppState manual_alerts lock poisoned");
+    prune_manual_alerts(&mut manual_alerts);
+    manual_alerts.clone()
+}
+
+fn apply_manual_alerts(
+    snapshot_views: &mut [SnapshotView],
+    manual_alerts: &HashMap<String, ManualAlert>,
+) {
+    for snapshot_view in snapshot_views.iter_mut() {
+        if let Some(manual_alert) = manual_alerts.get(&snapshot_key(&snapshot_view.snapshot)) {
+            snapshot_view
+                .alerts
+                .retain(|alert| alert.code != manual_alert.alert.code);
+            snapshot_view.alerts.push(manual_alert.alert.clone());
+        }
+    }
+}
+
+fn refresh_notified_alert_signatures(state: &AppState) {
+    let active_signatures = state
+        .snapshots
+        .lock()
+        .expect("AppState snapshots lock poisoned")
+        .iter()
+        .flat_map(|view| {
+            view.alerts
+                .iter()
+                .map(|alert| alert_signature(&view.snapshot, alert))
+        })
+        .collect::<HashSet<_>>();
+
+    state
+        .notified_alerts
+        .lock()
+        .expect("AppState notified_alerts lock poisoned")
+        .retain(|signature| active_signatures.contains(signature));
+}
+
+fn find_snapshot_for_test_alert(state: &AppState, target: &TestAlertInput) -> Option<UsageSnapshot> {
+    state
+        .snapshots
+        .lock()
+        .expect("AppState snapshots lock poisoned")
+        .iter()
+        .find(|view| {
+            view.snapshot.provider == target.provider
+                && view.snapshot.account_label == target.account_label
+        })
+        .map(|view| view.snapshot.clone())
+}
+
+fn spawn_manual_alert_expiry(app: AppHandle, target_key: String, expires_at: Instant) {
+    std::thread::spawn(move || {
+        if let Some(delay) = expires_at.checked_duration_since(Instant::now()) {
+            std::thread::sleep(delay);
+        }
+
+        let state = app.state::<AppState>();
+        let removed = {
+            let mut manual_alerts = state
+                .manual_alerts
+                .lock()
+                .expect("AppState manual_alerts lock poisoned");
+            prune_manual_alerts(&mut manual_alerts);
+
+            let is_current = manual_alerts
+                .get(&target_key)
+                .map(|manual_alert| manual_alert.expires_at == expires_at)
+                .unwrap_or(false);
+
+            if is_current {
+                manual_alerts.remove(&target_key);
+                true
+            } else {
+                false
+            }
+        };
+
+        if !removed {
+            return;
+        }
+
+        {
+            let mut snapshots = state
+                .snapshots
+                .lock()
+                .expect("AppState snapshots lock poisoned");
+            for snapshot_view in snapshots
+                .iter_mut()
+                .filter(|view| snapshot_key(&view.snapshot) == target_key)
+            {
+                snapshot_view
+                    .alerts
+                    .retain(|alert| alert.code != TEST_ALERT_CODE);
+            }
+        }
+
+        refresh_notified_alert_signatures(state.inner());
+        emit_widget_refresh(&app);
+    });
+}
+
 fn snapshot_views(
     snapshots: &[UsageSnapshot],
     now: chrono::DateTime<Utc>,
@@ -349,6 +486,25 @@ fn snapshot_views(
             snapshot,
         })
         .collect()
+}
+
+fn refresh_snapshot_alert_state(state: &AppState, cfg: &AppConfig) {
+    let snapshots = state
+        .snapshots
+        .lock()
+        .expect("AppState snapshots lock poisoned")
+        .iter()
+        .map(|view| view.snapshot.clone())
+        .collect::<Vec<_>>();
+    let manual_alerts = active_manual_alerts(state);
+    let mut refreshed = snapshot_views(&snapshots, Utc::now(), cfg);
+    apply_manual_alerts(&mut refreshed, &manual_alerts);
+
+    *state
+        .snapshots
+        .lock()
+        .expect("AppState snapshots lock poisoned") = refreshed;
+    refresh_notified_alert_signatures(state);
 }
 
 fn spawn_snapshot_refresh(app: AppHandle) {
@@ -382,7 +538,9 @@ fn spawn_snapshot_refresh(app: AppHandle) {
         let snapshots = provider_snapshots(&cfg);
         let now_local = Local::now();
         let now_utc = now_local.with_timezone(&Utc);
-        let snapshot_views = snapshot_views(&snapshots, now_utc, &cfg);
+        let manual_alerts = active_manual_alerts(state.inner());
+        let mut snapshot_views = snapshot_views(&snapshots, now_utc, &cfg);
+        apply_manual_alerts(&mut snapshot_views, &manual_alerts);
 
         {
             let mut cache = state
@@ -795,6 +953,103 @@ fn emit_native_notification(title: &str, body: &str) {
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn emit_native_notification(_title: &str, _body: &str) {}
+
+#[derive(Debug, Deserialize)]
+struct LatestReleaseResponse {
+    tag_name: String,
+}
+
+fn spawn_release_check(app: AppHandle) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let latest_tag = match fetch_latest_release_tag() {
+            Ok(tag_name) => tag_name,
+            Err(error) => {
+                eprintln!("release check failed: {error}");
+                return;
+            }
+        };
+
+        if compare_versions(&latest_tag, env!("CARGO_PKG_VERSION")) != Some(Ordering::Greater) {
+            return;
+        }
+
+        let should_notify = {
+            let state = app.state::<AppState>();
+            let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned");
+            if cfg.last_update_notified_version.as_deref() == Some(latest_tag.as_str()) {
+                false
+            } else {
+                cfg.last_update_notified_version = Some(latest_tag.clone());
+                if let Err(error) = save_config(&cfg) {
+                    eprintln!("failed to persist release notification state: {error}");
+                }
+                true
+            }
+        };
+
+        if should_notify {
+            emit_native_notification(
+                RELEASE_CHECK_TITLE,
+                &format!("{latest_tag} is available. Re-run the installer or download the latest release to update."),
+            );
+        }
+    });
+}
+
+fn fetch_latest_release_tag() -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(RELEASES_LATEST_URL)
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("usageguard-desktop/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?;
+    let release = response
+        .json::<LatestReleaseResponse>()
+        .map_err(|error| error.to_string())?;
+    Ok(release.tag_name)
+}
+
+fn compare_versions(left: &str, right: &str) -> Option<Ordering> {
+    let left_parts = parse_version_parts(left)?;
+    let right_parts = parse_version_parts(right)?;
+    let len = left_parts.len().max(right_parts.len());
+
+    for index in 0..len {
+        let left = *left_parts.get(index).unwrap_or(&0);
+        let right = *right_parts.get(index).unwrap_or(&0);
+        match left.cmp(&right) {
+            Ordering::Equal => continue,
+            non_equal => return Some(non_equal),
+        }
+    }
+
+    Some(Ordering::Equal)
+}
+
+fn parse_version_parts(version: &str) -> Option<Vec<u64>> {
+    let core = version
+        .trim()
+        .trim_start_matches('v')
+        .split(|ch| ch == '-' || ch == '+')
+        .next()?;
+    let parts = core
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+
+    (!parts.is_empty()).then_some(parts)
+}
 
 fn create_tray_icon() -> tauri::image::Image<'static> {
     static PIXELS: OnceLock<Box<[u8]>> = OnceLock::new();
@@ -1309,6 +1564,8 @@ struct OAuthStatus {
     connected: bool,
     plan_type: Option<String>,
     label: Option<String>,
+    alerts_5h_enabled: bool,
+    alerts_week_enabled: bool,
 }
 
 #[tauri::command]
@@ -1319,16 +1576,17 @@ fn get_openai_oauth_status(state: State<AppState>) -> OAuthStatus {
     } else {
         None
     };
-    let label = state
+    let cfg = state
         .cfg
         .lock()
         .expect("AppState cfg lock poisoned")
-        .openai_oauth_label
         .clone();
     OAuthStatus {
         connected,
         plan_type,
-        label,
+        label: cfg.openai_oauth_label,
+        alerts_5h_enabled: cfg.openai_oauth_5h_alerts_enabled,
+        alerts_week_enabled: cfg.openai_oauth_week_alerts_enabled,
     }
 }
 
@@ -1340,16 +1598,17 @@ fn get_anthropic_oauth_status(state: State<AppState>) -> OAuthStatus {
     } else {
         None
     };
-    let label = state
+    let cfg = state
         .cfg
         .lock()
         .expect("AppState cfg lock poisoned")
-        .anthropic_oauth_label
         .clone();
     OAuthStatus {
         connected,
         plan_type,
-        label,
+        label: cfg.anthropic_oauth_label,
+        alerts_5h_enabled: cfg.anthropic_oauth_5h_alerts_enabled,
+        alerts_week_enabled: cfg.anthropic_oauth_week_alerts_enabled,
     }
 }
 
@@ -1380,17 +1639,118 @@ fn set_oauth_label(
     Ok(())
 }
 
+#[tauri::command]
+fn set_oauth_window_alerts_enabled(
+    window: WebviewWindow,
+    provider: String,
+    window_key: String,
+    enabled: bool,
+    state: State<AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    require_window_label(&window, SETTINGS_LABEL, "set_oauth_window_alerts_enabled")?;
+    {
+        let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned");
+        match (provider.as_str(), window_key.as_str()) {
+            ("openai", "5h") => cfg.openai_oauth_5h_alerts_enabled = enabled,
+            ("openai", "week") => cfg.openai_oauth_week_alerts_enabled = enabled,
+            ("anthropic", "5h") => cfg.anthropic_oauth_5h_alerts_enabled = enabled,
+            ("anthropic", "week") => cfg.anthropic_oauth_week_alerts_enabled = enabled,
+            _ => return Err(format!("Unknown OAuth provider: {provider}")),
+        }
+        save_config(&cfg).map_err(|e| e.to_string())?;
+        refresh_snapshot_alert_state(&state, &cfg);
+    }
+    emit_widget_refresh(&app);
+    spawn_snapshot_refresh(app);
+    Ok(())
+}
+
+#[tauri::command]
+fn send_test_alert(
+    window: WebviewWindow,
+    target: TestAlertInput,
+    state: State<AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    require_window_label(&window, SETTINGS_LABEL, "send_test_alert")?;
+
+    let snapshot = find_snapshot_for_test_alert(state.inner(), &target).ok_or_else(|| {
+        format!(
+            "No loaded provider card found for '{}'. Refresh the widget and try again.",
+            target.account_label
+        )
+    })?;
+
+    let alert = Alert {
+        level: "warning".into(),
+        code: TEST_ALERT_CODE.into(),
+        message: TEST_ALERT_MESSAGE.into(),
+    };
+    let expires_at = Instant::now() + TEST_ALERT_DURATION;
+    let target_key = snapshot_key(&snapshot);
+
+    {
+        let mut manual_alerts = state
+            .manual_alerts
+            .lock()
+            .expect("AppState manual_alerts lock poisoned");
+        prune_manual_alerts(&mut manual_alerts);
+        manual_alerts.insert(
+            target_key.clone(),
+            ManualAlert {
+                alert: alert.clone(),
+                expires_at,
+            },
+        );
+    }
+
+    {
+        let mut snapshots = state
+            .snapshots
+            .lock()
+            .expect("AppState snapshots lock poisoned");
+        if let Some(snapshot_view) = snapshots
+            .iter_mut()
+            .find(|view| snapshot_key(&view.snapshot) == target_key)
+        {
+            snapshot_view
+                .alerts
+                .retain(|existing_alert| existing_alert.code != TEST_ALERT_CODE);
+            snapshot_view.alerts.push(alert.clone());
+        }
+    }
+
+    state
+        .notified_alerts
+        .lock()
+        .expect("AppState notified_alerts lock poisoned")
+        .insert(alert_signature(&snapshot, &alert));
+
+    emit_native_notification(
+        "UsageGuard",
+        &format!("{}: {}", snapshot.account_label, alert.message),
+    );
+    emit_widget_refresh(&app);
+    spawn_manual_alert_expiry(app, target_key, expires_at);
+
+    Ok(snapshot.account_label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        alert_signature, apply_provider_account_save, collect_pending_notifications,
-        parse_callback_code, Alert, AppConfig, ProviderAccount, ProviderAccountInput,
+        alert_signature, apply_manual_alerts, apply_provider_account_save,
+        collect_pending_notifications, compare_versions, parse_callback_code, prune_manual_alerts,
+        Alert, AppConfig, ManualAlert, ProviderAccount, ProviderAccountInput,
         ProviderCatalogEntry, SnapshotView, UsageSnapshot, ANTHROPIC_OAUTH_PROVIDER,
-        OPENAI_OAUTH_PROVIDER,
+        OPENAI_OAUTH_PROVIDER, TEST_ALERT_CODE, TEST_ALERT_MESSAGE,
     };
     use chrono::Local;
     use std::cell::Cell;
-    use std::collections::HashSet;
+    use std::cmp::Ordering;
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn callback_requires_matching_state() {
@@ -1412,6 +1772,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Unexpected callback path"));
+    }
+
+    #[test]
+    fn version_compare_ignores_leading_v_prefix() {
+        assert_eq!(compare_versions("v0.2.0", "0.1.9"), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn version_compare_pads_shorter_versions_with_zeroes() {
+        assert_eq!(compare_versions("1.2", "1.2.0"), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn version_compare_handles_prerelease_suffixes() {
+        assert_eq!(compare_versions("1.2.3-beta1", "1.2.2"), Some(Ordering::Greater));
     }
 
     #[test]
@@ -1726,6 +2101,60 @@ mod tests {
 
         assert_ne!(current_signature, next_signature);
     }
+
+    #[test]
+    fn manual_test_alert_overlays_matching_snapshot() {
+        let mut snapshot_views = vec![snapshot_view_with_alerts(Some("2026-03-10T12:00:00Z"), vec![])];
+        let mut manual_alerts = HashMap::new();
+        manual_alerts.insert(
+            "openai::ChatGPT Plus".into(),
+            ManualAlert {
+                alert: Alert {
+                    level: "warning".into(),
+                    code: TEST_ALERT_CODE.into(),
+                    message: TEST_ALERT_MESSAGE.into(),
+                },
+                expires_at: Instant::now() + Duration::from_secs(10),
+            },
+        );
+
+        apply_manual_alerts(&mut snapshot_views, &manual_alerts);
+
+        assert_eq!(snapshot_views[0].alerts.len(), 1);
+        assert_eq!(snapshot_views[0].alerts[0].code, TEST_ALERT_CODE);
+    }
+
+    #[test]
+    fn prune_manual_alerts_drops_expired_entries() {
+        let mut manual_alerts = HashMap::new();
+        manual_alerts.insert(
+            "expired".into(),
+            ManualAlert {
+                alert: Alert {
+                    level: "warning".into(),
+                    code: TEST_ALERT_CODE.into(),
+                    message: TEST_ALERT_MESSAGE.into(),
+                },
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        manual_alerts.insert(
+            "fresh".into(),
+            ManualAlert {
+                alert: Alert {
+                    level: "warning".into(),
+                    code: TEST_ALERT_CODE.into(),
+                    message: TEST_ALERT_MESSAGE.into(),
+                },
+                expires_at: Instant::now() + Duration::from_secs(10),
+            },
+        );
+
+        prune_manual_alerts(&mut manual_alerts);
+
+        assert!(!manual_alerts.contains_key("expired"));
+        assert!(manual_alerts.contains_key("fresh"));
+    }
 }
 
 fn main() {
@@ -1737,6 +2166,7 @@ fn main() {
                 cfg: Mutex::new(cfg),
                 notified_alerts: Mutex::new(HashSet::new()),
                 snapshots: Mutex::new(Vec::new()),
+                manual_alerts: Mutex::new(HashMap::new()),
                 refresh: Mutex::new(RefreshState::default()),
             });
 
@@ -1833,6 +2263,7 @@ fn main() {
                 .build(app)?;
 
             spawn_snapshot_refresh(app.handle().clone());
+            spawn_release_check(app.handle().clone());
 
             Ok(())
         })
@@ -1856,6 +2287,8 @@ fn main() {
             get_openai_oauth_status,
             get_anthropic_oauth_status,
             set_oauth_label,
+            set_oauth_window_alerts_enabled,
+            send_test_alert,
             set_refresh_interval_secs,
         ])
         .run(tauri::generate_context!())

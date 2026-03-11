@@ -4,7 +4,7 @@
 
 <h1 align="center">UsageGuard</h1>
 <p align="center">A local-first Windows widget and CLI for tracking AI spend, quotas, and subscription usage without dashboard noise.</p>
-<p align="center"><strong>Windows x64 | PowerShell one-line install | No Rust required</strong></p>
+<p align="center"><strong>Windows x64 release | Linux/macOS source-only for now | No Rust required on Windows</strong></p>
 
 UsageGuard keeps provider usage visible in a small desktop widget instead of burying it across multiple dashboards. It runs locally on Windows and stores your credentials securely on your machine.
 
@@ -17,26 +17,27 @@ UsageGuard keeps provider usage visible in a small desktop widget instead of bur
 - Stores API keys and refresh tokens securely on Windows and includes an optional CLI
 
 ## Install
-### One-line Windows install
+### Windows
 The installer downloads the latest Windows release from GitHub, extracts the binaries, and adds them to your user `PATH`.
+
+Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/openchert/usage-guard/main/install.ps1 | iex
 ```
 
-### Manual Windows install
+Windows CMD:
+
+```powershell
+curl -L https://raw.githubusercontent.com/openchert/usage-guard/main/install.ps1 -o install-usageguard.ps1
+powershell -ExecutionPolicy Bypass -File .\install-usageguard.ps1
+```
+
+Manual install:
+
 1. Download `usage-guard-windows-x64.zip` from GitHub Releases.
 2. Extract the archive.
 3. Run `usageguard-desktop.exe` for the widget or `usageguard.exe` for the CLI.
-
-### Verify release integrity
-Each release includes `SHA256SUMS`.
-
-```powershell
-Get-FileHash .\usage-guard-windows-x64.zip -Algorithm SHA256
-```
-
-Compare the reported hash with the matching entry in `SHA256SUMS`.
 
 ## Supported Connections
 - ChatGPT subscription usage through browser sign-in
@@ -70,6 +71,10 @@ usageguard config --anthropic-key "sk-ant-admin-..."
 usageguard demo
 ```
 
+## Updates
+- On Windows, update by running the same install command or script again. It always pulls the latest GitHub release and replaces the installed binaries.
+- The desktop app now checks GitHub Releases in the background on startup and shows a native notification when a newer version is available.
+
 ## Security
 On Windows, API keys and OAuth refresh tokens are stored in a DPAPI-encrypted file at `%APPDATA%\usage-guard\secrets.bin`. Access tokens stay in memory only and are refreshed when needed.
 
@@ -81,6 +86,7 @@ See [`docs/PROVIDERS.md`](docs/PROVIDERS.md) for the provider/source display mod
 
 ## Troubleshooting
 - If the install command succeeds but `usageguard` is not found, restart the terminal so `PATH` is reloaded.
+- If `irm` is unavailable, use `Invoke-RestMethod`, `Invoke-WebRequest`, `curl.exe`, or the manual ZIP install above.
 - If ChatGPT OAuth sign-in fails, make sure nothing else is using `localhost:1455`.
 - If Claude OAuth sign-in fails, make sure nothing else is using `localhost:45454`.
 - If an API card shows an admin-access status, verify the key has org usage access and that Anthropic uses an `sk-ant-admin...` key.

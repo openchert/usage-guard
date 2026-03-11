@@ -32,6 +32,8 @@
     connected: boolean;
     plan_type: string | null;
     label: string | null;
+    alerts_5h_enabled: boolean;
+    alerts_week_enabled: boolean;
   }
 
   let providers = [] as ProviderCatalogEntry[];
@@ -45,15 +47,17 @@
   let isLoading = true;
   let isSaving = false;
   let savePhase = 'idle' as 'idle' | 'saving' | 'verifying';
+  let isTestingAlert = false;
   let isConnectingOpenAi = false;
   let isConnectingAnthropic = false;
   let errorMessage = '';
   let successMessage = '';
-  let openaiOAuthStatus: OAuthStatus = { connected: false, plan_type: null, label: null };
-  let anthropicOAuthStatus: OAuthStatus = { connected: false, plan_type: null, label: null };
+  let openaiOAuthStatus: OAuthStatus = { connected: false, plan_type: null, label: null, alerts_5h_enabled: true, alerts_week_enabled: true };
+  let anthropicOAuthStatus: OAuthStatus = { connected: false, plan_type: null, label: null, alerts_5h_enabled: true, alerts_week_enabled: true };
   let openaiEditLabel = '';
   let anthropicEditLabel = '';
   let confirmRemoveId: string | null = null;
+  let editingAccount: ProviderAccountView | null = null;
   let unlistenTheme: (() => void) | null = null;
 
   const REFRESH_EVENT = 'usageguard://refresh';
@@ -190,6 +194,54 @@
     }
   }
 
+  async function setOAuthWindowAlertsEnabled(
+    provider: 'openai' | 'anthropic',
+    windowKey: '5h' | 'week',
+    enabled: boolean,
+  ): Promise<void> {
+    if (!invoke) return;
+    const target = provider === 'openai' ? openaiOAuthStatus : anthropicOAuthStatus;
+    const field = windowKey === '5h' ? 'alerts_5h_enabled' : 'alerts_week_enabled';
+    const previous = target[field];
+
+    if (provider === 'openai') {
+      openaiOAuthStatus = { ...openaiOAuthStatus, [field]: enabled };
+    } else {
+      anthropicOAuthStatus = { ...anthropicOAuthStatus, [field]: enabled };
+    }
+
+    try {
+      await invoke('set_oauth_window_alerts_enabled', { provider, windowKey, enabled });
+    } catch (error) {
+      if (provider === 'openai') {
+        openaiOAuthStatus = { ...openaiOAuthStatus, [field]: previous };
+      } else {
+        anthropicOAuthStatus = { ...anthropicOAuthStatus, [field]: previous };
+      }
+      errorMessage = String(error);
+    }
+  }
+
+  async function sendTestAlert(provider: string, accountLabel: string): Promise<void> {
+    if (!invoke || isTestingAlert) return;
+    isTestingAlert = true;
+    errorMessage = '';
+    successMessage = '';
+    try {
+      const testedLabel = await invoke('send_test_alert', {
+        target: {
+          provider,
+          accountLabel,
+        },
+      }) as string;
+      successMessage = `Test alert sent for ${testedLabel}.`;
+    } catch (error) {
+      errorMessage = String(error);
+    } finally {
+      isTestingAlert = false;
+    }
+  }
+
   async function connectOpenAIOAuth(): Promise<void> {
     if (!invoke || isConnectingOpenAi) return;
     isConnectingOpenAi = true;
@@ -197,7 +249,7 @@
     successMessage = '';
     try {
       const planType = await invoke('connect_openai_oauth') as string;
-      openaiOAuthStatus = { connected: true, plan_type: planType, label: null };
+      openaiOAuthStatus = { ...openaiOAuthStatus, connected: true, plan_type: planType, label: null };
       openaiEditLabel = `ChatGPT ${planType}`;
     } catch (error) {
       errorMessage = String(error);
@@ -210,7 +262,7 @@
     if (!invoke) return;
     try {
       await invoke('disconnect_openai_oauth');
-      openaiOAuthStatus = { connected: false, plan_type: null, label: null };
+      openaiOAuthStatus = { ...openaiOAuthStatus, connected: false, plan_type: null, label: null };
       openaiEditLabel = '';
     } catch (error) {
       errorMessage = String(error);
@@ -224,7 +276,7 @@
     successMessage = '';
     try {
       const planType = await invoke('connect_anthropic_oauth') as string;
-      anthropicOAuthStatus = { connected: true, plan_type: planType, label: null };
+      anthropicOAuthStatus = { ...anthropicOAuthStatus, connected: true, plan_type: planType, label: null };
       anthropicEditLabel = `Claude ${planType}`;
     } catch (error) {
       errorMessage = String(error);
@@ -237,7 +289,7 @@
     if (!invoke) return;
     try {
       await invoke('disconnect_anthropic_oauth');
-      anthropicOAuthStatus = { connected: false, plan_type: null, label: null };
+      anthropicOAuthStatus = { ...anthropicOAuthStatus, connected: false, plan_type: null, label: null };
       anthropicEditLabel = '';
     } catch (error) {
       errorMessage = String(error);
@@ -300,6 +352,8 @@
     window.removeEventListener('keydown', onKeydown);
     unlistenTheme?.();
   });
+
+  $: editingAccount = form.id ? accounts.find((account) => account.id === form.id) ?? null : null;
 </script>
 
 <div class="shell" on:contextmenu|preventDefault role="presentation">
@@ -336,6 +390,38 @@
           <button class="connect-btn" type="button" on:click={connectOpenAIOAuth}>Connect</button>
         {/if}
       </div>
+      {#if openaiOAuthStatus.connected && !isConnectingOpenAi}
+        <div class="oauth-subrow">
+          <span class="oauth-subrow-label">Alerts</span>
+          <label class="oauth-checkbox">
+            <input
+              type="checkbox"
+              checked={openaiOAuthStatus.alerts_5h_enabled}
+              on:change={(event) => void setOAuthWindowAlertsEnabled('openai', '5h', (event.currentTarget as HTMLInputElement).checked)}
+              on:mousedown|stopPropagation
+            />
+            <span>5h</span>
+          </label>
+          <label class="oauth-checkbox">
+            <input
+              type="checkbox"
+              checked={openaiOAuthStatus.alerts_week_enabled}
+              on:change={(event) => void setOAuthWindowAlertsEnabled('openai', 'week', (event.currentTarget as HTMLInputElement).checked)}
+              on:mousedown|stopPropagation
+            />
+            <span>Week</span>
+          </label>
+          <button
+            class="link-btn alert-test-button"
+            type="button"
+            disabled={isTestingAlert}
+            on:mousedown|stopPropagation
+            on:click={() => void sendTestAlert('openai', defaultOpenAILabel(openaiOAuthStatus))}
+          >
+            Test alert
+          </button>
+        </div>
+      {/if}
       {#if isConnectingOpenAi}
         <span class="field-help">Verifying ChatGPT subscription...</span>
       {/if}
@@ -359,6 +445,38 @@
           <button class="connect-btn" type="button" on:click={connectAnthropicOAuth}>Connect</button>
         {/if}
       </div>
+      {#if anthropicOAuthStatus.connected && !isConnectingAnthropic}
+        <div class="oauth-subrow">
+          <span class="oauth-subrow-label">Alerts</span>
+          <label class="oauth-checkbox">
+            <input
+              type="checkbox"
+              checked={anthropicOAuthStatus.alerts_5h_enabled}
+              on:change={(event) => void setOAuthWindowAlertsEnabled('anthropic', '5h', (event.currentTarget as HTMLInputElement).checked)}
+              on:mousedown|stopPropagation
+            />
+            <span>5h</span>
+          </label>
+          <label class="oauth-checkbox">
+            <input
+              type="checkbox"
+              checked={anthropicOAuthStatus.alerts_week_enabled}
+              on:change={(event) => void setOAuthWindowAlertsEnabled('anthropic', 'week', (event.currentTarget as HTMLInputElement).checked)}
+              on:mousedown|stopPropagation
+            />
+            <span>Week</span>
+          </label>
+          <button
+            class="link-btn alert-test-button"
+            type="button"
+            disabled={isTestingAlert}
+            on:mousedown|stopPropagation
+            on:click={() => void sendTestAlert('anthropic', defaultAnthropicLabel(anthropicOAuthStatus))}
+          >
+            Test alert
+          </button>
+        </div>
+      {/if}
       {#if isConnectingAnthropic}
         <span class="field-help">Verifying Claude subscription...</span>
       {/if}
@@ -453,9 +571,21 @@
         {:else}
           <span class="status"></span>
         {/if}
-        <button class="save-btn" type="button" disabled={isSaving} title={saveButtonLabel()} aria-label={saveButtonLabel()} on:click={save}>
+        <div class="footer-actions">
+          {#if editingAccount?.has_api_key}
+            <button
+              class="link-btn alert-test-button"
+              type="button"
+              disabled={isTestingAlert}
+              on:click={() => void sendTestAlert(editingAccount.provider, editingAccount.label)}
+            >
+              Test alert
+            </button>
+          {/if}
+          <button class="save-btn" type="button" disabled={isSaving} title={saveButtonLabel()} aria-label={saveButtonLabel()} on:click={save}>
           {isSaving ? '…' : form.id ? 'Save' : 'Add'}
-        </button>
+          </button>
+        </div>
       </div>
 
     </div>
@@ -559,6 +689,42 @@
     border-radius: 8px;
     background: var(--surface-row);
     flex-shrink: 0;
+  }
+
+  .oauth-subrow {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 16px;
+    margin: -2px 0 2px 14px;
+    padding: 0 2px;
+    flex-shrink: 0;
+  }
+
+  .oauth-subrow-label {
+    font-size: 10px;
+    color: var(--text-lo);
+    line-height: 1;
+  }
+
+  .oauth-checkbox {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-lo);
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .oauth-checkbox input {
+    width: 11px;
+    height: 11px;
+    margin: 0;
+    accent-color: rgba(110, 140, 230, 0.9);
+    cursor: pointer;
   }
 
   .oauth-provider-label {
@@ -758,6 +924,15 @@
     padding: 0;
   }
   .link-btn:hover { color: var(--text-mid); }
+  .link-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .link-btn:disabled:hover { color: var(--text-lo); }
+
+  .alert-test-button {
+    display: none;
+  }
 
   .form-fields {
     display: flex;
@@ -783,7 +958,7 @@
     color: var(--text-lo);
   }
 
-  input,
+  input:not([type='checkbox']),
   select {
     width: 100%;
     padding: 6px 9px;
@@ -796,7 +971,7 @@
     outline: none;
     box-sizing: border-box;
   }
-  input:focus, select:focus {
+  input:not([type='checkbox']):focus, select:focus {
     border-color: rgba(100, 140, 255, 0.45);
     background: var(--surface-input-focus);
   }
@@ -823,6 +998,13 @@
     gap: 10px;
     flex-shrink: 0;
     padding-top: 2px;
+  }
+
+  .footer-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
   }
 
   .status {

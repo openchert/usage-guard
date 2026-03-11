@@ -33,6 +33,10 @@ fn default_refresh_interval_secs() -> u32 {
     DEFAULT_REFRESH_INTERVAL_SECS
 }
 
+fn default_oauth_alerts_enabled() -> bool {
+    true
+}
+
 pub fn clamp_refresh_interval_secs(value: u32) -> u32 {
     value.clamp(MIN_REFRESH_INTERVAL_SECS, MAX_REFRESH_INTERVAL_SECS)
 }
@@ -202,6 +206,21 @@ pub struct AppConfig {
     /// Whether the UI should display in light mode instead of the default dark mode.
     #[serde(default)]
     pub light_mode: bool,
+    /// Whether ChatGPT 5h subscription alerts are enabled.
+    #[serde(default = "default_oauth_alerts_enabled")]
+    pub openai_oauth_5h_alerts_enabled: bool,
+    /// Whether ChatGPT weekly subscription alerts are enabled.
+    #[serde(default = "default_oauth_alerts_enabled")]
+    pub openai_oauth_week_alerts_enabled: bool,
+    /// Whether Claude 5h subscription alerts are enabled.
+    #[serde(default = "default_oauth_alerts_enabled")]
+    pub anthropic_oauth_5h_alerts_enabled: bool,
+    /// Whether Claude weekly subscription alerts are enabled.
+    #[serde(default = "default_oauth_alerts_enabled")]
+    pub anthropic_oauth_week_alerts_enabled: bool,
+    /// Last release tag that already triggered an update notification.
+    #[serde(default)]
+    pub last_update_notified_version: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -218,6 +237,11 @@ impl Default for AppConfig {
             openai_oauth_label: None,
             anthropic_oauth_label: None,
             light_mode: false,
+            openai_oauth_5h_alerts_enabled: true,
+            openai_oauth_week_alerts_enabled: true,
+            anthropic_oauth_5h_alerts_enabled: true,
+            anthropic_oauth_week_alerts_enabled: true,
+            last_update_notified_version: None,
         }
     }
 }
@@ -1663,6 +1687,51 @@ fn migrate_legacy_provider_accounts(cfg: &mut AppConfig) -> bool {
     migrated
 }
 
+fn migrate_legacy_oauth_alert_preferences(raw: &Value, cfg: &mut AppConfig) -> bool {
+    let mut migrated = false;
+
+    for (
+        legacy_key,
+        short_key,
+        week_key,
+        short_value,
+        week_value,
+    ) in [
+        (
+            "openai_oauth_alerts_enabled",
+            "openai_oauth_5h_alerts_enabled",
+            "openai_oauth_week_alerts_enabled",
+            &mut cfg.openai_oauth_5h_alerts_enabled,
+            &mut cfg.openai_oauth_week_alerts_enabled,
+        ),
+        (
+            "anthropic_oauth_alerts_enabled",
+            "anthropic_oauth_5h_alerts_enabled",
+            "anthropic_oauth_week_alerts_enabled",
+            &mut cfg.anthropic_oauth_5h_alerts_enabled,
+            &mut cfg.anthropic_oauth_week_alerts_enabled,
+        ),
+    ] {
+        let legacy = raw.get(legacy_key).and_then(|value| value.as_bool());
+        let has_short = raw.get(short_key).is_some();
+        let has_week = raw.get(week_key).is_some();
+        if legacy.is_some() && (!has_short || !has_week) {
+            migrated = true;
+        }
+        let Some(enabled) = legacy else {
+            continue;
+        };
+        if !has_short {
+            *short_value = enabled;
+        }
+        if !has_week {
+            *week_value = enabled;
+        }
+    }
+
+    migrated
+}
+
 fn reject_legacy_individual_accounts(raw: &Value, path: &std::path::Path) -> Result<()> {
     let Some(accounts) = raw
         .get("provider_accounts")
@@ -1708,12 +1777,13 @@ pub fn load_config() -> Result<AppConfig> {
     let raw_value = serde_json::from_str::<Value>(&raw)
         .with_context(|| format!("Invalid config JSON: {}", path.display()))?;
     reject_legacy_individual_accounts(&raw_value, &path)?;
-    let mut cfg = serde_json::from_value::<AppConfig>(raw_value)
+    let mut cfg = serde_json::from_value::<AppConfig>(raw_value.clone())
         .with_context(|| format!("Invalid config JSON: {}", path.display()))?;
 
     let mut migrated = false;
     migrated |= migrate_secret_payload(&mut cfg)?;
     migrated |= migrate_legacy_provider_accounts(&mut cfg);
+    migrated |= migrate_legacy_oauth_alert_preferences(&raw_value, &mut cfg);
 
     if !cfg.profiles.is_empty() {
         cfg.profiles.clear();
@@ -1859,34 +1929,102 @@ fn push_oauth_window_alerts(
     });
 }
 
-fn evaluate_oauth_alerts(snapshot: &UsageSnapshot, now: DateTime<Utc>) -> Vec<Alert> {
+fn evaluate_oauth_alerts(snapshot: &UsageSnapshot, now: DateTime<Utc>, cfg: &AppConfig) -> Vec<Alert> {
     let mut alerts = vec![];
-    push_oauth_window_alerts(
-        &mut alerts,
-        now,
-        "5h",
-        snapshot.tokens_in as f64,
-        snapshot.primary_reset_at.as_deref(),
-        OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
-        OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
-        Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
-        "quota_5h_exhausted",
-        "quota_5h_near_limit",
-        "quota_5h_unused_before_reset",
-    );
-    push_oauth_window_alerts(
-        &mut alerts,
-        now,
-        "Week",
-        snapshot.spent_usd,
-        snapshot.secondary_reset_at.as_deref(),
-        OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
-        OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
-        Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
-        "quota_week_exhausted",
-        "quota_week_near_limit",
-        "quota_week_unused_before_reset",
-    );
+    match snapshot.provider.as_str() {
+        "openai" => {
+            if cfg.openai_oauth_5h_alerts_enabled {
+                push_oauth_window_alerts(
+                    &mut alerts,
+                    now,
+                    "5h",
+                    snapshot.tokens_in as f64,
+                    snapshot.primary_reset_at.as_deref(),
+                    OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
+                    OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
+                    Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
+                    "quota_5h_exhausted",
+                    "quota_5h_near_limit",
+                    "quota_5h_unused_before_reset",
+                );
+            }
+            if cfg.openai_oauth_week_alerts_enabled {
+                push_oauth_window_alerts(
+                    &mut alerts,
+                    now,
+                    "Week",
+                    snapshot.spent_usd,
+                    snapshot.secondary_reset_at.as_deref(),
+                    OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
+                    OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
+                    Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
+                    "quota_week_exhausted",
+                    "quota_week_near_limit",
+                    "quota_week_unused_before_reset",
+                );
+            }
+        }
+        "anthropic" => {
+            if cfg.anthropic_oauth_5h_alerts_enabled {
+                push_oauth_window_alerts(
+                    &mut alerts,
+                    now,
+                    "5h",
+                    snapshot.tokens_in as f64,
+                    snapshot.primary_reset_at.as_deref(),
+                    OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
+                    OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
+                    Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
+                    "quota_5h_exhausted",
+                    "quota_5h_near_limit",
+                    "quota_5h_unused_before_reset",
+                );
+            }
+            if cfg.anthropic_oauth_week_alerts_enabled {
+                push_oauth_window_alerts(
+                    &mut alerts,
+                    now,
+                    "Week",
+                    snapshot.spent_usd,
+                    snapshot.secondary_reset_at.as_deref(),
+                    OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
+                    OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
+                    Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
+                    "quota_week_exhausted",
+                    "quota_week_near_limit",
+                    "quota_week_unused_before_reset",
+                );
+            }
+        }
+        _ => {
+            push_oauth_window_alerts(
+                &mut alerts,
+                now,
+                "5h",
+                snapshot.tokens_in as f64,
+                snapshot.primary_reset_at.as_deref(),
+                OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
+                OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
+                Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
+                "quota_5h_exhausted",
+                "quota_5h_near_limit",
+                "quota_5h_unused_before_reset",
+            );
+            push_oauth_window_alerts(
+                &mut alerts,
+                now,
+                "Week",
+                snapshot.spent_usd,
+                snapshot.secondary_reset_at.as_deref(),
+                OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
+                OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
+                Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
+                "quota_week_exhausted",
+                "quota_week_near_limit",
+                "quota_week_unused_before_reset",
+            );
+        }
+    }
     alerts
 }
 
@@ -1935,7 +2073,7 @@ pub fn evaluate_alerts(
     cfg: &AppConfig,
 ) -> Vec<Alert> {
     if snapshot.source == "oauth" {
-        evaluate_oauth_alerts(snapshot, now)
+        evaluate_oauth_alerts(snapshot, now, cfg)
     } else {
         evaluate_standard_alerts(snapshot, cfg)
     }
@@ -3601,6 +3739,36 @@ mod tests {
     }
 
     #[test]
+    fn openai_5h_oauth_alerts_can_be_disabled_independently() {
+        let cfg = AppConfig {
+            openai_oauth_5h_alerts_enabled: false,
+            ..AppConfig::default()
+        };
+        let now = Utc::now();
+        let snapshot = oauth_snapshot(95, 85.0, None, None);
+
+        let alerts = evaluate_alerts(&snapshot, now, &cfg);
+        assert!(!alerts.iter().any(|alert| alert.code.starts_with("quota_5h_")));
+        assert!(alerts.iter().any(|alert| alert.code.starts_with("quota_week_")));
+    }
+
+    #[test]
+    fn anthropic_week_oauth_alerts_can_be_disabled_independently() {
+        let cfg = AppConfig {
+            anthropic_oauth_week_alerts_enabled: false,
+            ..AppConfig::default()
+        };
+        let now = Utc::now();
+        let mut snapshot = oauth_snapshot(95, 85.0, None, None);
+        snapshot.provider = "anthropic".into();
+        snapshot.account_label = "Claude Pro".into();
+
+        let alerts = evaluate_alerts(&snapshot, now, &cfg);
+        assert!(alerts.iter().any(|alert| alert.code.starts_with("quota_5h_")));
+        assert!(!alerts.iter().any(|alert| alert.code.starts_with("quota_week_")));
+    }
+
+    #[test]
     fn exhausted_alerts_bypass_quiet_hours_but_non_critical_alerts_do_not() {
         let now = Local::now();
         let current_hour = now.hour() as u8;
@@ -3896,6 +4064,47 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("unsupported individual API account"));
+        });
+    }
+
+    #[test]
+    fn load_config_migrates_legacy_oauth_alert_toggle_to_window_toggles() {
+        with_test_config_dir("legacy_oauth_alert_toggle", || {
+            let path = config_path().unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::json!({
+                    "near_limit_ratio": 0.85,
+                    "inactive_threshold_hours": 8,
+                    "quiet_hours": {
+                        "enabled": true,
+                        "start_hour": 23,
+                        "end_hour": 8
+                    },
+                    "refresh_interval_secs": 15,
+                    "api": {},
+                    "openai_oauth_alerts_enabled": false
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let cfg = load_config().unwrap();
+            assert!(!cfg.openai_oauth_5h_alerts_enabled);
+            assert!(!cfg.openai_oauth_week_alerts_enabled);
+
+            let saved = fs::read_to_string(&path).unwrap();
+            let saved: Value = serde_json::from_str(&saved).unwrap();
+            assert!(saved.get("openai_oauth_alerts_enabled").is_none());
+            assert_eq!(
+                saved.get("openai_oauth_5h_alerts_enabled").and_then(|value| value.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                saved.get("openai_oauth_week_alerts_enabled").and_then(|value| value.as_bool()),
+                Some(false)
+            );
         });
     }
 
