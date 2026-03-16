@@ -1,13 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(any(test, target_os = "windows"))]
 use std::fs;
 use std::path::PathBuf;
 
 const APP_DIR_NAME: &str = "usage-guard";
 const CONFIG_DIR_OVERRIDE_ENV: &str = "USAGEGUARD_CONFIG_DIR_OVERRIDE";
 const SECRET_STORE_FILE_NAME: &str = "secrets.bin";
+#[cfg(target_os = "linux")]
+const SECRET_STORE_KEYRING_USER: &str = "secret-payload";
 const SECRET_PAYLOAD_VERSION: u32 = 1;
+const WINDOWS_BACKEND_ID: &str = "windows-dpapi";
+#[cfg(target_os = "linux")]
+const LINUX_BACKEND_ID: &str = "linux-secret-service";
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+const UNSUPPORTED_BACKEND_ID: &str = "unsupported";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct OpenAiOAuthSecret {
@@ -51,6 +59,33 @@ impl Default for SecretPayload {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecureStorageStatus {
+    pub available: bool,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl SecureStorageStatus {
+    fn available(backend: &str) -> Self {
+        Self {
+            available: true,
+            backend: backend.to_string(),
+            detail: None,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn unavailable(backend: &str, detail: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            backend: backend.to_string(),
+            detail: Some(detail.into()),
+        }
+    }
+}
+
 pub struct SecretStore;
 
 #[cfg(test)]
@@ -66,24 +101,22 @@ impl SecretStore {
         Ok(app_config_dir()?.join(SECRET_STORE_FILE_NAME))
     }
 
-    pub fn load() -> Result<SecretPayload> {
-        let path = Self::path()?;
-        if !path.exists() {
-            return Ok(SecretPayload::default());
-        }
+    pub fn status() -> SecureStorageStatus {
+        secure_storage_status()
+    }
 
-        let encrypted = fs::read(&path)
-            .with_context(|| format!("Unable to read secret store: {}", path.display()))?;
-        let decrypted = decrypt_bytes(&encrypted)
-            .with_context(|| format!("Unable to decrypt secret store: {}", path.display()))?;
-        let payload = serde_json::from_slice::<SecretPayload>(&decrypted)
-            .with_context(|| format!("Secret store is invalid JSON: {}", path.display()))?;
+    pub fn load() -> Result<SecretPayload> {
+        let Some(raw) = load_payload_bytes()? else {
+            return Ok(SecretPayload::default());
+        };
+
+        let payload = serde_json::from_slice::<SecretPayload>(&raw)
+            .context("Secret store is invalid JSON")?;
 
         if payload.version != SECRET_PAYLOAD_VERSION {
             return Err(anyhow!(
-                "Unsupported secret store version {} in {}",
-                payload.version,
-                path.display()
+                "Unsupported secret store version {}",
+                payload.version
             ));
         }
 
@@ -95,29 +128,14 @@ impl SecretStore {
     }
 
     pub fn save(payload: &SecretPayload) -> Result<()> {
-        let path = Self::path()?;
-        let dir = path
-            .parent()
-            .context("Secret store parent directory missing")?;
-        fs::create_dir_all(dir)
-            .with_context(|| format!("Unable to create secret store dir: {}", dir.display()))?;
-
         let mut normalized = payload.clone();
         normalized.version = SECRET_PAYLOAD_VERSION;
         let raw = serde_json::to_vec(&normalized)?;
-        let encrypted = encrypt_bytes(&raw)?;
-        fs::write(&path, encrypted)
-            .with_context(|| format!("Unable to write secret store: {}", path.display()))?;
-        Ok(())
+        save_payload_bytes(&raw)
     }
 
     pub fn clear() -> Result<()> {
-        let path = Self::path()?;
-        if path.exists() {
-            fs::remove_file(&path)
-                .with_context(|| format!("Unable to remove secret store: {}", path.display()))?;
-        }
-        Ok(())
+        clear_payload_bytes()
     }
 }
 
@@ -131,6 +149,136 @@ pub fn app_config_dir() -> Result<PathBuf> {
 
     let base = dirs::config_dir().context("Unable to resolve config directory")?;
     Ok(base.join(APP_DIR_NAME))
+}
+
+#[cfg(target_os = "windows")]
+fn secure_storage_status() -> SecureStorageStatus {
+    SecureStorageStatus::available(WINDOWS_BACKEND_ID)
+}
+
+#[cfg(target_os = "linux")]
+fn secure_storage_status() -> SecureStorageStatus {
+    let entry = match linux_secret_entry() {
+        Ok(entry) => entry,
+        Err(error) => {
+            return SecureStorageStatus::unavailable(
+                LINUX_BACKEND_ID,
+                format!("Could not initialize Linux secure storage: {error}"),
+            )
+        }
+    };
+
+    match entry.get_secret() {
+        Ok(_) | Err(keyring::Error::NoEntry) => SecureStorageStatus::available(LINUX_BACKEND_ID),
+        Err(error) => SecureStorageStatus::unavailable(
+            LINUX_BACKEND_ID,
+            format!("Could not access the Linux Secret Service keyring: {error}"),
+        ),
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn secure_storage_status() -> SecureStorageStatus {
+    SecureStorageStatus::unavailable(
+        UNSUPPORTED_BACKEND_ID,
+        "Secure secret persistence is only implemented for Windows and Linux in this release",
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn load_payload_bytes() -> Result<Option<Vec<u8>>> {
+    let path = SecretStore::path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let encrypted = fs::read(&path)
+        .with_context(|| format!("Unable to read secret store: {}", path.display()))?;
+    let decrypted = decrypt_bytes(&encrypted)
+        .with_context(|| format!("Unable to decrypt secret store: {}", path.display()))?;
+    Ok(Some(decrypted))
+}
+
+#[cfg(target_os = "linux")]
+fn load_payload_bytes() -> Result<Option<Vec<u8>>> {
+    let entry = linux_secret_entry()?;
+    match entry.get_secret() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(anyhow!(
+            "Unable to read secure secret store from the Linux keyring: {error}"
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn load_payload_bytes() -> Result<Option<Vec<u8>>> {
+    Err(anyhow!(
+        "Secure secret persistence is only implemented for Windows and Linux in this release"
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn save_payload_bytes(raw: &[u8]) -> Result<()> {
+    let path = SecretStore::path()?;
+    let dir = path
+        .parent()
+        .context("Secret store parent directory missing")?;
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Unable to create secret store dir: {}", dir.display()))?;
+
+    let encrypted = encrypt_bytes(raw)?;
+    fs::write(&path, encrypted)
+        .with_context(|| format!("Unable to write secret store: {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn save_payload_bytes(raw: &[u8]) -> Result<()> {
+    linux_secret_entry()?
+        .set_secret(raw)
+        .map_err(|error| anyhow!("Unable to write secret store to the Linux keyring: {error}"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn save_payload_bytes(_raw: &[u8]) -> Result<()> {
+    Err(anyhow!(
+        "Secure secret persistence is only implemented for Windows and Linux in this release"
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn clear_payload_bytes() -> Result<()> {
+    let path = SecretStore::path()?;
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("Unable to remove secret store: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_payload_bytes() -> Result<()> {
+    let entry = linux_secret_entry()?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(anyhow!(
+            "Unable to clear secret store from the Linux keyring: {error}"
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn clear_payload_bytes() -> Result<()> {
+    Err(anyhow!(
+        "Secure secret persistence is only implemented for Windows and Linux in this release"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_secret_entry() -> Result<keyring::Entry> {
+    keyring::Entry::new(APP_DIR_NAME, SECRET_STORE_KEYRING_USER)
+        .map_err(|error| anyhow!("Unable to create Linux keyring entry: {error}"))
 }
 
 #[cfg(target_os = "windows")]
@@ -217,20 +365,6 @@ fn decrypt_bytes(encrypted: &[u8]) -> Result<Vec<u8>> {
     };
 
     Ok(decrypted)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn encrypt_bytes(_raw: &[u8]) -> Result<Vec<u8>> {
-    Err(anyhow!(
-        "Secure secret persistence is only implemented for Windows in this release"
-    ))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn decrypt_bytes(_encrypted: &[u8]) -> Result<Vec<u8>> {
-    Err(anyhow!(
-        "Secure secret persistence is only implemented for Windows in this release"
-    ))
 }
 
 #[cfg(test)]

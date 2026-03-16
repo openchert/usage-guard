@@ -19,5 +19,5 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-keyring = "3"
+keyring = { version = "3", features = ["windows-native", "sync-secret-service"] }
 url = "2"

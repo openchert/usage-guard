@@ -8,7 +8,7 @@ UsageGuard is a local-first AI usage monitor built as a Rust workspace. It norma
 
 ## Workspace layout
 
-- `crates/usageguard-core`: config loading, Windows DPAPI-backed secret storage, provider adapters, snapshot normalization, alert evaluation, and demo fallback data.
+- `crates/usageguard-core`: config loading, OS-native secret storage, provider adapters, snapshot normalization, alert evaluation, and demo fallback data.
 - `crates/usageguard-cli`: terminal entrypoint for demo output, local alert checks, and basic config helpers.
 - `crates/usageguard-desktop`: Tauri desktop runtime, tray integration, native notifications, widget window management, and menu handling.
 - `crates/usageguard-desktop/ui`: Svelte 5 + Vite frontend for the mini desktop widget.
@@ -65,6 +65,7 @@ The current desktop app is a Tauri 2 widget, not the older `eframe/egui` shell.
 
 - Shared config is stored at the OS config directory under `usage-guard/config.json`.
 - On Windows, API keys and OAuth refresh tokens are stored in `%APPDATA%\usage-guard\secrets.bin` using DPAPI.
+- On Linux, API keys and OAuth refresh tokens are stored in the desktop Secret Service keyring.
 - OpenAI OAuth access tokens stay in memory only and are refreshed when needed.
 - Legacy plaintext OAuth storage and legacy keyring entries are migrated into the encrypted store on load.
 - Named provider accounts are stored in `provider_accounts` and can reuse the same vendor multiple times with different labels and keys.

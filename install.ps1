@@ -75,18 +75,18 @@ try {
       New-Item -Path $RunKeyPath -Force | Out-Null
       New-ItemProperty -Path $RunKeyPath -Name $RunValueName -PropertyType String -Value $startupCommand -Force | Out-Null
       if ($HadAutostart) {
-        Write-Host 'Updated the existing Start with Windows entry.'
+        Write-Host 'Updated the existing Start on Login entry.'
       }
       else {
-        Write-Host 'Enabled Start with Windows for this user. You can turn it off later from the app menu.'
+        Write-Host 'Enabled Start on Login for this user. You can turn it off later from the app menu.'
       }
     }
     else {
-      Write-Host 'Start with Windows remains disabled on this existing install.'
+      Write-Host 'Start on Login remains disabled on this existing install.'
     }
   }
   catch {
-    Write-Warning "Could not update the Start with Windows setting: $($_.Exception.Message)"
+    Write-Warning "Could not update the Start on Login setting: $($_.Exception.Message)"
   }
 
   try {

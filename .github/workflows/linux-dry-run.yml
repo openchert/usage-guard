@@ -1,0 +1,53 @@
+name: Linux Dry Run
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build linux-x64 bundles
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/usageguard-desktop/ui/package-lock.json
+
+      - name: Install desktop UI dependencies
+        run: npm ci --prefix crates/usageguard-desktop/ui
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked --version "^2"
+
+      - name: Build Linux bundles
+        working-directory: crates/usageguard-desktop
+        run: cargo tauri build --config tauri.linux.conf.json
+
+      - name: Upload Linux bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: usage-guard-linux-dry-run
+          path: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb

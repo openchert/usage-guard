@@ -2,7 +2,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use usageguard_core::{
     evaluate_alerts, has_provider_api_key, load_config, provider_snapshots, save_config,
-    set_provider_api_key, AppConfig, UsageSnapshot,
+    secure_storage_status, set_provider_api_key, AppConfig, UsageSnapshot,
 };
 
 #[derive(Parser)]
@@ -148,16 +148,13 @@ fn main() {
             }
 
             if show || (!has_openai_arg && !has_anthropic_arg) {
-                let secure_storage = if cfg!(target_os = "windows") {
-                    "windows-dpapi"
-                } else {
-                    "unsupported"
-                };
+                let secure_storage = secure_storage_status();
                 println!(
-                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"secure_storage\": \"{}\",\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
+                    "{{\n  \"openai_connected\": {},\n  \"anthropic_connected\": {},\n  \"secure_storage\": \"{}\",\n  \"secure_storage_available\": {},\n  \"near_limit_ratio\": {},\n  \"inactive_threshold_hours\": {}\n}}",
                     has_provider_api_key("openai") || cfg.api.openai_api_key.is_some(),
                     has_provider_api_key("anthropic") || cfg.api.anthropic_api_key.is_some(),
-                    secure_storage,
+                    secure_storage.backend,
+                    secure_storage.available,
                     cfg.near_limit_ratio,
                     cfg.inactive_threshold_hours
                 );
