@@ -23,7 +23,8 @@ function displayLabel(snapshot: UsageSnapshot, context: UsageDisplayContext): st
 export const anthropicOauthDisplayAdapter: UsageDisplayAdapter = {
   id: 'anthropic-oauth',
   matches(snapshot) {
-    return snapshot.provider === 'anthropic' && snapshot.source === 'oauth';
+    return snapshot.provider === 'anthropic'
+      && (snapshot.source === 'oauth' || snapshot.source === 'consumer_local');
   },
   toCard(snapshot, context): UsageCardSpec {
     const label = displayLabel(snapshot, context);

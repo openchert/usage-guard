@@ -2,69 +2,61 @@
 
 ## Scope
 
-This document describes the current Windows implementation for secret storage and provider authentication.
+This document describes the current Windows and Linux implementation for secret storage, local consumer imports, and provider authentication.
 
 ## Secret storage
 
-UsageGuard stores secrets in a DPAPI-encrypted blob at:
+UsageGuard stores secrets through OS-native secure storage:
 
-`%APPDATA%\usage-guard\secrets.bin`
+- Windows: DPAPI-encrypted blob at `%APPDATA%\usage-guard\secrets.bin`
+- Linux: desktop Secret Service keyring through the OS credential store (for example GNOME Keyring or a KWallet-backed Secret Service provider)
 
-For normal operation, the app reads and writes secrets only through this encrypted store. It does not use plaintext JSON files for active OAuth sessions.
+For normal operation, the app reads and writes secrets only through secure OS storage for API keys and any legacy secrets from older builds. Consumer usage import reads local Codex and Claude Code files directly from the current user profile.
 
 The encrypted payload currently contains:
 
 - Provider API keys for OpenAI and Anthropic accounts
-- OpenAI OAuth refresh token
-- OpenAI OAuth `account_id`
-- OpenAI OAuth `plan_type`
-- Anthropic OAuth refresh token
-- Anthropic OAuth `subscription_type`
-- Anthropic OAuth `rate_limit_tier`
+- Legacy OpenAI OAuth refresh token, `account_id`, and `plan_type` fields from earlier builds
+- Legacy Anthropic OAuth refresh token, `subscription_type`, and `rate_limit_tier` fields from earlier builds
 
-OAuth access tokens are not written to disk. They remain in memory and are refreshed when needed.
+OAuth access tokens are not written to disk. The current default consumer flow does not request or refresh consumer OAuth tokens.
 
 ## Supported connection types
 
 Current built-in connection types are:
 
-- OpenAI `oauth`: ChatGPT subscription usage via `https://chatgpt.com/backend-api/wham/usage`
-- Anthropic `oauth`: Claude subscription usage via `https://api.anthropic.com/api/oauth/usage`
+- OpenAI `consumer_local`: Codex consumer usage via local Codex session logs under `~/.codex/sessions`
+- Anthropic `consumer_local`: Claude Code exact `5h` quota via local CLI insights
+- Anthropic `consumer_local_metrics`: Claude Code local token activity via `~/.claude/projects`
+- Anthropic `consumer_local_status`: Claude Code local status via `~/.claude/.credentials.json`
 - OpenAI `api`: `GET https://api.openai.com/v1/organization/costs` and `GET https://api.openai.com/v1/organization/usage/completions`
 - Anthropic `api`: `GET https://api.anthropic.com/v1/organizations/cost_report` and `GET https://api.anthropic.com/v1/organizations/usage_report/messages`
 
 Outbound requests are limited to these built-in audited endpoints. Custom endpoint overrides and custom provider profiles are not used for outbound fetches.
 
-## OpenAI OAuth flow
+## OpenAI local consumer import
 
-OpenAI sign-in is a browser-based PKCE flow.
+Codex consumer usage is imported from local files created by the official Codex client.
 
-1. The settings window starts sign-in.
-2. UsageGuard opens the system browser to `https://auth.openai.com/oauth/authorize`.
-3. OpenAI redirects back to `http://localhost:1455/auth/callback`.
-4. UsageGuard accepts the callback only while a sign-in is active.
-5. The callback path and OAuth `state` must match the expected values.
-6. The app exchanges the authorization code at `https://auth.openai.com/oauth/token`.
-7. The refresh token is persisted in `secrets.bin`; the access token stays in memory.
-8. The app fetches `https://chatgpt.com/backend-api/wham/usage` and caches `account_id` and `plan_type`.
+1. The official Codex client signs the user in locally.
+2. UsageGuard detects local auth state from `~/.codex/auth.json`.
+3. UsageGuard scans recent session logs under `~/.codex/sessions`.
+4. The latest `token_count` event with `rate_limits` becomes the normalized `5h` and `week` quota snapshot.
 
-If token refresh fails in a way that indicates expired or invalid OAuth state, UsageGuard clears the stored OpenAI OAuth session and requires the user to reconnect.
+No consumer OAuth token exchange is performed in the default UI path.
 
-## Anthropic OAuth flow
+## Anthropic local consumer detection
 
-Anthropic sign-in is also a browser-based PKCE flow.
+Claude Code local state is read from the user profile.
 
-1. The settings window starts sign-in.
-2. UsageGuard opens the system browser to `https://claude.ai/oauth/authorize`.
-3. Anthropic redirects back to `http://localhost:45454/callback`.
-4. UsageGuard requires the exact callback path and the expected OAuth `state`.
-5. The app exchanges the authorization code at `https://platform.claude.com/v1/oauth/token`.
-6. The refresh token is persisted in `secrets.bin`; the access token stays in memory.
-7. The app fetches subscription usage from `https://api.anthropic.com/api/oauth/usage`.
+1. The official Claude Code client signs the user in locally.
+2. UsageGuard reads `subscriptionType` and `rateLimitTier` from `%USERPROFILE%\.claude\.credentials.json`.
+3. UsageGuard runs `claude -p --verbose --output-format stream-json "/insights"` and parses the local `five_hour` quota event.
+4. UsageGuard scans recent JSONL project logs under `%USERPROFILE%\.claude\projects`.
+5. Recent assistant-message token counts are aggregated into rolling local activity windows.
+6. The widget shows exact local `5h` quota and local `7d` activity.
 
-If Anthropic's OAuth response does not include plan metadata, UsageGuard may read only `subscriptionType` and `rateLimitTier` from `%USERPROFILE%\.claude\.credentials.json` and cache those values in `secrets.bin`. It does not import access tokens from that file for normal operation.
-
-If token refresh fails in a way that indicates expired or invalid OAuth state, UsageGuard clears the stored Anthropic OAuth session and requires the user to reconnect.
+UsageGuard does not import Claude access tokens from that file for normal operation. Weekly consumer quota percentage is not exposed through the local Claude Code client, so the built-in view shows exact `5h` quota plus local activity instead of a fake weekly percentage.
 
 ## API-key authentication
 
@@ -73,7 +65,7 @@ Built-in API providers use these authentication methods:
 - OpenAI API: `Authorization: Bearer <api key>` with organization/admin usage access for the Administration endpoints
 - Anthropic API: `x-api-key: <api key>` with `anthropic-version: 2023-06-01`; organization monitoring requires an Admin API key (`sk-ant-admin...`)
 
-UsageGuard does not accept individual API keys for provider-reported historical usage. Individual-user monitoring is handled through the OAuth subscription flows instead.
+UsageGuard does not accept individual API keys for provider-reported historical usage. Individual-user monitoring is handled through local consumer imports where the official local client exposes enough data.
 
 ## UI and command hardening
 
@@ -90,17 +82,18 @@ This protects secrets at rest against casual disclosure such as:
 
 - copied config directories
 - inspecting files in `%APPDATA%`
+- copying Linux config directories without also having access to the user's unlocked secret-service session
 - accidental plaintext token leakage from local app files
 
 It does not attempt to defend against:
 
 - same-user malware
-- a fully compromised Windows session
-- an attacker who can already call DPAPI as the logged-in user
+- a fully compromised desktop session
+- an attacker who can already call the platform credential APIs as the logged-in user
 
 ## Current limitations
 
-- Secure persistence is implemented for Windows in this release.
+- Secure persistence is implemented on Windows and Linux in this release.
 - If secure persistence is unavailable, UsageGuard does not intentionally fall back to plaintext secret storage.
-- If another process is already using port `1455`, OpenAI OAuth sign-in will fail until the port is free.
-- If another process is already using port `45454`, Anthropic OAuth sign-in will fail until the port is free.
+- On Linux, a Secret Service provider must be available and unlocked for credential persistence to work.
+- Claude Code local detection currently does not include a reliable local weekly consumer quota percentage.

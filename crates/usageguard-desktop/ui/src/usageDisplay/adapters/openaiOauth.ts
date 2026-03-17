@@ -23,7 +23,8 @@ function displayLabel(snapshot: UsageSnapshot, context: UsageDisplayContext): st
 export const openaiOauthDisplayAdapter: UsageDisplayAdapter = {
   id: 'openai-oauth',
   matches(snapshot) {
-    return snapshot.provider === 'openai' && snapshot.source === 'oauth';
+    return snapshot.provider === 'openai'
+      && (snapshot.source === 'oauth' || snapshot.source === 'consumer_local');
   },
   toCard(snapshot, context): UsageCardSpec {
     const label = displayLabel(snapshot, context);

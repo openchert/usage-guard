@@ -12,7 +12,7 @@
   const DEFAULT_REFRESH_INTERVAL_MS = 60_000;
   const REFRESH_EVENT = 'usageguard://refresh';
 
-  interface OAuthStatus {
+  interface ConsumerStatus {
     connected: boolean;
   }
 
@@ -125,8 +125,8 @@
     try {
       const [cfg, openaiStatus, anthropicStatus] = await Promise.all([
         invoke('get_config') as Promise<WidgetConfig>,
-        invoke('get_openai_oauth_status') as Promise<OAuthStatus>,
-        invoke('get_anthropic_oauth_status') as Promise<OAuthStatus>,
+        invoke('get_openai_consumer_status') as Promise<ConsumerStatus>,
+        invoke('get_anthropic_consumer_status') as Promise<ConsumerStatus>,
       ]);
       hasConfiguredSources =
         (cfg.provider_accounts?.length ?? 0) > 0
@@ -263,7 +263,8 @@
       {@const alertLevel = cardAlertLevel(snapshot)}
       <div
         class="provider-card"
-        class:provider-card-metrics={card.kind === 'metrics'}
+        class:provider-card-hybrid={card.kind === 'hybrid'}
+        class:provider-card-metrics={card.kind === 'metrics' || card.kind === 'hybrid'}
         data-alert-level={alertLevel ?? undefined}
         title={card.title}
       >
@@ -281,6 +282,27 @@
                 theme={provider.usageRing}
               />
             {/each}
+          </div>
+        {:else if card.kind === 'hybrid'}
+          <div class="hybrid-layout">
+            <div class="rings hybrid-rings">
+              {#each card.rings as ring}
+                <UsageRing
+                  ratio={ring.ratio}
+                  accent={provider.color}
+                  label={ring.label ?? ''}
+                  theme={provider.usageRing}
+                />
+              {/each}
+            </div>
+            <div class="metric-grid hybrid-metric-grid">
+              {#each card.stats as stat}
+                <div class="metric-tile">
+                  <span class="metric-value" style={`--metric-accent:${provider.color}`}>{stat.value}</span>
+                  <span class="metric-label">{stat.label}</span>
+                </div>
+              {/each}
+            </div>
           </div>
         {:else}
           <div class="metric-grid">
@@ -405,6 +427,25 @@
 
   .provider-card-metrics {
     gap: 4px;
+  }
+
+  .provider-card-hybrid {
+    gap: 5px;
+  }
+
+  .hybrid-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    flex: 1;
+  }
+
+  .hybrid-rings {
+    flex: 0;
+  }
+
+  .hybrid-metric-grid {
+    flex: 1;
   }
 
   .metric-grid {

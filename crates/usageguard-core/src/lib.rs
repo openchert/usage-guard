@@ -5,12 +5,15 @@ use chrono::{DateTime, Duration, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use secret_store::{
     app_config_dir, AnthropicOAuthSecret, OpenAiOAuthSecret, SecretPayload, SecretStore,
 };
+
+pub use secret_store::SecureStorageStatus;
 
 const KEYRING_SERVICE: &str = "usage-guard";
 const ACCESS_TOKEN_EXPIRY_SKEW_SECS: i64 = 60;
@@ -19,6 +22,16 @@ const ANTHROPIC_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 const ANTHROPIC_OAUTH_SCOPE: &str =
     "user:inference user:mcp_servers user:profile user:sessions:claude_code";
 const CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV: &str = "USAGEGUARD_CLAUDE_CREDENTIALS_PATH_OVERRIDE";
+#[cfg(test)]
+const CLAUDE_PROJECTS_DIR_OVERRIDE_ENV: &str = "USAGEGUARD_CLAUDE_PROJECTS_DIR_OVERRIDE";
+const CODEX_AUTH_PATH_OVERRIDE_ENV: &str = "USAGEGUARD_CODEX_AUTH_PATH_OVERRIDE";
+const CODEX_SESSIONS_DIR_OVERRIDE_ENV: &str = "USAGEGUARD_CODEX_SESSIONS_DIR_OVERRIDE";
+const CONSUMER_LOCAL_SOURCE: &str = "consumer_local";
+const CONSUMER_LOCAL_STATUS_SOURCE: &str = "consumer_local_status";
+const CLAUDE_CODE_USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_CODE_USAGE_CACHE_TTL_SECS: i64 = 300;
+const CODEX_SESSION_SCAN_FILE_LIMIT: usize = 32;
+const CODEX_SESSION_SCAN_LINE_LIMIT: usize = 256;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 15;
 pub const MIN_REFRESH_INTERVAL_SECS: u32 = 15;
 pub const MAX_REFRESH_INTERVAL_SECS: u32 = 900;
@@ -71,6 +84,23 @@ struct ClaudeDesktopOAuth {
     subscription_type: String,
     #[serde(default, rename = "rateLimitTier")]
     rate_limit_tier: String,
+    #[serde(default, rename = "accessToken")]
+    access_token: Option<String>,
+    #[serde(default, rename = "expiresAt")]
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CodexAuthFile {
+    #[serde(default)]
+    tokens: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClaudeInsightsCacheState {
+    fetched_at: Option<DateTime<Utc>>,
+    primary_window: Option<ConsumerQuotaWindow>,
+    secondary_window: Option<ConsumerQuotaWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -104,6 +134,24 @@ pub struct ApiMetricCard {
     pub rolling_30d: ApiMetricWindow,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConsumerQuotaWindow {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub used_percent: Option<f64>,
+    #[serde(default)]
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ConsumerQuotaCard {
+    #[serde(default)]
+    pub primary: Option<ConsumerQuotaWindow>,
+    #[serde(default)]
+    pub secondary: Option<ConsumerQuotaWindow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub provider: String,
@@ -120,6 +168,8 @@ pub struct UsageSnapshot {
     pub status_message: Option<String>,
     #[serde(default)]
     pub api_metrics: Option<ApiMetricCard>,
+    #[serde(default)]
+    pub consumer_quota: Option<ConsumerQuotaCard>,
     #[serde(default)]
     pub primary_reset_at: Option<String>,
     #[serde(default)]
@@ -364,6 +414,10 @@ pub fn has_provider_account_api_key(account_id: &str) -> bool {
     get_provider_account_api_key(account_id).is_some()
 }
 
+pub fn secure_storage_status() -> SecureStorageStatus {
+    SecretStore::status()
+}
+
 fn openai_session() -> &'static Mutex<OpenAiSessionState> {
     static SESSION: OnceLock<Mutex<OpenAiSessionState>> = OnceLock::new();
     SESSION.get_or_init(|| Mutex::new(OpenAiSessionState::default()))
@@ -372,6 +426,11 @@ fn openai_session() -> &'static Mutex<OpenAiSessionState> {
 fn anthropic_session() -> &'static Mutex<AnthropicSessionState> {
     static SESSION: OnceLock<Mutex<AnthropicSessionState>> = OnceLock::new();
     SESSION.get_or_init(|| Mutex::new(AnthropicSessionState::default()))
+}
+
+fn claude_insights_cache() -> &'static Mutex<ClaudeInsightsCacheState> {
+    static CACHE: OnceLock<Mutex<ClaudeInsightsCacheState>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ClaudeInsightsCacheState::default()))
 }
 
 fn is_non_empty(value: &str) -> bool {
@@ -693,6 +752,304 @@ fn claude_credentials_path() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".claude").join(".credentials.json"))
 }
 
+#[cfg(test)]
+fn claude_projects_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV) {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    Some(dirs::home_dir()?.join(".claude").join("projects"))
+}
+
+fn codex_auth_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(CODEX_AUTH_PATH_OVERRIDE_ENV) {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    Some(dirs::home_dir()?.join(".codex").join("auth.json"))
+}
+
+fn codex_sessions_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(CODEX_SESSIONS_DIR_OVERRIDE_ENV) {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    Some(dirs::home_dir()?.join(".codex").join("sessions"))
+}
+
+fn has_local_codex_auth() -> bool {
+    let Some(path) = codex_auth_path() else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(auth) = serde_json::from_str::<CodexAuthFile>(&raw) else {
+        return false;
+    };
+    !auth.tokens.is_null()
+}
+
+fn collect_jsonl_files(root: &Path, items: &mut Vec<(SystemTime, PathBuf)>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+
+        if metadata.is_dir() {
+            collect_jsonl_files(&path, items);
+            continue;
+        }
+
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        items.push((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), path));
+    }
+}
+
+fn value_reset_at(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(timestamp) = value.as_i64() {
+        return DateTime::from_timestamp(timestamp, 0).map(|dt| dt.to_rfc3339());
+    }
+    None
+}
+
+fn consumer_quota_window(used_percent: f64, reset_at: Option<String>) -> ConsumerQuotaWindow {
+    ConsumerQuotaWindow {
+        available: true,
+        used_percent: Some(used_percent.clamp(0.0, 100.0)),
+        reset_at,
+    }
+}
+
+fn get_valid_claude_code_access_token() -> Option<String> {
+    let path = claude_credentials_path()?;
+    let raw = fs::read_to_string(path).ok()?;
+    let credentials = serde_json::from_str::<ClaudeDesktopCredentials>(&raw).ok()?;
+    let oauth = credentials.claude_ai_oauth;
+    let access_token = oauth.access_token.filter(|t| !t.trim().is_empty())?;
+    // Check expiry (60 second skew)
+    if let Some(expires_at_ms) = oauth.expires_at_ms {
+        let now_ms = Utc::now().timestamp_millis();
+        if expires_at_ms < now_ms + 60_000 {
+            return None;
+        }
+    }
+    Some(access_token)
+}
+
+fn fetch_claude_code_usage_from_api(
+    access_token: &str,
+) -> Option<(ConsumerQuotaWindow, Option<ConsumerQuotaWindow>)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let resp: Value = client
+        .get(CLAUDE_CODE_USAGE_API_URL)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER)
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+    let five_hour = resp.get("five_hour")?;
+    let primary_used = five_hour["utilization"].as_f64()?.clamp(0.0, 100.0);
+    let primary_reset_at = five_hour["resets_at"].as_str().map(str::to_string);
+    let primary = ConsumerQuotaWindow {
+        available: true,
+        used_percent: Some(primary_used),
+        reset_at: primary_reset_at,
+    };
+    let secondary = resp.get("seven_day").and_then(|seven_day| {
+        let used_percent = seven_day["utilization"].as_f64()?.clamp(0.0, 100.0);
+        let reset_at = seven_day["resets_at"].as_str().map(str::to_string);
+        Some(ConsumerQuotaWindow { available: true, used_percent: Some(used_percent), reset_at })
+    });
+    Some((primary, secondary))
+}
+
+pub fn invalidate_claude_local_insights_cache() {
+    *claude_insights_cache().lock().unwrap() = ClaudeInsightsCacheState::default();
+}
+
+fn fetch_claude_local_quota_windows() -> Option<(ConsumerQuotaWindow, Option<ConsumerQuotaWindow>)> {
+    let now = Utc::now();
+    {
+        let cache = claude_insights_cache().lock().unwrap();
+        if let Some(fetched_at) = cache.fetched_at {
+            if now.signed_duration_since(fetched_at)
+                < Duration::seconds(CLAUDE_CODE_USAGE_CACHE_TTL_SECS)
+            {
+                return cache.primary_window.clone().map(|p| (p, cache.secondary_window.clone()));
+            }
+        }
+    }
+    let windows = get_valid_claude_code_access_token()
+        .as_deref()
+        .and_then(fetch_claude_code_usage_from_api);
+    let (primary_window, secondary_window) = match windows {
+        Some((p, s)) => (Some(p), s),
+        None => (None, None),
+    };
+    *claude_insights_cache().lock().unwrap() = ClaudeInsightsCacheState {
+        fetched_at: Some(now),
+        primary_window: primary_window.clone(),
+        secondary_window: secondary_window.clone(),
+    };
+    primary_window.map(|p| (p, secondary_window))
+}
+
+#[cfg(test)]
+fn normalize_claude_utilization_percent(value: f64) -> Option<f64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+
+    let percent = if value <= 1.0 { value * 100.0 } else { value };
+    Some(percent.clamp(0.0, 100.0))
+}
+
+#[cfg(test)]
+fn parse_claude_rate_limit_event(value: &Value) -> Option<ConsumerQuotaWindow> {
+    if pick_str(value, &["type"]) != Some("rate_limit_event") {
+        return None;
+    }
+
+    let info = value.get("rate_limit_info")?;
+    let rate_limit_type = pick_str(info, &["rateLimitType", "rate_limit_type"])?;
+    if rate_limit_type != "five_hour" {
+        return None;
+    }
+
+    let used_percent =
+        pick_f64(info, &["utilization"]).and_then(normalize_claude_utilization_percent)?;
+    let reset_at = info
+        .get("resetsAt")
+        .and_then(value_reset_at)
+        .or_else(|| info.get("resetAt").and_then(value_reset_at))
+        .or_else(|| info.get("resets_at").and_then(value_reset_at))
+        .or_else(|| info.get("reset_at").and_then(value_reset_at));
+
+    Some(consumer_quota_window(used_percent, reset_at))
+}
+
+fn codex_plan_type_from_payload(payload: &Value) -> Option<String> {
+    pick_str(payload, &["plan_type", "planType"])
+        .filter(|value| is_non_empty(value) && !value.eq_ignore_ascii_case("unknown"))
+        .map(openai_oauth_plan_label)
+}
+
+fn codex_account_label(plan_type: Option<&str>) -> String {
+    match plan_type.filter(|value| is_non_empty(value)) {
+        Some(plan_type) => format!("Codex {}", openai_oauth_plan_label(plan_type)),
+        None => "Codex".to_string(),
+    }
+}
+
+fn codex_rate_limits(payload: &Value) -> Option<&Value> {
+    let rate_limits = payload.get("rate_limits")?;
+    (rate_limits.is_object()
+        && rate_limits.get("primary").is_some_and(Value::is_object)
+        && rate_limits.get("secondary").is_some_and(Value::is_object))
+    .then_some(rate_limits)
+}
+
+fn latest_codex_rate_limit_payload() -> Option<Value> {
+    let root = codex_sessions_dir()?;
+    if !root.exists() {
+        return None;
+    }
+
+    let mut files = vec![];
+    collect_jsonl_files(&root, &mut files);
+    files.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut fallback_payload = None;
+
+    for (_, path) in files.into_iter().take(CODEX_SESSION_SCAN_FILE_LIMIT) {
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+
+        for line in raw.lines().rev().take(CODEX_SESSION_SCAN_LINE_LIMIT) {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(payload) = value.get("payload") else {
+                continue;
+            };
+            if pick_str(payload, &["type"]) != Some("token_count") {
+                continue;
+            }
+            let Some(rate_limits) = codex_rate_limits(payload) else {
+                continue;
+            };
+            if pick_str(rate_limits, &["limit_id"]) == Some("codex") {
+                return Some(payload.clone());
+            }
+            if fallback_payload.is_none() {
+                fallback_payload = Some(payload.clone());
+            }
+        }
+    }
+
+    fallback_payload
+}
+
+fn build_claude_local_consumer_snapshot(
+    primary_window: ConsumerQuotaWindow,
+    secondary_window: Option<ConsumerQuotaWindow>,
+) -> UsageSnapshot {
+    let plan_type = get_anthropic_consumer_plan_type();
+    let primary_used = primary_window.used_percent.unwrap_or(0.0);
+    let primary_reset_at = primary_window.reset_at.clone();
+    let secondary_reset_at = secondary_window.as_ref().and_then(|w| w.reset_at.clone());
+
+    UsageSnapshot {
+        provider: "anthropic".into(),
+        account_label: match plan_type {
+            Some(plan_type) if is_non_empty(&plan_type) => format!("Claude Code {plan_type}"),
+            _ => "Claude Code".to_string(),
+        },
+        spent_usd: 0.0,
+        limit_usd: 0.0,
+        tokens_in: primary_used.round() as u64,
+        tokens_out: 0,
+        inactive_hours: 0,
+        source: CONSUMER_LOCAL_SOURCE.to_string(),
+        status_code: Some("consumer_local_quota".to_string()),
+        status_message: None,
+        api_metrics: None,
+        consumer_quota: Some(ConsumerQuotaCard {
+            primary: Some(primary_window),
+            secondary: secondary_window,
+        }),
+        primary_reset_at,
+        secondary_reset_at,
+    }
+}
+
 fn load_local_claude_oauth_metadata() -> Option<(String, String)> {
     let path = claude_credentials_path()?;
     let raw = fs::read_to_string(path).ok()?;
@@ -750,6 +1107,14 @@ pub fn has_openai_oauth_session() -> bool {
     current_refresh_token().is_some() || current_cached_access_token().is_some()
 }
 
+pub fn has_openai_consumer_source() -> bool {
+    has_local_codex_auth() || latest_codex_rate_limit_payload().is_some()
+}
+
+pub fn has_openai_consumer_usage() -> bool {
+    latest_codex_rate_limit_payload().is_some()
+}
+
 pub fn get_openai_oauth_access_token() -> Option<String> {
     current_cached_access_token()
 }
@@ -768,8 +1133,35 @@ pub fn get_openai_oauth_plan_type() -> Option<String> {
     }
 }
 
+pub fn get_openai_consumer_plan_type() -> Option<String> {
+    latest_codex_rate_limit_payload()
+        .as_ref()
+        .and_then(codex_rate_limits)
+        .and_then(codex_plan_type_from_payload)
+}
+
 pub fn has_anthropic_oauth_session() -> bool {
     current_anthropic_refresh_token().is_some() || current_cached_anthropic_access_token().is_some()
+}
+
+pub fn has_anthropic_consumer_source() -> bool {
+    claude_credentials_path().is_some_and(|path| path.exists())
+}
+
+pub fn has_anthropic_consumer_5h_usage() -> bool {
+    if !has_anthropic_consumer_source() {
+        return false;
+    }
+
+    claude_insights_cache().lock().unwrap().primary_window.is_some()
+}
+
+pub fn has_anthropic_consumer_week_usage() -> bool {
+    false
+}
+
+pub fn has_anthropic_consumer_usage() -> bool {
+    has_anthropic_consumer_5h_usage()
 }
 
 pub fn get_anthropic_oauth_plan_type() -> Option<String> {
@@ -788,6 +1180,10 @@ pub fn get_anthropic_oauth_plan_type() -> Option<String> {
             anthropic_plan_type_from_fields(&subscription_type, &rate_limit_tier)
         },
     )
+}
+
+pub fn get_anthropic_consumer_plan_type() -> Option<String> {
+    get_anthropic_oauth_plan_type()
 }
 
 pub fn set_openai_oauth_tokens(
@@ -929,6 +1325,87 @@ pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
     }
 }
 
+fn parse_codex_local_usage_payload(payload: &Value) -> Result<UsageSnapshot> {
+    let rate_limits = payload
+        .get("rate_limits")
+        .context("Codex session entry missing rate_limits")?;
+    let primary = rate_limits
+        .get("primary")
+        .context("Codex session entry missing primary rate limit")?;
+    let secondary = rate_limits
+        .get("secondary")
+        .context("Codex session entry missing secondary rate limit")?;
+
+    let primary_percent = pick_f64(primary, &["used_percent"])
+        .context("Codex session entry missing primary used_percent")?
+        .clamp(0.0, 100.0);
+    let secondary_percent = pick_f64(secondary, &["used_percent"])
+        .context("Codex session entry missing secondary used_percent")?
+        .clamp(0.0, 100.0);
+    let plan_type = codex_plan_type_from_payload(rate_limits);
+
+    Ok(UsageSnapshot {
+        provider: "openai".into(),
+        account_label: codex_account_label(plan_type.as_deref()),
+        spent_usd: secondary_percent,
+        limit_usd: 100.0,
+        tokens_in: primary_percent.round() as u64,
+        tokens_out: 0,
+        inactive_hours: 0,
+        source: CONSUMER_LOCAL_SOURCE.to_string(),
+        status_code: None,
+        status_message: None,
+        api_metrics: None,
+        consumer_quota: Some(ConsumerQuotaCard {
+            primary: Some(consumer_quota_window(
+                primary_percent,
+                primary
+                    .get("resets_at")
+                    .and_then(value_reset_at)
+                    .or_else(|| primary.get("reset_at").and_then(value_reset_at)),
+            )),
+            secondary: Some(consumer_quota_window(
+                secondary_percent,
+                secondary
+                    .get("resets_at")
+                    .and_then(value_reset_at)
+                    .or_else(|| secondary.get("reset_at").and_then(value_reset_at)),
+            )),
+        }),
+        primary_reset_at: primary
+            .get("resets_at")
+            .and_then(value_reset_at)
+            .or_else(|| primary.get("reset_at").and_then(value_reset_at)),
+        secondary_reset_at: secondary
+            .get("resets_at")
+            .and_then(value_reset_at)
+            .or_else(|| secondary.get("reset_at").and_then(value_reset_at)),
+    })
+}
+
+pub fn fetch_openai_consumer_usage() -> Option<UsageSnapshot> {
+    if let Some(payload) = latest_codex_rate_limit_payload() {
+        match parse_codex_local_usage_payload(&payload) {
+            Ok(snapshot) => return Some(snapshot),
+            Err(error) => {
+                eprintln!("[usageguard] codex local usage parse failed: {error}");
+            }
+        }
+    }
+
+    if !has_openai_consumer_source() {
+        return None;
+    }
+
+    Some(error_snapshot(
+        "openai",
+        &codex_account_label(get_openai_consumer_plan_type().as_deref()),
+        CONSUMER_LOCAL_STATUS_SOURCE,
+        Some("consumer_local_waiting_for_usage"),
+        Some("Codex is signed in locally. Usage appears after your next Codex request."),
+    ))
+}
+
 pub fn fetch_anthropic_oauth_usage() -> Option<UsageSnapshot> {
     if !has_anthropic_oauth_session() {
         return None;
@@ -986,6 +1463,27 @@ pub fn fetch_anthropic_oauth_usage() -> Option<UsageSnapshot> {
             }
         }
     }
+}
+
+pub fn fetch_anthropic_consumer_usage() -> Option<UsageSnapshot> {
+    if !has_anthropic_consumer_source() {
+        return None;
+    }
+
+    if let Some((primary_window, secondary_window)) = fetch_claude_local_quota_windows() {
+        return Some(build_claude_local_consumer_snapshot(primary_window, secondary_window));
+    }
+
+    Some(error_snapshot(
+        "anthropic",
+        &match get_anthropic_consumer_plan_type() {
+            Some(plan_type) if is_non_empty(&plan_type) => format!("Claude Code {plan_type}"),
+            _ => "Claude Code".to_string(),
+        },
+        CONSUMER_LOCAL_STATUS_SOURCE,
+        Some("consumer_local_usage_pending"),
+        Some("Fetching Claude Code 5h quota… (appears ~10 s after app launch)"),
+    ))
 }
 
 fn try_refresh_oauth_token() -> Result<String> {
@@ -1324,6 +1822,7 @@ fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
         status_code: None,
         status_message: None,
         api_metrics: None,
+        consumer_quota: None,
         primary_reset_at: usage.primary_reset_at.clone(),
         secondary_reset_at: usage.secondary_reset_at.clone(),
     })
@@ -1373,8 +1872,7 @@ fn openai_oauth_window_reset_at(
         }
         // wham API returns reset_at as a Unix timestamp integer
         if let Some(ts) = val.as_i64() {
-            return DateTime::from_timestamp(ts, 0)
-                .map(|dt| dt.to_rfc3339());
+            return DateTime::from_timestamp(ts, 0).map(|dt| dt.to_rfc3339());
         }
         None
     })
@@ -1473,6 +1971,7 @@ fn anthropic_oauth_snapshot_from_usage(
         status_code: None,
         status_message: None,
         api_metrics: None,
+        consumer_quota: None,
         primary_reset_at: usage.session_reset_at.clone(),
         secondary_reset_at: usage.week_reset_at.clone(),
     }
@@ -1690,13 +2189,7 @@ fn migrate_legacy_provider_accounts(cfg: &mut AppConfig) -> bool {
 fn migrate_legacy_oauth_alert_preferences(raw: &Value, cfg: &mut AppConfig) -> bool {
     let mut migrated = false;
 
-    for (
-        legacy_key,
-        short_key,
-        week_key,
-        short_value,
-        week_value,
-    ) in [
+    for (legacy_key, short_key, week_key, short_value, week_value) in [
         (
             "openai_oauth_alerts_enabled",
             "openai_oauth_5h_alerts_enabled",
@@ -1840,6 +2333,39 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+fn snapshot_primary_quota(snapshot: &UsageSnapshot) -> Option<(f64, Option<&str>)> {
+    if let Some(window) = snapshot.consumer_quota.as_ref().and_then(|quota| quota.primary.as_ref()) {
+        if window.available {
+            return window
+                .used_percent
+                .map(|used_percent| (used_percent, window.reset_at.as_deref()));
+        }
+        return None;
+    }
+
+    Some((snapshot.tokens_in as f64, snapshot.primary_reset_at.as_deref()))
+}
+
+fn snapshot_secondary_quota(snapshot: &UsageSnapshot) -> Option<(f64, Option<&str>)> {
+    if let Some(window) = snapshot
+        .consumer_quota
+        .as_ref()
+        .and_then(|quota| quota.secondary.as_ref())
+    {
+        if window.available {
+            return window
+                .used_percent
+                .map(|used_percent| (used_percent, window.reset_at.as_deref()));
+        }
+        return None;
+    }
+
+    let has_legacy_week_window = snapshot.limit_usd > 0.0
+        || snapshot.spent_usd > 0.0
+        || snapshot.secondary_reset_at.is_some();
+    has_legacy_week_window.then_some((snapshot.spent_usd, snapshot.secondary_reset_at.as_deref()))
+}
+
 fn quota_percent_left(used_percent: f64) -> u32 {
     (100.0 - used_percent.clamp(0.0, 100.0)).round() as u32
 }
@@ -1929,17 +2455,24 @@ fn push_oauth_window_alerts(
     });
 }
 
-fn evaluate_oauth_alerts(snapshot: &UsageSnapshot, now: DateTime<Utc>, cfg: &AppConfig) -> Vec<Alert> {
+fn evaluate_oauth_alerts(
+    snapshot: &UsageSnapshot,
+    now: DateTime<Utc>,
+    cfg: &AppConfig,
+) -> Vec<Alert> {
     let mut alerts = vec![];
+    let primary_quota = snapshot_primary_quota(snapshot);
+    let secondary_quota = snapshot_secondary_quota(snapshot);
     match snapshot.provider.as_str() {
         "openai" => {
             if cfg.openai_oauth_5h_alerts_enabled {
+                if let Some((used_percent, reset_at)) = primary_quota {
                 push_oauth_window_alerts(
                     &mut alerts,
                     now,
                     "5h",
-                    snapshot.tokens_in as f64,
-                    snapshot.primary_reset_at.as_deref(),
+                    used_percent,
+                    reset_at,
                     OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
                     OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
                     Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
@@ -1947,14 +2480,16 @@ fn evaluate_oauth_alerts(snapshot: &UsageSnapshot, now: DateTime<Utc>, cfg: &App
                     "quota_5h_near_limit",
                     "quota_5h_unused_before_reset",
                 );
+                }
             }
             if cfg.openai_oauth_week_alerts_enabled {
+                if let Some((used_percent, reset_at)) = secondary_quota {
                 push_oauth_window_alerts(
                     &mut alerts,
                     now,
                     "Week",
-                    snapshot.spent_usd,
-                    snapshot.secondary_reset_at.as_deref(),
+                    used_percent,
+                    reset_at,
                     OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
                     OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
                     Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
@@ -1962,16 +2497,53 @@ fn evaluate_oauth_alerts(snapshot: &UsageSnapshot, now: DateTime<Utc>, cfg: &App
                     "quota_week_near_limit",
                     "quota_week_unused_before_reset",
                 );
+                }
             }
         }
         "anthropic" => {
             if cfg.anthropic_oauth_5h_alerts_enabled {
+                if let Some((used_percent, reset_at)) = primary_quota {
                 push_oauth_window_alerts(
                     &mut alerts,
                     now,
                     "5h",
-                    snapshot.tokens_in as f64,
-                    snapshot.primary_reset_at.as_deref(),
+                    used_percent,
+                    reset_at,
+                    OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
+                    OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
+                    Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
+                    "quota_5h_exhausted",
+                    "quota_5h_near_limit",
+                    "quota_5h_unused_before_reset",
+                );
+                }
+            }
+            if cfg.anthropic_oauth_week_alerts_enabled {
+                if let Some((used_percent, reset_at)) = secondary_quota {
+                push_oauth_window_alerts(
+                    &mut alerts,
+                    now,
+                    "Week",
+                    used_percent,
+                    reset_at,
+                    OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
+                    OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
+                    Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
+                    "quota_week_exhausted",
+                    "quota_week_near_limit",
+                    "quota_week_unused_before_reset",
+                );
+                }
+            }
+        }
+        _ => {
+            if let Some((used_percent, reset_at)) = primary_quota {
+                push_oauth_window_alerts(
+                    &mut alerts,
+                    now,
+                    "5h",
+                    used_percent,
+                    reset_at,
                     OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
                     OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
                     Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
@@ -1980,13 +2552,13 @@ fn evaluate_oauth_alerts(snapshot: &UsageSnapshot, now: DateTime<Utc>, cfg: &App
                     "quota_5h_unused_before_reset",
                 );
             }
-            if cfg.anthropic_oauth_week_alerts_enabled {
+            if let Some((used_percent, reset_at)) = secondary_quota {
                 push_oauth_window_alerts(
                     &mut alerts,
                     now,
                     "Week",
-                    snapshot.spent_usd,
-                    snapshot.secondary_reset_at.as_deref(),
+                    used_percent,
+                    reset_at,
                     OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
                     OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
                     Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
@@ -1995,34 +2567,6 @@ fn evaluate_oauth_alerts(snapshot: &UsageSnapshot, now: DateTime<Utc>, cfg: &App
                     "quota_week_unused_before_reset",
                 );
             }
-        }
-        _ => {
-            push_oauth_window_alerts(
-                &mut alerts,
-                now,
-                "5h",
-                snapshot.tokens_in as f64,
-                snapshot.primary_reset_at.as_deref(),
-                OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
-                OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
-                Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
-                "quota_5h_exhausted",
-                "quota_5h_near_limit",
-                "quota_5h_unused_before_reset",
-            );
-            push_oauth_window_alerts(
-                &mut alerts,
-                now,
-                "Week",
-                snapshot.spent_usd,
-                snapshot.secondary_reset_at.as_deref(),
-                OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
-                OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
-                Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
-                "quota_week_exhausted",
-                "quota_week_near_limit",
-                "quota_week_unused_before_reset",
-            );
         }
     }
     alerts
@@ -2072,7 +2616,7 @@ pub fn evaluate_alerts(
     now: DateTime<Utc>,
     cfg: &AppConfig,
 ) -> Vec<Alert> {
-    if snapshot.source == "oauth" {
+    if snapshot.source == "oauth" || snapshot.source == CONSUMER_LOCAL_SOURCE {
         evaluate_oauth_alerts(snapshot, now, cfg)
     } else {
         evaluate_standard_alerts(snapshot, cfg)
@@ -2160,8 +2704,8 @@ fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec
 pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
     let mut items: Vec<UsageSnapshot> = vec![];
 
-    // OAuth subscriptions first (consumer plans before API-key sources)
-    if let Some(mut s) = fetch_openai_oauth_usage() {
+    // Local consumer app sources first.
+    if let Some(mut s) = fetch_openai_consumer_usage() {
         if let Some(label) = cfg
             .openai_oauth_label
             .as_deref()
@@ -2171,7 +2715,7 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
         }
         items.push(s);
     }
-    if let Some(mut s) = fetch_anthropic_oauth_usage() {
+    if let Some(mut s) = fetch_anthropic_consumer_usage() {
         if let Some(label) = cfg
             .anthropic_oauth_label
             .as_deref()
@@ -2690,6 +3234,7 @@ fn build_api_metric_snapshot(
         status_code: status_code.map(str::to_string),
         status_message,
         api_metrics: Some(metrics),
+        consumer_quota: None,
         primary_reset_at: None,
         secondary_reset_at: None,
     }
@@ -3313,6 +3858,7 @@ fn parse_openai_costs_response(value: &Value, label: &str, source: &str) -> Resu
         status_code: None,
         status_message: None,
         api_metrics: None,
+        consumer_quota: None,
         primary_reset_at: None,
         secondary_reset_at: None,
     })
@@ -3362,6 +3908,7 @@ fn parse_anthropic_usage_response(
         status_code: None,
         status_message: None,
         api_metrics: None,
+        consumer_quota: None,
         primary_reset_at: None,
         secondary_reset_at: None,
     })
@@ -3417,6 +3964,7 @@ fn snapshot_from_value(
         status_code: None,
         status_message: None,
         api_metrics,
+        consumer_quota: None,
         primary_reset_at: None,
         secondary_reset_at: None,
     })
@@ -3456,6 +4004,7 @@ fn env_fallback_snapshot(provider: &str, label: &str, prefix: &str) -> Option<Us
         status_code: None,
         status_message: None,
         api_metrics: None,
+        consumer_quota: None,
         primary_reset_at: None,
         secondary_reset_at: None,
     })
@@ -3480,6 +4029,7 @@ fn error_snapshot(
         status_code: status_code.map(str::to_string),
         status_message: status_message.map(str::to_string),
         api_metrics: None,
+        consumer_quota: None,
         primary_reset_at: None,
         secondary_reset_at: None,
     }
@@ -3524,6 +4074,7 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
             status_code: None,
             status_message: None,
             api_metrics: None,
+            consumer_quota: None,
             primary_reset_at: None,
             secondary_reset_at: None,
         },
@@ -3539,6 +4090,7 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
             status_code: None,
             status_message: None,
             api_metrics: None,
+            consumer_quota: None,
             primary_reset_at: None,
             secondary_reset_at: None,
         },
@@ -3548,37 +4100,171 @@ pub fn demo_snapshots() -> Vec<UsageSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+    #[cfg(test)]
+    fn set_claude_local_primary_quota_window_for_testing(window: Option<ConsumerQuotaWindow>) {
+        *claude_insights_cache().lock().unwrap() = ClaudeInsightsCacheState {
+            fetched_at: Some(Utc::now()),
+            primary_window: window,
+            secondary_window: None,
+        };
+    }
+
+    fn with_codex_consumer_override(
+        name: &str,
+        auth_body: &str,
+        session_lines: &[&str],
+        test: impl FnOnce(),
+    ) {
+        let _guard = crate::secret_store::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "usageguard_core_codex_consumer_{name}_{}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        let auth_path = root.join(".codex").join("auth.json");
+        let session_path = root.join(".codex").join("sessions").join("test.jsonl");
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&config_root).unwrap();
+        fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        fs::write(&auth_path, auth_body).unwrap();
+        fs::write(&session_path, session_lines.join("\n")).unwrap();
+
+        std::env::set_var("USAGEGUARD_CONFIG_DIR_OVERRIDE", &config_root);
+        std::env::set_var(CODEX_AUTH_PATH_OVERRIDE_ENV, &auth_path);
+        std::env::set_var(CODEX_SESSIONS_DIR_OVERRIDE_ENV, session_path.parent().unwrap());
+        clear_in_memory_oauth_session();
+        let _ = SecretStore::clear();
+
+        let result = catch_unwind(AssertUnwindSafe(test));
+
+        clear_in_memory_oauth_session();
+        let _ = SecretStore::clear();
+        std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
+        std::env::remove_var(CODEX_AUTH_PATH_OVERRIDE_ENV);
+        std::env::remove_var(CODEX_SESSIONS_DIR_OVERRIDE_ENV);
+        let _ = fs::remove_dir_all(&root);
+
+        if let Err(payload) = result {
+            resume_unwind(payload);
+        }
+    }
 
     fn with_claude_credentials_override(name: &str, body: &str, test: impl FnOnce()) {
-        let _guard = crate::secret_store::test_env_lock().lock().unwrap();
+        let _guard = crate::secret_store::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let root = std::env::temp_dir().join(format!(
             "usageguard_core_claude_plan_{name}_{}",
             std::process::id()
         ));
         let config_root = root.join("config");
         let credentials_path = root.join(".claude").join(".credentials.json");
+        let projects_dir = root.join(".claude").join("projects");
 
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&config_root).unwrap();
         fs::create_dir_all(credentials_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&projects_dir).unwrap();
         fs::write(&credentials_path, body).unwrap();
 
         std::env::set_var("USAGEGUARD_CONFIG_DIR_OVERRIDE", &config_root);
         std::env::set_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV, &credentials_path);
+        std::env::set_var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV, &projects_dir);
+        set_claude_local_primary_quota_window_for_testing(None);
+        invalidate_claude_local_insights_cache();
         clear_in_memory_anthropic_session();
         let _ = SecretStore::clear();
 
-        test();
+        let result = catch_unwind(AssertUnwindSafe(test));
 
         clear_in_memory_anthropic_session();
         let _ = SecretStore::clear();
+        invalidate_claude_local_insights_cache();
         std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
         std::env::remove_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV);
+        std::env::remove_var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV);
         let _ = fs::remove_dir_all(&root);
+
+        if let Err(payload) = result {
+            resume_unwind(payload);
+        }
+    }
+
+    fn with_claude_local_override(
+        name: &str,
+        credentials_body: &str,
+        project_lines: &[&str],
+        insights_stdout: Option<&str>,
+        _insights_status: i32,
+        test: impl FnOnce(),
+    ) {
+        let _guard = crate::secret_store::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "usageguard_core_claude_local_{name}_{}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        let credentials_path = root.join(".claude").join(".credentials.json");
+        let projects_dir = root.join(".claude").join("projects");
+        let project_path = projects_dir.join("test.jsonl");
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&config_root).unwrap();
+        fs::create_dir_all(credentials_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&projects_dir).unwrap();
+        fs::write(&credentials_path, credentials_body).unwrap();
+        fs::write(&project_path, project_lines.join("\n")).unwrap();
+
+        std::env::set_var("USAGEGUARD_CONFIG_DIR_OVERRIDE", &config_root);
+        std::env::set_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV, &credentials_path);
+        std::env::set_var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV, &projects_dir);
+
+        // Inject the quota window directly into the cache (no subprocess needed).
+        if let Some(raw) = insights_stdout {
+            let window = raw.lines().find_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let value = serde_json::from_str::<Value>(trimmed).ok()?;
+                parse_claude_rate_limit_event(&value)
+            });
+            set_claude_local_primary_quota_window_for_testing(window);
+        } else {
+            set_claude_local_primary_quota_window_for_testing(None);
+            invalidate_claude_local_insights_cache();
+        }
+
+        clear_in_memory_anthropic_session();
+        let _ = SecretStore::clear();
+
+        let result = catch_unwind(AssertUnwindSafe(test));
+
+        clear_in_memory_anthropic_session();
+        let _ = SecretStore::clear();
+        invalidate_claude_local_insights_cache();
+        std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
+        std::env::remove_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV);
+        std::env::remove_var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV);
+        let _ = fs::remove_dir_all(&root);
+
+        if let Err(payload) = result {
+            resume_unwind(payload);
+        }
     }
 
     fn with_test_config_dir(name: &str, test: impl FnOnce()) {
-        let _guard = crate::secret_store::test_env_lock().lock().unwrap();
+        let _guard = crate::secret_store::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let root = std::env::temp_dir().join(format!(
             "usageguard_core_validation_{name}_{}",
             std::process::id()
@@ -3590,15 +4276,21 @@ mod tests {
         std::env::set_var("USAGEGUARD_CONFIG_DIR_OVERRIDE", &config_root);
         clear_in_memory_oauth_session();
         clear_in_memory_anthropic_session();
+        invalidate_claude_local_insights_cache();
         let _ = SecretStore::clear();
 
-        test();
+        let result = catch_unwind(AssertUnwindSafe(test));
 
         clear_in_memory_oauth_session();
         clear_in_memory_anthropic_session();
+        invalidate_claude_local_insights_cache();
         let _ = SecretStore::clear();
         std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
         let _ = fs::remove_dir_all(&root);
+
+        if let Err(payload) = result {
+            resume_unwind(payload);
+        }
     }
 
     #[test]
@@ -3616,6 +4308,7 @@ mod tests {
             status_code: None,
             status_message: None,
             api_metrics: None,
+            consumer_quota: None,
             primary_reset_at: None,
             secondary_reset_at: None,
         };
@@ -3641,6 +4334,7 @@ mod tests {
             status_code: None,
             status_message: None,
             api_metrics: None,
+            consumer_quota: None,
             primary_reset_at: five_hour_reset_at.map(str::to_string),
             secondary_reset_at: week_reset_at.map(str::to_string),
         }
@@ -3674,6 +4368,23 @@ mod tests {
             .iter()
             .any(|alert| alert.code == "quota_week_near_limit"));
         assert!(evaluate_alerts(&at_threshold, now, &cfg)
+            .iter()
+            .any(|alert| alert.code == "quota_week_near_limit"));
+    }
+
+    #[test]
+    fn consumer_local_snapshots_use_quota_alert_rules() {
+        let cfg = AppConfig::default();
+        let now = Utc::now();
+        let mut snapshot = oauth_snapshot(95, 85.0, None, None);
+        snapshot.source = CONSUMER_LOCAL_SOURCE.into();
+        snapshot.account_label = "Codex Plus".into();
+
+        let alerts = evaluate_alerts(&snapshot, now, &cfg);
+        assert!(alerts
+            .iter()
+            .any(|alert| alert.code == "quota_5h_near_limit"));
+        assert!(alerts
             .iter()
             .any(|alert| alert.code == "quota_week_near_limit"));
     }
@@ -3748,8 +4459,12 @@ mod tests {
         let snapshot = oauth_snapshot(95, 85.0, None, None);
 
         let alerts = evaluate_alerts(&snapshot, now, &cfg);
-        assert!(!alerts.iter().any(|alert| alert.code.starts_with("quota_5h_")));
-        assert!(alerts.iter().any(|alert| alert.code.starts_with("quota_week_")));
+        assert!(!alerts
+            .iter()
+            .any(|alert| alert.code.starts_with("quota_5h_")));
+        assert!(alerts
+            .iter()
+            .any(|alert| alert.code.starts_with("quota_week_")));
     }
 
     #[test]
@@ -3764,8 +4479,12 @@ mod tests {
         snapshot.account_label = "Claude Pro".into();
 
         let alerts = evaluate_alerts(&snapshot, now, &cfg);
-        assert!(alerts.iter().any(|alert| alert.code.starts_with("quota_5h_")));
-        assert!(!alerts.iter().any(|alert| alert.code.starts_with("quota_week_")));
+        assert!(alerts
+            .iter()
+            .any(|alert| alert.code.starts_with("quota_5h_")));
+        assert!(!alerts
+            .iter()
+            .any(|alert| alert.code.starts_with("quota_week_")));
     }
 
     #[test]
@@ -4098,11 +4817,15 @@ mod tests {
             let saved: Value = serde_json::from_str(&saved).unwrap();
             assert!(saved.get("openai_oauth_alerts_enabled").is_none());
             assert_eq!(
-                saved.get("openai_oauth_5h_alerts_enabled").and_then(|value| value.as_bool()),
+                saved
+                    .get("openai_oauth_5h_alerts_enabled")
+                    .and_then(|value| value.as_bool()),
                 Some(false)
             );
             assert_eq!(
-                saved.get("openai_oauth_week_alerts_enabled").and_then(|value| value.as_bool()),
+                saved
+                    .get("openai_oauth_week_alerts_enabled")
+                    .and_then(|value| value.as_bool()),
                 Some(false)
             );
         });
@@ -4156,6 +4879,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_claude_rate_limit_event_normalizes_fraction_utilization() {
+        let value: Value = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "rateLimitType": "five_hour",
+                "utilization": 0.62,
+                "resetsAt": 1773709200i64
+            }
+        });
+
+        let window = parse_claude_rate_limit_event(&value).expect("window missing");
+        assert_eq!(window.used_percent, Some(62.0));
+        assert!(window.reset_at.is_some());
+    }
+
+    #[test]
+    fn parse_claude_rate_limit_event_accepts_percent_utilization() {
+        let value: Value = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "rateLimitType": "five_hour",
+                "utilization": 73.0
+            }
+        });
+
+        let window = parse_claude_rate_limit_event(&value).expect("window missing");
+        assert_eq!(window.used_percent, Some(73.0));
+    }
+
+    #[test]
     fn parse_openai_oauth_usage_data_extracts_reset_times() {
         let value: Value = serde_json::json!({
             "plan_type": "plus",
@@ -4204,8 +4957,14 @@ mod tests {
         let usage = parse_openai_oauth_usage_data(&value).unwrap();
         assert!((usage.primary_percent - 22.0).abs() < f64::EPSILON);
         assert!((usage.secondary_percent - 29.0).abs() < f64::EPSILON);
-        assert!(usage.primary_reset_at.is_some(), "primary reset_at should be parsed from Unix timestamp");
-        assert!(usage.secondary_reset_at.is_some(), "secondary reset_at should be parsed from Unix timestamp");
+        assert!(
+            usage.primary_reset_at.is_some(),
+            "primary reset_at should be parsed from Unix timestamp"
+        );
+        assert!(
+            usage.secondary_reset_at.is_some(),
+            "secondary reset_at should be parsed from Unix timestamp"
+        );
     }
 
     #[test]
@@ -4216,6 +4975,159 @@ mod tests {
 
         let error = parse_openai_oauth_usage_data(&value).unwrap_err();
         assert!(error.to_string().contains("quota window"));
+    }
+
+    #[test]
+    fn parse_codex_local_usage_payload_extracts_quota_windows() {
+        let payload: Value = serde_json::json!({
+            "type": "token_count",
+            "rate_limits": {
+                "plan_type": "plus",
+                "primary": {
+                    "used_percent": 18.0,
+                    "resets_at": 1773706757i64
+                },
+                "secondary": {
+                    "used_percent": 68.0,
+                    "resets_at": 1773855809i64
+                }
+            }
+        });
+
+        let snapshot = parse_codex_local_usage_payload(&payload).unwrap();
+        assert_eq!(snapshot.provider, "openai");
+        assert_eq!(snapshot.account_label, "Codex Plus");
+        assert_eq!(snapshot.source, CONSUMER_LOCAL_SOURCE);
+        assert_eq!(snapshot.tokens_in, 18);
+        assert!((snapshot.spent_usd - 68.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.limit_usd, 100.0);
+        assert!(snapshot.primary_reset_at.is_some());
+        assert!(snapshot.secondary_reset_at.is_some());
+    }
+
+    #[test]
+    fn openai_consumer_usage_skips_null_rate_limits_entries() {
+        with_codex_consumer_override(
+            "skip_null_rate_limits",
+            r#"{"tokens":{"access_token":"present"}}"#,
+            &[
+                &serde_json::json!({
+                    "timestamp": "2026-03-17T15:21:39Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "rate_limits": {
+                            "limit_id": "codex",
+                            "plan_type": "plus",
+                            "primary": {
+                                "used_percent": 18.0,
+                                "resets_at": 1773706757i64
+                            },
+                            "secondary": {
+                                "used_percent": 68.0,
+                                "resets_at": 1773855809i64
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                &serde_json::json!({
+                    "timestamp": "2026-03-17T16:02:15Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 1
+                            }
+                        },
+                        "rate_limits": Value::Null
+                    }
+                })
+                .to_string(),
+            ],
+            || {
+                let snapshot = fetch_openai_consumer_usage().expect("snapshot missing");
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_SOURCE);
+                assert_eq!(snapshot.account_label, "Codex Plus");
+                assert_eq!(snapshot.tokens_in, 18);
+                assert!((snapshot.spent_usd - 68.0).abs() < f64::EPSILON);
+            },
+        );
+    }
+
+    #[test]
+    fn openai_consumer_usage_prefers_global_codex_limit_over_model_specific_limit() {
+        with_codex_consumer_override(
+            "prefer_global_limit",
+            r#"{"tokens":{"access_token":"present"}}"#,
+            &[
+                &serde_json::json!({
+                    "timestamp": "2026-03-17T15:21:42Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "rate_limits": {
+                            "limit_id": "codex",
+                            "plan_type": "plus",
+                            "primary": {
+                                "used_percent": 10.0,
+                                "resets_at": 1773762721i64
+                            },
+                            "secondary": {
+                                "used_percent": 86.0,
+                                "resets_at": 1773855809i64
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                &serde_json::json!({
+                    "timestamp": "2026-03-17T15:21:43Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "rate_limits": {
+                            "limit_id": "codex_bengalfox",
+                            "limit_name": "GPT-5.3-Codex-Spark",
+                            "primary": {
+                                "used_percent": 1.0,
+                                "resets_at": 1773762721i64
+                            },
+                            "secondary": {
+                                "used_percent": 3.0,
+                                "resets_at": 1773855809i64
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            ],
+            || {
+                let snapshot = fetch_openai_consumer_usage().expect("snapshot missing");
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_SOURCE);
+                assert_eq!(snapshot.tokens_in, 10);
+                assert!((snapshot.spent_usd - 86.0).abs() < f64::EPSILON);
+            },
+        );
+    }
+
+    #[test]
+    fn openai_consumer_usage_falls_back_to_status_snapshot_without_sessions() {
+        with_codex_consumer_override(
+            "status_only",
+            r#"{"tokens":{"access_token":"present"}}"#,
+            &[],
+            || {
+                let snapshot = fetch_openai_consumer_usage().unwrap();
+                assert_eq!(snapshot.provider, "openai");
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_STATUS_SOURCE);
+                assert_eq!(
+                    snapshot.status_code.as_deref(),
+                    Some("consumer_local_waiting_for_usage")
+                );
+            },
+        );
     }
 
     #[test]
@@ -4265,6 +5177,118 @@ mod tests {
                 assert_eq!(plan_type.as_deref(), Some("Pro"));
                 assert_eq!(session.subscription_type, "pro");
                 assert_eq!(session.rate_limit_tier, "default_claude_ai");
+            },
+        );
+    }
+
+    #[test]
+    fn anthropic_consumer_usage_uses_local_status_snapshot() {
+        with_claude_credentials_override(
+            "consumer_status",
+            r#"{
+                "claudeAiOauth": {
+                    "subscriptionType": "max",
+                    "rateLimitTier": "default_claude_ai"
+                }
+            }"#,
+            || {
+                let snapshot = fetch_anthropic_consumer_usage().unwrap();
+                assert_eq!(snapshot.provider, "anthropic");
+                assert_eq!(snapshot.account_label, "Claude Code Max");
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_STATUS_SOURCE);
+                assert_eq!(
+                    snapshot.status_code.as_deref(),
+                    Some("consumer_local_usage_pending")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn claude_consumer_usage_shows_pending_when_no_quota_available() {
+        with_claude_local_override(
+            "pending",
+            r#"{
+                "claudeAiOauth": {
+                    "subscriptionType": "pro",
+                    "rateLimitTier": "default_claude_ai"
+                }
+            }"#,
+            &[],
+            None,
+            0,
+            || {
+                let snapshot = fetch_anthropic_consumer_usage().unwrap();
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_STATUS_SOURCE);
+                assert_eq!(
+                    snapshot.status_code.as_deref(),
+                    Some("consumer_local_usage_pending")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn claude_consumer_usage_prefers_insights_quota_and_omits_week_window() {
+        let now = Utc::now();
+        let recent_week = now - Duration::days(1);
+        let insights_stdout = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed_warning",
+                "rateLimitType": "five_hour",
+                "utilization": 0.62,
+                "resetsAt": 1773709200i64
+            }
+        })
+        .to_string();
+
+        with_claude_local_override(
+            "insights_quota",
+            r#"{
+                "claudeAiOauth": {
+                    "subscriptionType": "pro",
+                    "rateLimitTier": "default_claude_ai"
+                }
+            }"#,
+            &[
+                &serde_json::json!({
+                    "timestamp": recent_week.to_rfc3339(),
+                    "message": {
+                        "id": "msg-2",
+                        "role": "assistant",
+                        "usage": {
+                            "input_tokens": 200,
+                            "cache_read_input_tokens": 30,
+                            "output_tokens": 11
+                        }
+                    }
+                })
+                .to_string(),
+            ],
+            Some(&insights_stdout),
+            1,
+            || {
+                let snapshot = fetch_anthropic_consumer_usage().unwrap();
+                assert_eq!(snapshot.provider, "anthropic");
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_SOURCE);
+                assert_eq!(
+                    snapshot.status_code.as_deref(),
+                    Some("consumer_local_quota")
+                );
+
+                let consumer_quota = snapshot
+                    .consumer_quota
+                    .clone()
+                    .expect("consumer quota missing");
+                let primary = consumer_quota.primary.expect("primary window missing");
+                assert_eq!(primary.used_percent, Some(62.0));
+                assert!(primary.reset_at.is_some());
+                assert!(consumer_quota.secondary.is_none());
+                assert!(snapshot.api_metrics.is_none());
+
+                let alerts = evaluate_alerts(&snapshot, Utc::now(), &AppConfig::default());
+                assert!(alerts.iter().all(|alert| !alert.code.starts_with("quota_week_")));
             },
         );
     }

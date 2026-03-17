@@ -1,5 +1,6 @@
 import type {
   ApiMetricWindow,
+  ConsumerQuotaWindow,
   MetricStatSpec,
   UsageCardSpec,
   UsageDisplayContext,
@@ -13,6 +14,53 @@ function clampRatio(value: number): number {
 
 function displayLabel(snapshot: UsageSnapshot, context: UsageDisplayContext): string {
   return snapshot.account_label?.trim() || context.providerLabel;
+}
+
+function quotaWindow(
+  snapshot: UsageSnapshot,
+  window: 'primary' | 'secondary',
+): ConsumerQuotaWindow | null {
+  return snapshot.consumer_quota?.[window] ?? null;
+}
+
+export function quotaUsedPercent(
+  snapshot: UsageSnapshot,
+  window: 'primary' | 'secondary',
+): number | null {
+  const quota = quotaWindow(snapshot, window);
+  if (quota) {
+    if (!quota.available) return null;
+    return quota.used_percent ?? null;
+  }
+
+  if (window === 'primary') {
+    return snapshot.tokens_in ?? null;
+  }
+
+  const hasLegacyWeekWindow = (snapshot.limit_usd ?? 0) > 0
+    || (snapshot.spent_usd ?? 0) > 0
+    || snapshot.secondary_reset_at != null;
+  return hasLegacyWeekWindow ? (snapshot.spent_usd ?? null) : null;
+}
+
+export function quotaResetAt(
+  snapshot: UsageSnapshot,
+  window: 'primary' | 'secondary',
+): string | null {
+  const quota = quotaWindow(snapshot, window);
+  if (quota) return quota.reset_at ?? null;
+  return window === 'primary'
+    ? (snapshot.primary_reset_at ?? null)
+    : (snapshot.secondary_reset_at ?? null);
+}
+
+export function quotaWindowAvailable(
+  snapshot: UsageSnapshot,
+  window: 'primary' | 'secondary',
+): boolean {
+  const quota = quotaWindow(snapshot, window);
+  if (quota) return quota.available && quota.used_percent != null;
+  return quotaUsedPercent(snapshot, window) != null;
 }
 
 function formatUsd(value: number): string {

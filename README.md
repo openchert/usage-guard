@@ -3,21 +3,21 @@
 </p>
 
 <h1 align="center">UsageGuard</h1>
-<p align="center">A local-first Windows widget and CLI for tracking AI spend, quotas, and subscription usage without dashboard noise.</p>
+<p align="center">A local-first desktop widget and CLI for tracking AI spend, quotas, and subscription usage without dashboard noise.</p>
 
-UsageGuard keeps provider usage visible in a small desktop widget instead of burying it across multiple dashboards. It runs locally on Windows and stores your credentials securely on your machine.
+UsageGuard keeps provider usage visible in a small desktop widget instead of burying it across multiple dashboards. It runs locally on Windows and Linux and stores your credentials securely on your machine.
 
 ## What It Does
-- Tracks ChatGPT and Claude subscription quotas plus OpenAI and Anthropic org/admin API usage in one widget
+- Tracks Codex consumer quotas, Claude Code local `5h` quota plus local activity, and OpenAI/Anthropic org/admin API usage in one widget
 - Shows compact cards with hover details for usage, spend, tokens, requests, reset times, and status
 - Sends native desktop notifications and shows in-widget alert badges for quota, budget, and inactivity issues
-- Supports browser sign-in for ChatGPT and Claude, plus multiple OpenAI and Anthropic monitoring accounts
-- Includes widget and tray controls for `Light Mode`, `Always on Top`, `Start with Windows`, `Hide to Tray`, `Refresh`, and show/hide
-- Stores API keys and refresh tokens securely on Windows and includes an optional CLI
+- Supports local consumer-app detection for Codex and Claude Code, plus multiple OpenAI and Anthropic monitoring accounts
+- Includes widget and tray controls for `Light Mode`, `Always on Top`, `Refresh`, show/hide, and `Start on Login`
+- Stores API keys securely through OS-native secret storage and includes an optional CLI
 
 ## Install
 ### Windows
-The installer downloads the latest Windows release from GitHub, extracts the binaries, adds them to your user `PATH`, creates a Start Menu shortcut so UsageGuard appears in Windows Search, enables `Start with Windows` on first install, and launches the widget.
+The installer downloads the latest Windows release from GitHub, extracts the binaries, adds them to your user `PATH`, creates a Start Menu shortcut so UsageGuard appears in Windows Search, enables `Start on Login` on first install, and launches the widget.
 
 Windows PowerShell:
 
@@ -44,11 +44,36 @@ Manual install:
 2. Extract the archive.
 3. Run `usageguard-desktop.exe` for the widget or `usageguard.exe` for the CLI.
 
-Manual ZIP installs do not add the Windows Search shortcut or the `Start with Windows` entry automatically.
+Manual ZIP installs do not add the Windows Search shortcut or the `Start on Login` entry automatically.
+
+### Linux
+UsageGuard publishes x86_64 Linux desktop builds on GitHub Releases as `.deb` and `.AppImage` assets.
+
+Debian / Ubuntu:
+
+1. Download the latest `UsageGuard_*_amd64.deb` release asset.
+2. Install it with `sudo apt install ./UsageGuard_*_amd64.deb`.
+3. Launch `UsageGuard` from your applications menu.
+
+Portable AppImage:
+
+1. Download the latest `UsageGuard_*.AppImage` release asset.
+2. Run `chmod +x UsageGuard_*.AppImage`.
+3. Launch it with `./UsageGuard_*.AppImage`.
+
+The first Linux release does not ship a one-line installer or package repository yet. Updates come from new GitHub release assets.
+
+## Linux Compatibility
+- `.deb` installs are the recommended Linux path. They provide launcher integration and are the most stable option for `Start on Login`.
+- `.AppImage` builds stay portable. If you enable `Start on Login`, the autostart entry points at the exact AppImage path you launched, so moving or replacing the file later requires turning the toggle off and on again.
+- Secure storage on Linux requires a running Secret Service provider such as GNOME Keyring or KWallet-backed Secret Service.
+- Native notifications use the desktop notification service exposed by your Linux desktop environment.
+- Tray support depends on the desktop environment. If no tray is available, UsageGuard keeps the main widget window visible so the app remains usable.
+- On Linux, `Start on Login` writes a managed XDG autostart entry at `${XDG_CONFIG_HOME:-~/.config}/autostart/com.usageguard.app.desktop`.
 
 ## Supported Connections
-- ChatGPT subscription usage through browser sign-in
-- Claude subscription usage through browser sign-in
+- Codex consumer usage through local Codex sign-in and session logs
+- Claude Code exact local `5h` quota through local Claude Code insights, plus local project activity details
 - OpenAI organization usage through an organization or admin monitoring key
 - Anthropic organization usage through an admin monitoring key
 
@@ -57,10 +82,11 @@ API-key monitoring accepts organization/admin keys only. Individual API keys are
 ## Alerts
 UsageGuard ships with native desktop notifications and an in-widget alert state for the most important quota conditions.
 
-- OAuth subscription sources watch both the `5h` and `week` windows
+- Local Codex consumer sources watch both the `5h` and `week` windows
 - Near-limit alerts fire at `90%` used for `5h` and `80%` used for `week`
 - Use-before-reset reminders fire when a reset is close and usage is still low
 - API/admin monitoring sources keep spend and inactivity alerts
+- Claude Code local detection shows exact `5h` quota from CLI insights and local `7d` token activity from project logs; weekly consumer quota percentage is not exposed through the local client
 
 See [`docs/ALERTS.md`](docs/ALERTS.md) for the full alert model and delivery behavior.
 
@@ -68,7 +94,7 @@ See [`docs/ALERTS.md`](docs/ALERTS.md) for the full alert model and delivery beh
 ### Desktop widget
 1. Launch `usageguard-desktop`.
 2. Open **Manage Providers...** from the `+` button, the widget right-click menu, or the tray menu.
-3. Connect ChatGPT or Claude, or add an OpenAI or Anthropic monitoring account with an API key.
+3. Sign in to Codex or Claude Code on this machine, or add an OpenAI or Anthropic monitoring account with an API key.
 4. Hover any provider card for details and keep the widget running for notifications and alert badges.
 
 ### Optional CLI
@@ -80,15 +106,16 @@ usageguard demo
 
 ## Updates
 - On Windows, update by running the same install command or script again. It always pulls the latest GitHub release and replaces the installed binaries.
-- Re-running the installer refreshes the Start Menu shortcut and preserves an existing disabled `Start with Windows` setting.
-- The desktop app now checks GitHub Releases in the background on startup and shows a native notification when a newer version is available.
+- On Linux, update by installing the newest `.deb` or replacing the `.AppImage` with the latest GitHub release asset.
+- Re-running the Windows installer refreshes the Start Menu shortcut and preserves an existing disabled `Start on Login` setting.
+- The desktop app checks GitHub Releases in the background on startup and shows a native notification when a newer version is available.
 
 ## Security
-On Windows, API keys and OAuth refresh tokens are stored in a DPAPI-encrypted file at `%APPDATA%\usage-guard\secrets.bin`. Access tokens stay in memory only and are refreshed when needed.
+On Windows, API keys and any legacy OAuth refresh tokens from older builds are stored in a DPAPI-encrypted file at `%APPDATA%\usage-guard\secrets.bin`. On Linux, they are stored in the desktop Secret Service keyring (for example GNOME Keyring or KWallet-backed Secret Service). The default consumer flow reads local Codex and Claude Code state instead of requesting a browser OAuth login.
 
 UsageGuard does not fall back to plaintext secret storage if secure storage is unavailable.
 
-See [`docs/SECURITY.md`](docs/SECURITY.md) for storage, OAuth, and threat-model details.
+See [`docs/SECURITY.md`](docs/SECURITY.md) for storage, local consumer imports, and threat-model details.
 See [`docs/ALERTS.md`](docs/ALERTS.md) for alert thresholds, native notifications, and widget badges.
 See [`docs/PROVIDERS.md`](docs/PROVIDERS.md) for the provider/source display model.
 
@@ -99,8 +126,11 @@ MIT. See [`LICENSE`](LICENSE).
 - If the install command succeeds but `usageguard` is not found, restart the terminal so `PATH` is reloaded.
 - If you use `curl.exe`, remember it only downloads `install.ps1`; you still need to run the second `powershell -File ...` command, or use the one-line CMD install command above.
 - If `irm` is unavailable, use `Invoke-RestMethod`, `Invoke-WebRequest`, `curl.exe`, or the manual ZIP install above.
-- If ChatGPT OAuth sign-in fails, make sure nothing else is using `localhost:1455`.
-- If Claude OAuth sign-in fails, make sure nothing else is using `localhost:45454`.
+- If the Codex card stays in local-status mode, run at least one Codex request so a fresh session log exists under `~/.codex/sessions`.
+- Claude Code currently exposes exact local `5h` quota, but not a reliable local weekly consumer quota percentage.
 - If an API card shows an admin-access status, verify the key has org usage access and that Anthropic uses an `sk-ant-admin...` key.
-- If the widget shows a provider load failure, verify the API key or reconnect the OAuth source.
+- If the widget shows a provider load failure, verify the API key or local client sign-in.
+- On Linux, if secure storage is unavailable, make sure a Secret Service provider such as GNOME Keyring or KWallet is running.
+- On Linux desktop environments that do not expose a tray icon, UsageGuard stays usable from the main widget window and provider settings window.
+- On Linux AppImage installs, re-enable `Start on Login` after moving or replacing the AppImage so the autostart path stays current.
 - If secure storage is unavailable, UsageGuard will not save credentials.

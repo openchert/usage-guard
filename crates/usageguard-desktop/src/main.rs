@@ -6,6 +6,7 @@ use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{
@@ -15,10 +16,11 @@ use tauri::{
 };
 use usageguard_core::{
     clamp_refresh_interval_secs, evaluate_alerts, has_provider_account_api_key, load_config,
-    provider_catalog, provider_snapshots, save_config, set_provider_account_api_key,
-    should_notify_alert, verify_anthropic_oauth_access_token, verify_openai_oauth_access_token,
-    verify_provider_api_key, Alert, AppConfig, ProviderAccount, ProviderCatalogEntry,
-    UsageSnapshot, MAX_REFRESH_INTERVAL_SECS, MIN_REFRESH_INTERVAL_SECS,
+    provider_catalog, provider_snapshots, save_config, secure_storage_status,
+    set_provider_account_api_key, should_notify_alert,
+    verify_anthropic_oauth_access_token, verify_openai_oauth_access_token, verify_provider_api_key,
+    Alert, AppConfig, ProviderAccount, ProviderCatalogEntry, SecureStorageStatus, UsageSnapshot,
+    MAX_REFRESH_INTERVAL_SECS, MIN_REFRESH_INTERVAL_SECS,
 };
 
 #[derive(Default)]
@@ -47,34 +49,44 @@ struct AppState {
     snapshots: Mutex<Vec<SnapshotView>>,
     manual_alerts: Mutex<HashMap<String, ManualAlert>>,
     refresh: Mutex<RefreshState>,
-    #[cfg(target_os = "windows")]
-    start_with_windows_enabled: Mutex<bool>,
-    #[cfg(target_os = "windows")]
-    tray_start_with_windows_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
+    tray_available: Mutex<bool>,
+    start_on_login_enabled: Mutex<bool>,
+    tray_start_on_login_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
 }
 
 const TRAY_TOGGLE_ID: &str = "tray.toggle";
 const TRAY_PROVIDERS_ID: &str = "tray.providers";
-const TRAY_START_WITH_WINDOWS_ID: &str = "tray.start_with_windows";
+const TRAY_START_ON_LOGIN_ID: &str = "tray.start_on_login";
 const TRAY_QUIT_ID: &str = "tray.quit";
 const CTX_REFRESH_ID: &str = "widget.refresh";
 const CTX_PROVIDERS_ID: &str = "widget.providers";
-const CTX_START_WITH_WINDOWS_ID: &str = "widget.start_with_windows";
+const CTX_START_ON_LOGIN_ID: &str = "widget.start_on_login";
 const CTX_ALWAYS_ON_TOP_ID: &str = "widget.always_on_top";
 const CTX_LIGHT_MODE_ID: &str = "widget.light_mode";
 const CTX_HIDE_ID: &str = "widget.hide";
 const CTX_QUIT_ID: &str = "widget.quit";
 const REFRESH_EVENT: &str = "usageguard://refresh";
 const SETTINGS_LABEL: &str = "settings";
-const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/openchert/usage-guard/releases/latest";
+const RELEASES_LATEST_URL: &str =
+    "https://api.github.com/repos/openchert/usage-guard/releases/latest";
 const RELEASE_CHECK_TITLE: &str = "UsageGuard update available";
 const TEST_ALERT_CODE: &str = "manual_test_alert";
 const TEST_ALERT_MESSAGE: &str = "Test alert: notifications and widget badges are working.";
 const TEST_ALERT_DURATION: Duration = Duration::from_secs(10);
+const START_ON_LOGIN_LABEL: &str = "Start on Login";
+const START_ON_LOGIN_FAILURE_MESSAGE: &str = "Could not update Start on Login.";
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_VALUE_NAME: &str = "UsageGuard";
+#[cfg(target_os = "linux")]
+const LINUX_AUTOSTART_FILE_NAME: &str = "com.usageguard.app.desktop";
+#[cfg(target_os = "linux")]
+const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
+const DEFAULT_WIDGET_WIDTH: f64 = 244.0;
+const DEFAULT_WIDGET_HEIGHT: f64 = 100.0;
+const DEFAULT_WIDGET_MARGIN_RIGHT: f64 = 30.0;
+const DEFAULT_WIDGET_MARGIN_BOTTOM: f64 = 14.0;
 
 #[derive(Debug, Clone, Serialize)]
 struct ProviderAccountView {
@@ -89,6 +101,7 @@ struct ProviderAccountView {
 struct ProviderSettingsPayload {
     providers: Vec<ProviderCatalogEntry>,
     accounts: Vec<ProviderAccountView>,
+    secure_storage: SecureStorageStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,7 +371,40 @@ fn provider_settings_payload(cfg: &AppConfig) -> ProviderSettingsPayload {
     ProviderSettingsPayload {
         providers,
         accounts,
+        secure_storage: secure_storage_status(),
     }
+}
+
+fn secure_storage_unavailable_message(status: &SecureStorageStatus) -> String {
+    status.detail.clone().unwrap_or_else(|| {
+        format!(
+            "Secure storage backend '{}' is unavailable.",
+            status.backend
+        )
+    })
+}
+
+fn require_secure_storage_available() -> Result<(), String> {
+    let status = secure_storage_status();
+    if status.available {
+        Ok(())
+    } else {
+        Err(secure_storage_unavailable_message(&status))
+    }
+}
+
+fn tray_available(app: &AppHandle) -> bool {
+    *app.state::<AppState>()
+        .tray_available
+        .lock()
+        .expect("AppState tray_available lock poisoned")
+}
+
+fn set_tray_available(app: &AppHandle, available: bool) {
+    *app.state::<AppState>()
+        .tray_available
+        .lock()
+        .expect("AppState tray_available lock poisoned") = available;
 }
 
 fn emit_widget_refresh(app: &AppHandle) {
@@ -419,7 +465,10 @@ fn refresh_notified_alert_signatures(state: &AppState) {
         .retain(|signature| active_signatures.contains(signature));
 }
 
-fn find_snapshot_for_test_alert(state: &AppState, target: &TestAlertInput) -> Option<UsageSnapshot> {
+fn find_snapshot_for_test_alert(
+    state: &AppState,
+    target: &TestAlertInput,
+) -> Option<UsageSnapshot> {
     state
         .snapshots
         .lock()
@@ -591,6 +640,91 @@ fn spawn_snapshot_refresh(app: AppHandle) {
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LogicalWorkArea {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+fn logical_work_area(monitor: &tauri::Monitor) -> LogicalWorkArea {
+    let scale = monitor.scale_factor();
+    let work_area = monitor.work_area();
+    let left = work_area.position.x as f64 / scale;
+    let top = work_area.position.y as f64 / scale;
+    let width = work_area.size.width as f64 / scale;
+    let height = work_area.size.height as f64 / scale;
+
+    LogicalWorkArea {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
+}
+
+fn work_area_contains_point(area: LogicalWorkArea, x: f64, y: f64) -> bool {
+    x >= area.left && x <= area.right && y >= area.top && y <= area.bottom
+}
+
+fn clamp_widget_origin_to_area(area: LogicalWorkArea, x: f64, y: f64) -> (f64, f64) {
+    let max_x = (area.right - DEFAULT_WIDGET_WIDTH).max(area.left);
+    let max_y = (area.bottom - DEFAULT_WIDGET_HEIGHT).max(area.top);
+
+    (x.clamp(area.left, max_x), y.clamp(area.top, max_y))
+}
+
+fn default_widget_origin_for_area(area: LogicalWorkArea) -> (f64, f64) {
+    clamp_widget_origin_to_area(
+        area,
+        area.right - DEFAULT_WIDGET_WIDTH - DEFAULT_WIDGET_MARGIN_RIGHT,
+        area.bottom - DEFAULT_WIDGET_HEIGHT - DEFAULT_WIDGET_MARGIN_BOTTOM,
+    )
+}
+
+fn preferred_widget_work_area(win: &WebviewWindow) -> Option<LogicalWorkArea> {
+    win.current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| win.primary_monitor().ok().flatten())
+        .or_else(|| {
+            win.available_monitors()
+                .ok()
+                .and_then(|monitors| monitors.into_iter().next())
+        })
+        .map(|monitor| logical_work_area(&monitor))
+}
+
+fn restored_widget_origin(
+    win: &WebviewWindow,
+    saved_position: Option<[f64; 2]>,
+) -> Option<(f64, f64)> {
+    if let Some([right, bottom]) = saved_position {
+        if let Ok(monitors) = win.available_monitors() {
+            if let Some(area) = monitors
+                .into_iter()
+                .map(|monitor| logical_work_area(&monitor))
+                .find(|area| work_area_contains_point(*area, right, bottom))
+            {
+                return Some(clamp_widget_origin_to_area(
+                    area,
+                    right - DEFAULT_WIDGET_WIDTH,
+                    bottom - DEFAULT_WIDGET_HEIGHT,
+                ));
+            }
+        }
+    }
+
+    preferred_widget_work_area(win).map(default_widget_origin_for_area)
+}
+
+fn restore_widget_position(win: &WebviewWindow, saved_position: Option<[f64; 2]>) {
+    if let Some((x, y)) = restored_widget_origin(win, saved_position) {
+        let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+    }
+}
+
 fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = win.set_always_on_top(true);
@@ -695,6 +829,7 @@ fn save_provider_account(
     app: AppHandle,
 ) -> Result<ProviderSettingsPayload, String> {
     require_window_label(&window, SETTINGS_LABEL, "save_provider_account")?;
+    require_secure_storage_available()?;
     // Clone out because apply_provider_account_save may perform HTTP validation,
     // and we must not hold the mutex across network I/O.
     let mut cfg = state
@@ -730,6 +865,7 @@ fn delete_provider_account(
     app: AppHandle,
 ) -> Result<ProviderSettingsPayload, String> {
     require_window_label(&window, SETTINGS_LABEL, "delete_provider_account")?;
+    require_secure_storage_available()?;
     let cfg = {
         let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
         let before = guard.provider_accounts.len();
@@ -800,16 +936,7 @@ fn flush_context_menu(window: &WebviewWindow) {
 mod win32 {
     pub const SWP_NOACTIVATE: u32 = 0x0010;
     pub const SWP_NOZORDER: u32 = 0x0004;
-    pub const SPI_GETWORKAREA: u32 = 0x0030;
     pub const WM_NULL: u32 = 0x0000;
-
-    #[repr(C)]
-    pub struct Rect {
-        pub left: i32,
-        pub top: i32,
-        pub right: i32,
-        pub bottom: i32,
-    }
 
     #[link(name = "user32")]
     extern "system" {
@@ -821,15 +948,6 @@ mod win32 {
             cx: i32,
             cy: i32,
             flags: u32,
-        ) -> i32;
-
-        /// Retrieves system-wide parameters. Used here with SPI_GETWORKAREA to get
-        /// the usable desktop area, which excludes the taskbar.
-        pub fn SystemParametersInfoW(
-            ui_action: u32,
-            ui_param: u32,
-            pv_param: *mut std::ffi::c_void,
-            f_win_ini: u32,
         ) -> i32;
 
         pub fn PostMessageW(hwnd: isize, msg: u32, w_param: usize, l_param: isize) -> i32;
@@ -969,6 +1087,25 @@ struct LatestReleaseResponse {
     tag_name: String,
 }
 
+#[cfg(target_os = "windows")]
+fn release_update_message(latest_tag: &str) -> String {
+    format!(
+        "{latest_tag} is available. Re-run the installer or download the latest release to update."
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn release_update_message(latest_tag: &str) -> String {
+    format!(
+        "{latest_tag} is available. Download the latest .deb or .AppImage from GitHub Releases to update."
+    )
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn release_update_message(latest_tag: &str) -> String {
+    format!("{latest_tag} is available. Download the latest release to update.")
+}
+
 fn spawn_release_check(app: AppHandle) {
     if cfg!(debug_assertions) {
         return;
@@ -1002,10 +1139,7 @@ fn spawn_release_check(app: AppHandle) {
         };
 
         if should_notify {
-            emit_native_notification(
-                RELEASE_CHECK_TITLE,
-                &format!("{latest_tag} is available. Re-run the installer or download the latest release to update."),
-            );
+            emit_native_notification(RELEASE_CHECK_TITLE, &release_update_message(&latest_tag));
         }
     });
 }
@@ -1068,10 +1202,21 @@ fn create_tray_icon() -> tauri::image::Image<'static> {
     tauri::image::Image::new(data, size, size)
 }
 
-#[cfg(target_os = "windows")]
-fn windows_startup_command() -> Result<String, String> {
+fn current_executable_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("failed to resolve current executable: {error}"))?;
+    if exe.is_absolute() {
+        Ok(exe)
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("failed to resolve current directory: {error}"))?;
+        Ok(cwd.join(exe))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_start_on_login_command() -> Result<String, String> {
+    let exe = current_executable_path()?;
     Ok(format!("\"{}\"", exe.display()))
 }
 
@@ -1099,55 +1244,88 @@ fn reg_command_error(output: &std::process::Output) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn is_start_with_windows_enabled() -> bool {
+fn is_start_on_login_enabled() -> bool {
     run_reg_command(&["query", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE_NAME])
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
-#[cfg(not(target_os = "windows"))]
-fn is_start_with_windows_enabled() -> bool {
+#[cfg(target_os = "linux")]
+fn linux_autostart_dir() -> Result<PathBuf, String> {
+    if let Some(config_home) =
+        std::env::var_os(XDG_CONFIG_HOME_ENV).filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(config_home).join("autostart"));
+    }
+
+    let home =
+        dirs::home_dir().ok_or_else(|| "failed to resolve HOME for autostart".to_string())?;
+    Ok(home.join(".config").join("autostart"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_path() -> Result<PathBuf, String> {
+    Ok(linux_autostart_dir()?.join(LINUX_AUTOSTART_FILE_NAME))
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_exec_value(path: &std::path::Path) -> String {
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_file_contents() -> Result<String, String> {
+    let exe = current_executable_path()?;
+    Ok(format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=UsageGuard\nExec={}\nTerminal=false\n",
+        desktop_exec_value(&exe)
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn is_start_on_login_enabled() -> bool {
+    linux_autostart_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn is_start_on_login_enabled() -> bool {
     false
 }
 
-#[cfg(target_os = "windows")]
-fn cached_start_with_windows_enabled(app: &AppHandle) -> bool {
+fn cached_start_on_login_enabled(app: &AppHandle) -> bool {
     *app.state::<AppState>()
-        .start_with_windows_enabled
+        .start_on_login_enabled
         .lock()
-        .expect("AppState start_with_windows_enabled lock poisoned")
+        .expect("AppState start_on_login_enabled lock poisoned")
 }
 
-#[cfg(not(target_os = "windows"))]
-fn cached_start_with_windows_enabled(_app: &AppHandle) -> bool {
-    false
-}
-
-#[cfg(target_os = "windows")]
-fn set_cached_start_with_windows_enabled(app: &AppHandle, enabled: bool) {
+fn set_cached_start_on_login_enabled(app: &AppHandle, enabled: bool) {
     *app.state::<AppState>()
-        .start_with_windows_enabled
+        .start_on_login_enabled
         .lock()
-        .expect("AppState start_with_windows_enabled lock poisoned") = enabled;
+        .expect("AppState start_on_login_enabled lock poisoned") = enabled;
 
     if let Some(item) = app
         .state::<AppState>()
-        .tray_start_with_windows_item
+        .tray_start_on_login_item
         .lock()
-        .expect("AppState tray_start_with_windows_item lock poisoned")
+        .expect("AppState tray_start_on_login_item lock poisoned")
         .as_ref()
     {
         let _ = item.set_checked(enabled);
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn set_cached_start_with_windows_enabled(_app: &AppHandle, _enabled: bool) {}
-
 #[cfg(target_os = "windows")]
-fn set_start_with_windows_enabled(enabled: bool) -> Result<(), String> {
+fn set_start_on_login_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
-        let startup_command = windows_startup_command()?;
+        let startup_command = windows_start_on_login_command()?;
         let output = run_reg_command(&[
             "add",
             WINDOWS_RUN_KEY,
@@ -1166,12 +1344,17 @@ fn set_start_with_windows_enabled(enabled: bool) -> Result<(), String> {
             Err(reg_command_error(&output))
         }
     } else {
-        if !is_start_with_windows_enabled() {
+        if !is_start_on_login_enabled() {
             return Ok(());
         }
 
-        let output =
-            run_reg_command(&["delete", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE_NAME, "/f"])?;
+        let output = run_reg_command(&[
+            "delete",
+            WINDOWS_RUN_KEY,
+            "/v",
+            WINDOWS_RUN_VALUE_NAME,
+            "/f",
+        ])?;
         if output.status.success() {
             Ok(())
         } else {
@@ -1180,8 +1363,26 @@ fn set_start_with_windows_enabled(enabled: bool) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn set_start_with_windows_enabled(_enabled: bool) -> Result<(), String> {
+#[cfg(target_os = "linux")]
+fn set_start_on_login_enabled(enabled: bool) -> Result<(), String> {
+    let path = linux_autostart_path()?;
+    if enabled {
+        let dir = path
+            .parent()
+            .ok_or_else(|| "failed to resolve autostart directory".to_string())?;
+        std::fs::create_dir_all(dir)
+            .map_err(|error| format!("failed to create Linux autostart directory: {error}"))?;
+        std::fs::write(&path, linux_autostart_file_contents()?)
+            .map_err(|error| format!("failed to write Linux autostart file: {error}"))?;
+    } else if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("failed to remove Linux autostart file: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn set_start_on_login_enabled(_enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
@@ -1200,11 +1401,11 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
 
     #[cfg(target_os = "windows")]
     {
-        let startup_enabled = cached_start_with_windows_enabled(&app);
+        let startup_enabled = cached_start_on_login_enabled(&app);
         let startup_toggle = CheckMenuItem::with_id(
             app,
-            CTX_START_WITH_WINDOWS_ID,
-            "Start with Windows",
+            CTX_START_ON_LOGIN_ID,
+            START_ON_LOGIN_LABEL,
             true,
             startup_enabled,
             None::<&str>,
@@ -1247,42 +1448,164 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
         )
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
-        Menu::with_items(
+        let startup_enabled = cached_start_on_login_enabled(&app);
+        let startup_toggle = CheckMenuItem::with_id(
             app,
-            &[
-                &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
-                &first_sep,
-                &MenuItem::with_id(
-                    app,
-                    CTX_PROVIDERS_ID,
-                    "Manage Providers...",
-                    true,
-                    None::<&str>,
-                )?,
-                &second_sep,
-                &CheckMenuItem::with_id(
-                    app,
-                    CTX_ALWAYS_ON_TOP_ID,
-                    "Always on Top",
-                    true,
-                    always_on_top,
-                    None::<&str>,
-                )?,
-                &CheckMenuItem::with_id(
-                    app,
-                    CTX_LIGHT_MODE_ID,
-                    "Light Mode",
-                    true,
-                    light_mode,
-                    None::<&str>,
-                )?,
-                &MenuItem::with_id(app, CTX_HIDE_ID, "Hide to Tray", true, None::<&str>)?,
-                &third_sep,
-                &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
-            ],
-        )
+            CTX_START_ON_LOGIN_ID,
+            START_ON_LOGIN_LABEL,
+            true,
+            startup_enabled,
+            None::<&str>,
+        )?;
+
+        if tray_available(&app) {
+            Menu::with_items(
+                app,
+                &[
+                    &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
+                    &first_sep,
+                    &MenuItem::with_id(
+                        app,
+                        CTX_PROVIDERS_ID,
+                        "Manage Providers...",
+                        true,
+                        None::<&str>,
+                    )?,
+                    &second_sep,
+                    &startup_toggle,
+                    &CheckMenuItem::with_id(
+                        app,
+                        CTX_ALWAYS_ON_TOP_ID,
+                        "Always on Top",
+                        true,
+                        always_on_top,
+                        None::<&str>,
+                    )?,
+                    &CheckMenuItem::with_id(
+                        app,
+                        CTX_LIGHT_MODE_ID,
+                        "Light Mode",
+                        true,
+                        light_mode,
+                        None::<&str>,
+                    )?,
+                    &MenuItem::with_id(app, CTX_HIDE_ID, "Hide to Tray", true, None::<&str>)?,
+                    &third_sep,
+                    &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
+                ],
+            )
+        } else {
+            Menu::with_items(
+                app,
+                &[
+                    &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
+                    &first_sep,
+                    &MenuItem::with_id(
+                        app,
+                        CTX_PROVIDERS_ID,
+                        "Manage Providers...",
+                        true,
+                        None::<&str>,
+                    )?,
+                    &second_sep,
+                    &startup_toggle,
+                    &CheckMenuItem::with_id(
+                        app,
+                        CTX_ALWAYS_ON_TOP_ID,
+                        "Always on Top",
+                        true,
+                        always_on_top,
+                        None::<&str>,
+                    )?,
+                    &CheckMenuItem::with_id(
+                        app,
+                        CTX_LIGHT_MODE_ID,
+                        "Light Mode",
+                        true,
+                        light_mode,
+                        None::<&str>,
+                    )?,
+                    &third_sep,
+                    &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
+                ],
+            )
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        if tray_available(&app) {
+            Menu::with_items(
+                app,
+                &[
+                    &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
+                    &first_sep,
+                    &MenuItem::with_id(
+                        app,
+                        CTX_PROVIDERS_ID,
+                        "Manage Providers...",
+                        true,
+                        None::<&str>,
+                    )?,
+                    &second_sep,
+                    &CheckMenuItem::with_id(
+                        app,
+                        CTX_ALWAYS_ON_TOP_ID,
+                        "Always on Top",
+                        true,
+                        always_on_top,
+                        None::<&str>,
+                    )?,
+                    &CheckMenuItem::with_id(
+                        app,
+                        CTX_LIGHT_MODE_ID,
+                        "Light Mode",
+                        true,
+                        light_mode,
+                        None::<&str>,
+                    )?,
+                    &MenuItem::with_id(app, CTX_HIDE_ID, "Hide to Tray", true, None::<&str>)?,
+                    &third_sep,
+                    &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
+                ],
+            )
+        } else {
+            Menu::with_items(
+                app,
+                &[
+                    &MenuItem::with_id(app, CTX_REFRESH_ID, "Refresh", true, None::<&str>)?,
+                    &first_sep,
+                    &MenuItem::with_id(
+                        app,
+                        CTX_PROVIDERS_ID,
+                        "Manage Providers...",
+                        true,
+                        None::<&str>,
+                    )?,
+                    &second_sep,
+                    &CheckMenuItem::with_id(
+                        app,
+                        CTX_ALWAYS_ON_TOP_ID,
+                        "Always on Top",
+                        true,
+                        always_on_top,
+                        None::<&str>,
+                    )?,
+                    &CheckMenuItem::with_id(
+                        app,
+                        CTX_LIGHT_MODE_ID,
+                        "Light Mode",
+                        true,
+                        light_mode,
+                        None::<&str>,
+                    )?,
+                    &third_sep,
+                    &MenuItem::with_id(app, CTX_QUIT_ID, "Quit", true, None::<&str>)?,
+                ],
+            )
+        }
     }
 }
 
@@ -1293,19 +1616,19 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     #[cfg(target_os = "windows")]
     {
         let third_sep = PredefinedMenuItem::separator(app)?;
-        let startup_enabled = cached_start_with_windows_enabled(app);
+        let startup_enabled = cached_start_on_login_enabled(app);
         let startup_toggle = CheckMenuItem::with_id(
             app,
-            TRAY_START_WITH_WINDOWS_ID,
-            "Start with Windows",
+            TRAY_START_ON_LOGIN_ID,
+            START_ON_LOGIN_LABEL,
             true,
             startup_enabled,
             None::<&str>,
         )?;
         *app.state::<AppState>()
-            .tray_start_with_windows_item
+            .tray_start_on_login_item
             .lock()
-            .expect("AppState tray_start_with_windows_item lock poisoned") =
+            .expect("AppState tray_start_on_login_item lock poisoned") =
             Some(startup_toggle.clone());
 
         Menu::with_items(
@@ -1328,7 +1651,45 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         )
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let third_sep = PredefinedMenuItem::separator(app)?;
+        let startup_enabled = cached_start_on_login_enabled(app);
+        let startup_toggle = CheckMenuItem::with_id(
+            app,
+            TRAY_START_ON_LOGIN_ID,
+            START_ON_LOGIN_LABEL,
+            true,
+            startup_enabled,
+            None::<&str>,
+        )?;
+        *app.state::<AppState>()
+            .tray_start_on_login_item
+            .lock()
+            .expect("AppState tray_start_on_login_item lock poisoned") =
+            Some(startup_toggle.clone());
+
+        Menu::with_items(
+            app,
+            &[
+                &MenuItem::with_id(app, TRAY_TOGGLE_ID, "Show / Hide", true, None::<&str>)?,
+                &first_sep,
+                &MenuItem::with_id(
+                    app,
+                    TRAY_PROVIDERS_ID,
+                    "Manage Providers...",
+                    true,
+                    None::<&str>,
+                )?,
+                &second_sep,
+                &startup_toggle,
+                &third_sep,
+                &MenuItem::with_id(app, TRAY_QUIT_ID, "Quit UsageGuard", true, None::<&str>)?,
+            ],
+        )
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         Menu::with_items(
             app,
@@ -1360,21 +1721,70 @@ fn toggle_window(app: &AppHandle) {
     }
 }
 
+fn build_tray(app: &mut tauri::App<tauri::Wry>) -> tauri::Result<()> {
+    let menu = create_tray_menu(&app.handle())?;
+
+    TrayIconBuilder::new()
+        .icon(create_tray_icon())
+        .tooltip("UsageGuard")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn setup_tray(app: &mut tauri::App<tauri::Wry>) -> tauri::Result<bool> {
+    match build_tray(app) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            eprintln!("failed to create tray icon; continuing without tray: {error}");
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn setup_tray(app: &mut tauri::App<tauri::Wry>) -> tauri::Result<bool> {
+    build_tray(app)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn show_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         TRAY_TOGGLE_ID => toggle_window(app),
         TRAY_PROVIDERS_ID | CTX_PROVIDERS_ID => spawn_open_provider_settings(app.clone()),
-        TRAY_START_WITH_WINDOWS_ID | CTX_START_WITH_WINDOWS_ID => {
-            let enabled = !cached_start_with_windows_enabled(app);
-            if let Err(error) = set_start_with_windows_enabled(enabled) {
-                eprintln!("failed to update Start with Windows: {error}");
-                emit_native_notification("UsageGuard", "Could not update Start with Windows.");
+        TRAY_START_ON_LOGIN_ID | CTX_START_ON_LOGIN_ID => {
+            let enabled = !cached_start_on_login_enabled(app);
+            if let Err(error) = set_start_on_login_enabled(enabled) {
+                eprintln!("failed to update {START_ON_LOGIN_LABEL}: {error}");
+                emit_native_notification("UsageGuard", START_ON_LOGIN_FAILURE_MESSAGE);
             } else {
-                set_cached_start_with_windows_enabled(app, enabled);
+                set_cached_start_on_login_enabled(app, enabled);
             }
         }
         TRAY_QUIT_ID | CTX_QUIT_ID => save_position_and_exit(app),
         CTX_REFRESH_ID => {
+            usageguard_core::invalidate_claude_local_insights_cache();
             spawn_snapshot_refresh(app.clone());
         }
         CTX_ALWAYS_ON_TOP_ID => {
@@ -1397,8 +1807,10 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             }
         }
         CTX_HIDE_ID => {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.hide();
+            if tray_available(app) {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.hide();
+                }
             }
         }
         _ => {}
@@ -1407,12 +1819,14 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 
 // --- OAuth PKCE helpers ---
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum OAuthTokenEncoding {
     Form,
     Json,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct OAuthProviderConfig {
     client_id: &'static str,
@@ -1427,13 +1841,16 @@ struct OAuthProviderConfig {
     auth_extra_params: &'static [(&'static str, &'static str)],
 }
 
+#[allow(dead_code)]
 const OPENAI_OAUTH_AUTH_EXTRA_PARAMS: [(&str, &str); 2] = [
     ("id_token_add_organizations", "true"),
     ("codex_cli_simplified_flow", "true"),
 ];
 
+#[allow(dead_code)]
 const ANTHROPIC_OAUTH_AUTH_EXTRA_PARAMS: [(&str, &str); 0] = [];
 
+#[allow(dead_code)]
 const OPENAI_OAUTH_PROVIDER: OAuthProviderConfig = OAuthProviderConfig {
     client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
     authorize_url: "https://auth.openai.com/oauth/authorize",
@@ -1447,6 +1864,7 @@ const OPENAI_OAUTH_PROVIDER: OAuthProviderConfig = OAuthProviderConfig {
     auth_extra_params: &OPENAI_OAUTH_AUTH_EXTRA_PARAMS,
 };
 
+#[allow(dead_code)]
 const ANTHROPIC_OAUTH_PROVIDER: OAuthProviderConfig = OAuthProviderConfig {
     client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
     authorize_url: "https://claude.ai/oauth/authorize",
@@ -1460,6 +1878,7 @@ const ANTHROPIC_OAUTH_PROVIDER: OAuthProviderConfig = OAuthProviderConfig {
     auth_extra_params: &ANTHROPIC_OAUTH_AUTH_EXTRA_PARAMS,
 };
 
+#[allow(dead_code)]
 fn pkce_verifier() -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use rand::RngCore;
@@ -1468,6 +1887,7 @@ fn pkce_verifier() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+#[allow(dead_code)]
 fn pkce_challenge(verifier: &str) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use sha2::{Digest, Sha256};
@@ -1475,6 +1895,7 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(hash)
 }
 
+#[allow(dead_code)]
 fn oauth_redirect_uri(provider: OAuthProviderConfig) -> String {
     format!(
         "http://{}:{}{}",
@@ -1482,6 +1903,7 @@ fn oauth_redirect_uri(provider: OAuthProviderConfig) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn bind_oauth_listener(
     provider: OAuthProviderConfig,
 ) -> Result<(std::net::TcpListener, String), String> {
@@ -1498,6 +1920,7 @@ fn bind_oauth_listener(
     Ok((listener, oauth_redirect_uri(provider)))
 }
 
+#[allow(dead_code)]
 fn oauth_callback_body(message: &str) -> String {
     format!("<html><body><h2>{message}</h2></body></html>")
 }
@@ -1535,6 +1958,7 @@ fn parse_callback_code(
 }
 
 /// Blocks until the browser hits the local callback, or 5 minutes elapse.
+#[allow(dead_code)]
 fn wait_for_callback(
     listener: std::net::TcpListener,
     callback_path: String,
@@ -1592,6 +2016,7 @@ fn wait_for_callback(
     }
 }
 
+#[allow(dead_code)]
 fn oauth_response_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         value
@@ -1601,6 +2026,7 @@ fn oauth_response_string(value: &serde_json::Value, keys: &[&str]) -> Option<Str
     })
 }
 
+#[allow(dead_code)]
 fn oauth_tokens_from_response(
     response: &serde_json::Value,
 ) -> Result<(String, String, chrono::DateTime<chrono::Utc>), String> {
@@ -1615,6 +2041,7 @@ fn oauth_tokens_from_response(
 }
 
 /// Exchanges the auth code for access + refresh tokens.
+#[allow(dead_code)]
 fn exchange_code(
     provider: OAuthProviderConfig,
     code: &str,
@@ -1665,6 +2092,7 @@ fn exchange_code(
         .map_err(|e| e.to_string())
 }
 
+#[allow(dead_code)]
 async fn authorize_with_oauth(
     provider: OAuthProviderConfig,
 ) -> Result<
@@ -1725,9 +2153,11 @@ async fn authorize_with_oauth(
     Ok((response, access, refresh, expires_at))
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 async fn connect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<String, String> {
     require_window_label(&window, SETTINGS_LABEL, "connect_openai_oauth")?;
+    require_secure_storage_available()?;
     let (_, access, refresh, expires_at) = authorize_with_oauth(OPENAI_OAUTH_PROVIDER).await?;
     let verified = {
         let access = access.clone();
@@ -1750,9 +2180,11 @@ async fn connect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<S
     Ok(verified.plan_type)
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Result<String, String> {
     require_window_label(&window, SETTINGS_LABEL, "connect_anthropic_oauth")?;
+    require_secure_storage_available()?;
     let (response, access, refresh, expires_at) =
         authorize_with_oauth(ANTHROPIC_OAUTH_PROVIDER).await?;
 
@@ -1794,36 +2226,48 @@ async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Resul
     Ok(verified.plan_type)
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 fn disconnect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "disconnect_openai_oauth")?;
+    require_secure_storage_available()?;
     usageguard_core::clear_openai_oauth_tokens();
     spawn_snapshot_refresh(app);
     Ok(())
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 fn disconnect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "disconnect_anthropic_oauth")?;
+    require_secure_storage_available()?;
     usageguard_core::clear_anthropic_oauth_tokens();
     spawn_snapshot_refresh(app);
     Ok(())
 }
 
 #[derive(Serialize)]
-struct OAuthStatus {
+struct ConsumerStatus {
     connected: bool,
     plan_type: Option<String>,
     label: Option<String>,
     alerts_5h_enabled: bool,
     alerts_week_enabled: bool,
+    supports_usage: bool,
+    supports_5h_usage: bool,
+    supports_week_usage: bool,
+    source_label: String,
+    status_message: Option<String>,
 }
 
 #[tauri::command]
-fn get_openai_oauth_status(state: State<AppState>) -> OAuthStatus {
-    let connected = usageguard_core::has_openai_oauth_session();
+fn get_openai_consumer_status(state: State<AppState>) -> ConsumerStatus {
+    let connected = usageguard_core::has_openai_consumer_source();
+    let supports_usage = usageguard_core::has_openai_consumer_usage();
+    let supports_5h_usage = supports_usage;
+    let supports_week_usage = supports_usage;
     let plan_type = if connected {
-        usageguard_core::get_openai_oauth_plan_type().filter(|s| !s.is_empty())
+        usageguard_core::get_openai_consumer_plan_type().filter(|s| !s.is_empty())
     } else {
         None
     };
@@ -1832,20 +2276,34 @@ fn get_openai_oauth_status(state: State<AppState>) -> OAuthStatus {
         .lock()
         .expect("AppState cfg lock poisoned")
         .clone();
-    OAuthStatus {
+    ConsumerStatus {
         connected,
         plan_type,
         label: cfg.openai_oauth_label,
         alerts_5h_enabled: cfg.openai_oauth_5h_alerts_enabled,
         alerts_week_enabled: cfg.openai_oauth_week_alerts_enabled,
+        supports_usage,
+        supports_5h_usage,
+        supports_week_usage,
+        source_label: "Codex local client".to_string(),
+        status_message: if connected && !supports_usage {
+            Some("Signed in locally. Usage appears after your next Codex request.".to_string())
+        } else if connected {
+            None
+        } else {
+            Some("Sign in to Codex on this machine to enable local usage import.".to_string())
+        },
     }
 }
 
 #[tauri::command]
-fn get_anthropic_oauth_status(state: State<AppState>) -> OAuthStatus {
-    let connected = usageguard_core::has_anthropic_oauth_session();
+fn get_anthropic_consumer_status(state: State<AppState>) -> ConsumerStatus {
+    let connected = usageguard_core::has_anthropic_consumer_source();
+    let supports_5h_usage = usageguard_core::has_anthropic_consumer_5h_usage();
+    let supports_week_usage = usageguard_core::has_anthropic_consumer_week_usage();
+    let supports_usage = supports_5h_usage || supports_week_usage;
     let plan_type = if connected {
-        usageguard_core::get_anthropic_oauth_plan_type().filter(|s| !s.is_empty())
+        usageguard_core::get_anthropic_consumer_plan_type().filter(|s| !s.is_empty())
     } else {
         None
     };
@@ -1854,24 +2312,41 @@ fn get_anthropic_oauth_status(state: State<AppState>) -> OAuthStatus {
         .lock()
         .expect("AppState cfg lock poisoned")
         .clone();
-    OAuthStatus {
+    ConsumerStatus {
         connected,
         plan_type,
         label: cfg.anthropic_oauth_label,
         alerts_5h_enabled: cfg.anthropic_oauth_5h_alerts_enabled,
         alerts_week_enabled: cfg.anthropic_oauth_week_alerts_enabled,
+        supports_usage,
+        supports_5h_usage,
+        supports_week_usage,
+        source_label: "Claude Code local client".to_string(),
+        status_message: if connected && supports_5h_usage {
+            Some(
+                "Showing exact Claude Code 5h quota from local CLI insights. Weekly quota percentage is not exposed by the local client."
+                    .to_string(),
+            )
+        } else if connected {
+            Some(
+                "Claude Code local sign-in detected. Exact 5h quota is currently unavailable, and weekly quota percentage is not exposed by the local client."
+                    .to_string(),
+            )
+        } else {
+            Some("Sign in to Claude Code on this machine to enable local detection.".to_string())
+        },
     }
 }
 
 #[tauri::command]
-fn set_oauth_label(
+fn set_consumer_label(
     window: WebviewWindow,
     provider: String,
     label: String,
     state: State<AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    require_window_label(&window, SETTINGS_LABEL, "set_oauth_label")?;
+    require_window_label(&window, SETTINGS_LABEL, "set_consumer_label")?;
     let trimmed = label.trim().to_string();
     let label_opt = if trimmed.is_empty() {
         None
@@ -1882,7 +2357,7 @@ fn set_oauth_label(
     match provider.as_str() {
         "openai" => guard.openai_oauth_label = label_opt,
         "anthropic" => guard.anthropic_oauth_label = label_opt,
-        _ => return Err(format!("Unknown OAuth provider: {provider}")),
+        _ => return Err(format!("Unknown consumer provider: {provider}")),
     }
     save_config(&guard).map_err(|e| e.to_string())?;
     drop(guard);
@@ -1891,7 +2366,7 @@ fn set_oauth_label(
 }
 
 #[tauri::command]
-fn set_oauth_window_alerts_enabled(
+fn set_consumer_window_alerts_enabled(
     window: WebviewWindow,
     provider: String,
     window_key: String,
@@ -1899,7 +2374,11 @@ fn set_oauth_window_alerts_enabled(
     state: State<AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    require_window_label(&window, SETTINGS_LABEL, "set_oauth_window_alerts_enabled")?;
+    require_window_label(
+        &window,
+        SETTINGS_LABEL,
+        "set_consumer_window_alerts_enabled",
+    )?;
     {
         let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned");
         match (provider.as_str(), window_key.as_str()) {
@@ -1907,7 +2386,7 @@ fn set_oauth_window_alerts_enabled(
             ("openai", "week") => cfg.openai_oauth_week_alerts_enabled = enabled,
             ("anthropic", "5h") => cfg.anthropic_oauth_5h_alerts_enabled = enabled,
             ("anthropic", "week") => cfg.anthropic_oauth_week_alerts_enabled = enabled,
-            _ => return Err(format!("Unknown OAuth provider: {provider}")),
+            _ => return Err(format!("Unknown consumer provider: {provider}")),
         }
         save_config(&cfg).map_err(|e| e.to_string())?;
         refresh_snapshot_alert_state(&state, &cfg);
@@ -1992,16 +2471,26 @@ fn send_test_alert(
 mod tests {
     use super::{
         alert_signature, apply_manual_alerts, apply_provider_account_save,
-        collect_pending_notifications, compare_versions, parse_callback_code, prune_manual_alerts,
-        Alert, AppConfig, ManualAlert, ProviderAccount, ProviderAccountInput,
-        ProviderCatalogEntry, SnapshotView, UsageSnapshot, ANTHROPIC_OAUTH_PROVIDER,
-        OPENAI_OAUTH_PROVIDER, TEST_ALERT_CODE, TEST_ALERT_MESSAGE,
+        clamp_widget_origin_to_area, collect_pending_notifications, compare_versions,
+        default_widget_origin_for_area, parse_callback_code, prune_manual_alerts,
+        work_area_contains_point, Alert, AppConfig, LogicalWorkArea, ManualAlert,
+        ProviderAccount, ProviderAccountInput, ProviderCatalogEntry, SnapshotView, UsageSnapshot,
+        ANTHROPIC_OAUTH_PROVIDER, DEFAULT_WIDGET_HEIGHT, DEFAULT_WIDGET_MARGIN_BOTTOM,
+        DEFAULT_WIDGET_MARGIN_RIGHT, DEFAULT_WIDGET_WIDTH, OPENAI_OAUTH_PROVIDER,
+        TEST_ALERT_CODE, TEST_ALERT_MESSAGE,
     };
     use chrono::Local;
     use std::cell::Cell;
     use std::cmp::Ordering;
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    use super::{
+        current_executable_path, desktop_exec_value, is_start_on_login_enabled,
+        linux_autostart_file_contents, linux_autostart_path, set_start_on_login_enabled,
+        XDG_CONFIG_HOME_ENV,
+    };
 
     #[test]
     fn callback_requires_matching_state() {
@@ -2037,7 +2526,59 @@ mod tests {
 
     #[test]
     fn version_compare_handles_prerelease_suffixes() {
-        assert_eq!(compare_versions("1.2.3-beta1", "1.2.2"), Some(Ordering::Greater));
+        assert_eq!(
+            compare_versions("1.2.3-beta1", "1.2.2"),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn work_area_contains_point_rejects_offscreen_corner() {
+        let area = LogicalWorkArea {
+            left: 0.0,
+            top: 0.0,
+            right: 1920.0,
+            bottom: 1080.0,
+        };
+
+        assert!(work_area_contains_point(area, 1919.0, 1079.0));
+        assert!(!work_area_contains_point(area, -1.0, 1079.0));
+    }
+
+    #[test]
+    fn clamp_widget_origin_to_area_keeps_widget_fully_visible() {
+        let area = LogicalWorkArea {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 600.0,
+        };
+
+        let (x, y) = clamp_widget_origin_to_area(area, 700.0, 550.0);
+
+        assert_eq!(x, area.right - DEFAULT_WIDGET_WIDTH);
+        assert_eq!(y, area.bottom - DEFAULT_WIDGET_HEIGHT);
+    }
+
+    #[test]
+    fn default_widget_origin_anchors_to_bottom_right_margin() {
+        let area = LogicalWorkArea {
+            left: 0.0,
+            top: 0.0,
+            right: 1920.0,
+            bottom: 1080.0,
+        };
+
+        let (x, y) = default_widget_origin_for_area(area);
+
+        assert_eq!(
+            x,
+            area.right - DEFAULT_WIDGET_WIDTH - DEFAULT_WIDGET_MARGIN_RIGHT
+        );
+        assert_eq!(
+            y,
+            area.bottom - DEFAULT_WIDGET_HEIGHT - DEFAULT_WIDGET_MARGIN_BOTTOM
+        );
     }
 
     #[test]
@@ -2073,6 +2614,88 @@ mod tests {
                 label: "Anthropic".into(),
             },
         ]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn autostart_env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_autostart_test_dir(name: &str, test: impl FnOnce(std::path::PathBuf)) {
+        let _guard = autostart_env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "usageguard_autostart_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var(XDG_CONFIG_HOME_ENV, &root);
+        test(root.join("autostart"));
+        std::env::remove_var(XDG_CONFIG_HOME_ENV);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_autostart_path_uses_xdg_config_home() {
+        with_autostart_test_dir("path", |autostart_dir| {
+            let path = linux_autostart_path().unwrap();
+            assert_eq!(path, autostart_dir.join("com.usageguard.app.desktop"));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_autostart_file_has_required_fields() {
+        with_autostart_test_dir("contents", |_autostart_dir| {
+            let contents = linux_autostart_file_contents().unwrap();
+            let exe = current_executable_path().unwrap();
+
+            assert!(contents.starts_with("[Desktop Entry]\n"));
+            assert!(contents.contains("Type=Application\n"));
+            assert!(contents.contains("Version=1.0\n"));
+            assert!(contents.contains("Name=UsageGuard\n"));
+            assert!(contents.contains(&format!("Exec={}\n", desktop_exec_value(&exe))));
+            assert!(contents.contains("Terminal=false\n"));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_autostart_state_detects_managed_file() {
+        with_autostart_test_dir("detect", |autostart_dir| {
+            std::fs::create_dir_all(&autostart_dir).unwrap();
+            std::fs::write(
+                autostart_dir.join("com.usageguard.app.desktop"),
+                "[Desktop Entry]\nType=Application\nName=UsageGuard\n",
+            )
+            .unwrap();
+
+            assert!(is_start_on_login_enabled());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_autostart_enable_disable_round_trip() {
+        with_autostart_test_dir("round_trip", |_autostart_dir| {
+            let path = linux_autostart_path().unwrap();
+
+            assert!(!is_start_on_login_enabled());
+            assert!(!path.exists());
+
+            set_start_on_login_enabled(true).unwrap();
+            assert!(path.exists());
+            assert!(is_start_on_login_enabled());
+
+            set_start_on_login_enabled(false).unwrap();
+            assert!(!path.exists());
+            assert!(!is_start_on_login_enabled());
+        });
     }
 
     #[test]
@@ -2256,6 +2879,7 @@ mod tests {
                 status_code: None,
                 status_message: None,
                 api_metrics: None,
+                consumer_quota: None,
                 primary_reset_at: primary_reset_at.map(str::to_string),
                 secondary_reset_at: Some("2026-03-14T00:00:00Z".into()),
             },
@@ -2355,7 +2979,10 @@ mod tests {
 
     #[test]
     fn manual_test_alert_overlays_matching_snapshot() {
-        let mut snapshot_views = vec![snapshot_view_with_alerts(Some("2026-03-10T12:00:00Z"), vec![])];
+        let mut snapshot_views = vec![snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![],
+        )];
         let mut manual_alerts = HashMap::new();
         manual_alerts.insert(
             "openai::ChatGPT Plus".into(),
@@ -2413,94 +3040,33 @@ fn main() {
         .setup(|app| {
             let cfg = load_config().map_err(|error| std::io::Error::other(error.to_string()))?;
             let saved_position = cfg.widget_position;
-            #[cfg(target_os = "windows")]
-            let startup_enabled = is_start_with_windows_enabled();
+            let startup_enabled = is_start_on_login_enabled();
             app.manage(AppState {
                 cfg: Mutex::new(cfg),
                 notified_alerts: Mutex::new(HashSet::new()),
                 snapshots: Mutex::new(Vec::new()),
                 manual_alerts: Mutex::new(HashMap::new()),
                 refresh: Mutex::new(RefreshState::default()),
-                #[cfg(target_os = "windows")]
-                start_with_windows_enabled: Mutex::new(startup_enabled),
-                #[cfg(target_os = "windows")]
-                tray_start_with_windows_item: Mutex::new(None),
+                tray_available: Mutex::new(false),
+                start_on_login_enabled: Mutex::new(startup_enabled),
+                tray_start_on_login_item: Mutex::new(None),
             });
 
             // Restore last widget position, or default to bottom-right of the work area.
             // widget_position stores the right-bottom corner so that resizeToFit (which
             // anchors to the right-bottom edge) restores correctly regardless of card count.
             if let Some(win) = app.get_webview_window("main") {
-                if let Some([right, bottom]) = saved_position {
-                    // Position the window so its right-bottom matches the saved corner.
-                    // resizeToFit will then keep right-bottom fixed while adjusting width.
-                    let widget_w = 244.0_f64;
-                    let widget_h = 100.0_f64;
-                    let _ = win.set_position(tauri::LogicalPosition::new(
-                        right - widget_w,
-                        bottom - widget_h,
-                    ));
-                } else if let Ok(Some(monitor)) = win.current_monitor() {
-                    let scale = monitor.scale_factor();
-
-                    // On Windows, use SystemParametersInfo(SPI_GETWORKAREA) so the widget
-                    // lands above the taskbar instead of behind it.
-                    #[cfg(target_os = "windows")]
-                    let (area_w, area_h) = {
-                        let mut rect = win32::Rect {
-                            left: 0,
-                            top: 0,
-                            right: 0,
-                            bottom: 0,
-                        };
-                        unsafe {
-                            win32::SystemParametersInfoW(
-                                win32::SPI_GETWORKAREA,
-                                0,
-                                &mut rect as *mut _ as *mut _,
-                                0,
-                            );
-                        }
-                        (rect.right as f64 / scale, rect.bottom as f64 / scale)
-                    };
-
-                    #[cfg(not(target_os = "windows"))]
-                    let (area_w, area_h) = {
-                        let size = monitor.size();
-                        (size.width as f64 / scale, size.height as f64 / scale)
-                    };
-
-                    let widget_w = 244.0;
-                    let widget_h = 100.0;
-                    let margin_right = 30.0;
-                    let margin_bottom = 14.0;
-                    let _ = win.set_position(tauri::LogicalPosition::new(
-                        area_w - widget_w - margin_right,
-                        area_h - widget_h - margin_bottom,
-                    ));
-                }
+                restore_widget_position(&win, saved_position);
             }
 
             app.on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()));
 
-            let menu = create_tray_menu(&app.handle())?;
-
-            TrayIconBuilder::new()
-                .icon(create_tray_icon())
-                .tooltip("UsageGuard")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        toggle_window(tray.app_handle());
-                    }
-                })
-                .build(app)?;
+            let tray_is_available = setup_tray(app)?;
+            set_tray_available(&app.handle(), tray_is_available);
+            #[cfg(target_os = "linux")]
+            if !tray_is_available {
+                show_main_window(&app.handle());
+            }
 
             spawn_snapshot_refresh(app.handle().clone());
             spawn_release_check(app.handle().clone());
@@ -2520,14 +3086,10 @@ fn main() {
             quit,
             show_context_menu,
             set_window_rect,
-            connect_openai_oauth,
-            connect_anthropic_oauth,
-            disconnect_openai_oauth,
-            disconnect_anthropic_oauth,
-            get_openai_oauth_status,
-            get_anthropic_oauth_status,
-            set_oauth_label,
-            set_oauth_window_alerts_enabled,
+            get_openai_consumer_status,
+            get_anthropic_consumer_status,
+            set_consumer_label,
+            set_consumer_window_alerts_enabled,
             send_test_alert,
             set_refresh_interval_secs,
         ])

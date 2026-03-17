@@ -16,9 +16,16 @@
     has_api_key: boolean;
   }
 
+  interface SecureStorageStatus {
+    available: boolean;
+    backend: string;
+    detail: string | null;
+  }
+
   interface ProviderSettingsPayload {
     providers: ProviderCatalogEntry[];
     accounts: ProviderAccountView[];
+    secure_storage: SecureStorageStatus;
   }
 
   interface ProviderForm {
@@ -28,12 +35,17 @@
     apiKey: string;
   }
 
-  interface OAuthStatus {
+  interface ConsumerStatus {
     connected: boolean;
     plan_type: string | null;
     label: string | null;
     alerts_5h_enabled: boolean;
     alerts_week_enabled: boolean;
+    supports_usage: boolean;
+    supports_5h_usage: boolean;
+    supports_week_usage: boolean;
+    source_label: string;
+    status_message: string | null;
   }
 
   let providers = [] as ProviderCatalogEntry[];
@@ -48,12 +60,34 @@
   let isSaving = false;
   let savePhase = 'idle' as 'idle' | 'saving' | 'verifying';
   let isTestingAlert = false;
-  let isConnectingOpenAi = false;
-  let isConnectingAnthropic = false;
   let errorMessage = '';
   let successMessage = '';
-  let openaiOAuthStatus: OAuthStatus = { connected: false, plan_type: null, label: null, alerts_5h_enabled: true, alerts_week_enabled: true };
-  let anthropicOAuthStatus: OAuthStatus = { connected: false, plan_type: null, label: null, alerts_5h_enabled: true, alerts_week_enabled: true };
+  let secureStorage: SecureStorageStatus = { available: true, backend: 'unknown', detail: null };
+  let secureStorageBlocked = false;
+  let openaiConsumerStatus: ConsumerStatus = {
+    connected: false,
+    plan_type: null,
+    label: null,
+    alerts_5h_enabled: true,
+    alerts_week_enabled: true,
+    supports_usage: false,
+    supports_5h_usage: false,
+    supports_week_usage: false,
+    source_label: 'Codex local client',
+    status_message: null,
+  };
+  let anthropicConsumerStatus: ConsumerStatus = {
+    connected: false,
+    plan_type: null,
+    label: null,
+    alerts_5h_enabled: true,
+    alerts_week_enabled: true,
+    supports_usage: false,
+    supports_5h_usage: false,
+    supports_week_usage: false,
+    source_label: 'Claude Code local client',
+    status_message: null,
+  };
   let openaiEditLabel = '';
   let anthropicEditLabel = '';
   let confirmRemoveId: string | null = null;
@@ -70,12 +104,12 @@
     } catch { /* ignore */ }
   }
 
-  function defaultOpenAILabel(status: OAuthStatus): string {
-    return status.label || (status.plan_type ? `ChatGPT ${status.plan_type}` : 'ChatGPT');
+  function defaultOpenAILabel(status: ConsumerStatus): string {
+    return status.label || (status.plan_type ? `Codex ${status.plan_type}` : 'Codex');
   }
 
-  function defaultAnthropicLabel(status: OAuthStatus): string {
-    return status.label || (status.plan_type ? `Claude ${status.plan_type}` : 'Claude');
+  function defaultAnthropicLabel(status: ConsumerStatus): string {
+    return status.label || (status.plan_type ? `Claude Code ${status.plan_type}` : 'Claude Code');
   }
 
   function apiAccountSectionLabel(): string {
@@ -122,6 +156,10 @@
     return savePhase === 'verifying' ? 'Verifying...' : 'Saving...';
   }
 
+  function secureStorageMessage(): string {
+    return secureStorage.detail || `Secure storage backend '${secureStorage.backend}' is unavailable.`;
+  }
+
   function resetForm(providerId = form.provider || providers[0]?.id || ''): void {
     form = { id: null, provider: providerId, label: '', apiKey: '' };
     errorMessage = '';
@@ -131,6 +169,7 @@
   function applyPayload(payload: ProviderSettingsPayload): void {
     providers = payload.providers;
     accounts = payload.accounts;
+    secureStorage = payload.secure_storage;
     if (!providers.some((p) => p.id === form.provider)) {
       form.provider = providers[0]?.id ?? '';
     }
@@ -169,12 +208,12 @@
     try {
       const [payload, openaiStatus, anthropicStatus] = await Promise.all([
         invoke('get_provider_settings') as Promise<ProviderSettingsPayload>,
-        invoke('get_openai_oauth_status') as Promise<OAuthStatus>,
-        invoke('get_anthropic_oauth_status') as Promise<OAuthStatus>,
+        invoke('get_openai_consumer_status') as Promise<ConsumerStatus>,
+        invoke('get_anthropic_consumer_status') as Promise<ConsumerStatus>,
       ]);
       applyPayload(payload);
-      openaiOAuthStatus = openaiStatus;
-      anthropicOAuthStatus = anthropicStatus;
+      openaiConsumerStatus = openaiStatus;
+      anthropicConsumerStatus = anthropicStatus;
       openaiEditLabel = defaultOpenAILabel(openaiStatus);
       anthropicEditLabel = defaultAnthropicLabel(anthropicStatus);
       if (!form.provider) resetForm(payload.providers[0]?.id ?? '');
@@ -185,38 +224,38 @@
     }
   }
 
-  async function saveOAuthLabel(provider: 'openai' | 'anthropic', label: string): Promise<void> {
+  async function saveConsumerLabel(provider: 'openai' | 'anthropic', label: string): Promise<void> {
     if (!invoke) return;
     try {
-      await invoke('set_oauth_label', { provider, label });
+      await invoke('set_consumer_label', { provider, label });
     } catch (error) {
       errorMessage = String(error);
     }
   }
 
-  async function setOAuthWindowAlertsEnabled(
+  async function setConsumerWindowAlertsEnabled(
     provider: 'openai' | 'anthropic',
     windowKey: '5h' | 'week',
     enabled: boolean,
   ): Promise<void> {
     if (!invoke) return;
-    const target = provider === 'openai' ? openaiOAuthStatus : anthropicOAuthStatus;
+    const target = provider === 'openai' ? openaiConsumerStatus : anthropicConsumerStatus;
     const field = windowKey === '5h' ? 'alerts_5h_enabled' : 'alerts_week_enabled';
     const previous = target[field];
 
     if (provider === 'openai') {
-      openaiOAuthStatus = { ...openaiOAuthStatus, [field]: enabled };
+      openaiConsumerStatus = { ...openaiConsumerStatus, [field]: enabled };
     } else {
-      anthropicOAuthStatus = { ...anthropicOAuthStatus, [field]: enabled };
+      anthropicConsumerStatus = { ...anthropicConsumerStatus, [field]: enabled };
     }
 
     try {
-      await invoke('set_oauth_window_alerts_enabled', { provider, windowKey, enabled });
+      await invoke('set_consumer_window_alerts_enabled', { provider, windowKey, enabled });
     } catch (error) {
       if (provider === 'openai') {
-        openaiOAuthStatus = { ...openaiOAuthStatus, [field]: previous };
+        openaiConsumerStatus = { ...openaiConsumerStatus, [field]: previous };
       } else {
-        anthropicOAuthStatus = { ...anthropicOAuthStatus, [field]: previous };
+        anthropicConsumerStatus = { ...anthropicConsumerStatus, [field]: previous };
       }
       errorMessage = String(error);
     }
@@ -242,62 +281,8 @@
     }
   }
 
-  async function connectOpenAIOAuth(): Promise<void> {
-    if (!invoke || isConnectingOpenAi) return;
-    isConnectingOpenAi = true;
-    errorMessage = '';
-    successMessage = '';
-    try {
-      const planType = await invoke('connect_openai_oauth') as string;
-      openaiOAuthStatus = { ...openaiOAuthStatus, connected: true, plan_type: planType, label: null };
-      openaiEditLabel = `ChatGPT ${planType}`;
-    } catch (error) {
-      errorMessage = String(error);
-    } finally {
-      isConnectingOpenAi = false;
-    }
-  }
-
-  async function disconnectOpenAIOAuth(): Promise<void> {
-    if (!invoke) return;
-    try {
-      await invoke('disconnect_openai_oauth');
-      openaiOAuthStatus = { ...openaiOAuthStatus, connected: false, plan_type: null, label: null };
-      openaiEditLabel = '';
-    } catch (error) {
-      errorMessage = String(error);
-    }
-  }
-
-  async function connectAnthropicOAuth(): Promise<void> {
-    if (!invoke || isConnectingAnthropic) return;
-    isConnectingAnthropic = true;
-    errorMessage = '';
-    successMessage = '';
-    try {
-      const planType = await invoke('connect_anthropic_oauth') as string;
-      anthropicOAuthStatus = { ...anthropicOAuthStatus, connected: true, plan_type: planType, label: null };
-      anthropicEditLabel = `Claude ${planType}`;
-    } catch (error) {
-      errorMessage = String(error);
-    } finally {
-      isConnectingAnthropic = false;
-    }
-  }
-
-  async function disconnectAnthropicOAuth(): Promise<void> {
-    if (!invoke) return;
-    try {
-      await invoke('disconnect_anthropic_oauth');
-      anthropicOAuthStatus = { ...anthropicOAuthStatus, connected: false, plan_type: null, label: null };
-      anthropicEditLabel = '';
-    } catch (error) {
-      errorMessage = String(error);
-    }
-  }
-
   async function save(): Promise<void> {
-    if (!invoke || isSaving) return;
+    if (!invoke || isSaving || secureStorageBlocked) return;
     isSaving = true;
     savePhase = form.apiKey.trim() ? 'verifying' : 'saving';
     errorMessage = '';
@@ -324,7 +309,7 @@
   }
 
   async function removeAccount(account: ProviderAccountView): Promise<void> {
-    if (!invoke) return;
+    if (!invoke || secureStorageBlocked) return;
     errorMessage = '';
     successMessage = '';
     try {
@@ -354,6 +339,7 @@
   });
 
   $: editingAccount = form.id ? accounts.find((account) => account.id === form.id) ?? null : null;
+  $: secureStorageBlocked = !secureStorage.available;
 </script>
 
 <div class="shell" on:contextmenu|preventDefault role="presentation">
@@ -367,37 +353,44 @@
     </header>
 
     <div class="body">
+      {#if secureStorageBlocked}
+        <div class="storage-warning">
+          <span class="storage-warning-title">Secure storage unavailable</span>
+          <span class="storage-warning-copy">{secureStorageMessage()}</span>
+        </div>
+      {/if}
 
-      <!-- Subscription connections -->
-      <div class="section-label">Subscriptions</div>
+      <!-- Local consumer connections -->
+      <div class="section-label">Local consumer apps</div>
 
-      <!-- ChatGPT OAuth -->
-      <div class="oauth-row" class:oauth-connected={openaiOAuthStatus.connected}>
-        <div class="account-dot" style="--accent:{openaiOAuthStatus.connected ? '#10a37f' : 'rgba(130, 138, 165, 0.35)'}"></div>
-        {#if isConnectingOpenAi}
+      <!-- Codex local status -->
+      <div class="oauth-row" class:oauth-connected={openaiConsumerStatus.connected}>
+        <div class="account-dot" style="--accent:{openaiConsumerStatus.connected ? '#10a37f' : 'rgba(130, 138, 165, 0.35)'}"></div>
+        {#if false}
           <span class="account-vendor" style="flex:1">Waiting for browser…</span>
-        {:else if openaiOAuthStatus.connected}
+        {:else if openaiConsumerStatus.connected}
           <input
             class="oauth-name"
             type="text"
             bind:value={openaiEditLabel}
-            on:blur={() => saveOAuthLabel('openai', openaiEditLabel)}
+            on:blur={() => saveConsumerLabel('openai', openaiEditLabel)}
             on:mousedown|stopPropagation
           />
-          <button class="link-btn" type="button" on:click={disconnectOpenAIOAuth}>Disconnect</button>
+          <span class="oauth-provider-label">{openaiConsumerStatus.source_label}</span>
         {:else}
-          <span class="oauth-provider-label">ChatGPT</span>
-          <button class="connect-btn" type="button" on:click={connectOpenAIOAuth}>Connect</button>
+          <span class="oauth-provider-label">Codex</span>
+          <span class="account-vendor">{openaiConsumerStatus.source_label}</span>
         {/if}
       </div>
-      {#if openaiOAuthStatus.connected && !isConnectingOpenAi}
+      {#if openaiConsumerStatus.connected}
         <div class="oauth-subrow">
           <span class="oauth-subrow-label">Alerts</span>
           <label class="oauth-checkbox">
             <input
               type="checkbox"
-              checked={openaiOAuthStatus.alerts_5h_enabled}
-              on:change={(event) => void setOAuthWindowAlertsEnabled('openai', '5h', (event.currentTarget as HTMLInputElement).checked)}
+              checked={openaiConsumerStatus.alerts_5h_enabled}
+              disabled={!openaiConsumerStatus.supports_5h_usage}
+              on:change={(event) => void setConsumerWindowAlertsEnabled('openai', '5h', (event.currentTarget as HTMLInputElement).checked)}
               on:mousedown|stopPropagation
             />
             <span>5h</span>
@@ -405,8 +398,9 @@
           <label class="oauth-checkbox">
             <input
               type="checkbox"
-              checked={openaiOAuthStatus.alerts_week_enabled}
-              on:change={(event) => void setOAuthWindowAlertsEnabled('openai', 'week', (event.currentTarget as HTMLInputElement).checked)}
+              checked={openaiConsumerStatus.alerts_week_enabled}
+              disabled={!openaiConsumerStatus.supports_week_usage}
+              on:change={(event) => void setConsumerWindowAlertsEnabled('openai', 'week', (event.currentTarget as HTMLInputElement).checked)}
               on:mousedown|stopPropagation
             />
             <span>Week</span>
@@ -416,43 +410,44 @@
             type="button"
             disabled={isTestingAlert}
             on:mousedown|stopPropagation
-            on:click={() => void sendTestAlert('openai', defaultOpenAILabel(openaiOAuthStatus))}
+            on:click={() => void sendTestAlert('openai', defaultOpenAILabel(openaiConsumerStatus))}
           >
             Test alert
           </button>
         </div>
       {/if}
-      {#if isConnectingOpenAi}
-        <span class="field-help">Verifying ChatGPT subscription...</span>
+      {#if openaiConsumerStatus.status_message}
+        <span class="field-help">{openaiConsumerStatus.status_message}</span>
       {/if}
 
-      <!-- Claude OAuth -->
-      <div class="oauth-row" class:oauth-connected={anthropicOAuthStatus.connected}>
-        <div class="account-dot" style="--accent:{anthropicOAuthStatus.connected ? '#d97a4e' : 'rgba(130, 138, 165, 0.35)'}"></div>
-        {#if isConnectingAnthropic}
+      <!-- Claude Code local status -->
+      <div class="oauth-row" class:oauth-connected={anthropicConsumerStatus.connected}>
+        <div class="account-dot" style="--accent:{anthropicConsumerStatus.connected ? '#d97a4e' : 'rgba(130, 138, 165, 0.35)'}"></div>
+        {#if false}
           <span class="account-vendor" style="flex:1">Waiting for browser…</span>
-        {:else if anthropicOAuthStatus.connected}
+        {:else if anthropicConsumerStatus.connected}
           <input
             class="oauth-name"
             type="text"
             bind:value={anthropicEditLabel}
-            on:blur={() => saveOAuthLabel('anthropic', anthropicEditLabel)}
+            on:blur={() => saveConsumerLabel('anthropic', anthropicEditLabel)}
             on:mousedown|stopPropagation
           />
-          <button class="link-btn" type="button" on:click={disconnectAnthropicOAuth}>Disconnect</button>
+          <span class="oauth-provider-label">{anthropicConsumerStatus.source_label}</span>
         {:else}
-          <span class="oauth-provider-label">Claude</span>
-          <button class="connect-btn" type="button" on:click={connectAnthropicOAuth}>Connect</button>
+          <span class="oauth-provider-label">Claude Code</span>
+          <span class="account-vendor">{anthropicConsumerStatus.source_label}</span>
         {/if}
       </div>
-      {#if anthropicOAuthStatus.connected && !isConnectingAnthropic}
+      {#if anthropicConsumerStatus.connected}
         <div class="oauth-subrow">
           <span class="oauth-subrow-label">Alerts</span>
           <label class="oauth-checkbox">
             <input
               type="checkbox"
-              checked={anthropicOAuthStatus.alerts_5h_enabled}
-              on:change={(event) => void setOAuthWindowAlertsEnabled('anthropic', '5h', (event.currentTarget as HTMLInputElement).checked)}
+              checked={anthropicConsumerStatus.alerts_5h_enabled}
+              disabled={!anthropicConsumerStatus.supports_5h_usage}
+              on:change={(event) => void setConsumerWindowAlertsEnabled('anthropic', '5h', (event.currentTarget as HTMLInputElement).checked)}
               on:mousedown|stopPropagation
             />
             <span>5h</span>
@@ -460,25 +455,26 @@
           <label class="oauth-checkbox">
             <input
               type="checkbox"
-              checked={anthropicOAuthStatus.alerts_week_enabled}
-              on:change={(event) => void setOAuthWindowAlertsEnabled('anthropic', 'week', (event.currentTarget as HTMLInputElement).checked)}
+              checked={anthropicConsumerStatus.alerts_week_enabled}
+              disabled={!anthropicConsumerStatus.supports_week_usage}
+              on:change={(event) => void setConsumerWindowAlertsEnabled('anthropic', 'week', (event.currentTarget as HTMLInputElement).checked)}
               on:mousedown|stopPropagation
             />
-            <span>Week</span>
+            <span>{anthropicConsumerStatus.supports_week_usage ? 'Week' : 'Week unavailable locally'}</span>
           </label>
           <button
             class="link-btn alert-test-button"
             type="button"
             disabled={isTestingAlert}
             on:mousedown|stopPropagation
-            on:click={() => void sendTestAlert('anthropic', defaultAnthropicLabel(anthropicOAuthStatus))}
+            on:click={() => void sendTestAlert('anthropic', defaultAnthropicLabel(anthropicConsumerStatus))}
           >
             Test alert
           </button>
         </div>
       {/if}
-      {#if isConnectingAnthropic}
-        <span class="field-help">Verifying Claude subscription...</span>
+      {#if anthropicConsumerStatus.status_message}
+        <span class="field-help">{anthropicConsumerStatus.status_message}</span>
       {/if}
 
       <div class="divider"></div>
@@ -507,7 +503,7 @@
               <div class="account-dot"></div>
               {#if confirmRemoveId === account.id}
                 <span class="confirm-label">Remove "{account.label}"?</span>
-                <button class="confirm-yes" type="button" on:mousedown|stopPropagation on:click|stopPropagation={() => removeAccount(account)}>Remove</button>
+                <button class="confirm-yes" type="button" disabled={secureStorageBlocked} on:mousedown|stopPropagation on:click|stopPropagation={() => removeAccount(account)}>Remove</button>
                 <button class="confirm-no" type="button" on:mousedown|stopPropagation on:click|stopPropagation={() => confirmRemoveId = null}>Cancel</button>
               {:else}
                 <div class="account-info">
@@ -517,7 +513,7 @@
                     <span class="account-warn">no key</span>
                   {/if}
                 </div>
-                <button class="row-remove" type="button" title="Remove" on:mousedown|stopPropagation on:click|stopPropagation={() => confirmRemoveId = account.id}>×</button>
+                <button class="row-remove" type="button" title="Remove" disabled={secureStorageBlocked} on:mousedown|stopPropagation on:click|stopPropagation={() => confirmRemoveId = account.id}>×</button>
               {/if}
             </div>
           {/each}
@@ -538,7 +534,7 @@
         <div class="row-2">
           <label class="field">
             <span class="field-label">Vendor</span>
-            <select bind:value={form.provider} disabled={Boolean(form.id)}>
+            <select bind:value={form.provider} disabled={Boolean(form.id) || secureStorageBlocked}>
               {#each providers as provider}
                 <option value={provider.id}>{provider.label}</option>
               {/each}
@@ -546,7 +542,7 @@
           </label>
           <label class="field">
             <span class="field-label">Name</span>
-            <input type="text" bind:value={form.label} placeholder="Work, Personal…" autocomplete="off" />
+            <input type="text" bind:value={form.label} placeholder="Work, Personal…" autocomplete="off" disabled={secureStorageBlocked} />
           </label>
         </div>
         <label class="field">
@@ -556,6 +552,7 @@
             bind:value={form.apiKey}
             placeholder={apiKeyPlaceholder(form.provider)}
             autocomplete="off"
+            disabled={secureStorageBlocked}
           />
         </label>
         <span class="field-help">{apiKeyHelp(form.provider)}</span>
@@ -582,7 +579,7 @@
               Test alert
             </button>
           {/if}
-          <button class="save-btn" type="button" disabled={isSaving} title={saveButtonLabel()} aria-label={saveButtonLabel()} on:click={save}>
+          <button class="save-btn" type="button" disabled={isSaving || secureStorageBlocked} title={saveButtonLabel()} aria-label={saveButtonLabel()} on:click={save}>
           {isSaving ? '…' : form.id ? 'Save' : 'Add'}
           </button>
         </div>
@@ -661,6 +658,30 @@
     overflow: hidden;
     padding: 10px;
     gap: 6px;
+  }
+
+  .storage-warning {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 9px;
+    border: 1px solid rgba(255, 158, 102, 0.28);
+    border-radius: 8px;
+    background: rgba(255, 140, 72, 0.08);
+    color: rgba(255, 214, 190, 0.95);
+    flex-shrink: 0;
+  }
+
+  .storage-warning-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255, 225, 204, 0.98);
+  }
+
+  .storage-warning-copy {
+    font-size: 10px;
+    line-height: 1.35;
+    color: rgba(255, 204, 174, 0.92);
   }
 
   /* Section labels */
@@ -748,19 +769,6 @@
   .oauth-name:focus {
     border-bottom: 1px solid rgba(100, 140, 255, 0.4);
   }
-
-  .connect-btn {
-    padding: 4px 10px;
-    border: 1px solid var(--border-btn);
-    border-radius: 999px;
-    background: var(--surface-btn);
-    color: var(--text-hi);
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-  .connect-btn:hover { background: var(--surface-btn-hover); }
 
   /* Account list */
   .placeholder {
@@ -890,6 +898,8 @@
   }
   .account-row:hover .row-remove { opacity: 1; }
   .row-remove:hover { color: #ff9999; background: rgba(255, 100, 100, 0.1); }
+  .row-remove:disabled { opacity: 0.35; cursor: default; }
+  .row-remove:disabled:hover { color: rgba(180, 120, 120, 0.6); background: transparent; }
 
   /* Divider */
   .divider {

@@ -10,6 +10,17 @@ export interface ApiMetricCard {
   rolling_30d: ApiMetricWindow;
 }
 
+export interface ConsumerQuotaWindow {
+  available: boolean;
+  used_percent?: number | null;
+  reset_at?: string | null;
+}
+
+export interface ConsumerQuotaCard {
+  primary?: ConsumerQuotaWindow | null;
+  secondary?: ConsumerQuotaWindow | null;
+}
+
 export interface Alert {
   level: string;
   code: string;
@@ -28,6 +39,7 @@ export interface UsageSnapshot {
   status_code?: string | null;
   status_message?: string | null;
   api_metrics?: ApiMetricCard | null;
+  consumer_quota?: ConsumerQuotaCard | null;
   primary_reset_at?: string | null;
   secondary_reset_at?: string | null;
   alerts?: Alert[] | null;
@@ -59,7 +71,13 @@ export interface MetricsUsageCardSpec extends UsageCardBase {
   stats: MetricStatSpec[];
 }
 
-export type UsageCardSpec = QuotaUsageCardSpec | MetricsUsageCardSpec;
+export interface HybridUsageCardSpec extends UsageCardBase {
+  kind: 'hybrid';
+  rings: UsageRingSpec[];
+  stats: MetricStatSpec[];
+}
+
+export type UsageCardSpec = QuotaUsageCardSpec | MetricsUsageCardSpec | HybridUsageCardSpec;
 
 export interface UsageDisplayContext {
   providerLabel: string;

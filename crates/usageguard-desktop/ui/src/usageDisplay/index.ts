@@ -1,4 +1,6 @@
 import { anthropicApiDisplayAdapter } from './adapters/anthropicApi';
+import { anthropicConsumerHybridDisplayAdapter } from './adapters/anthropicConsumerHybrid';
+import { consumerStatusDisplayAdapter } from './adapters/consumerStatus';
 import { anthropicOauthDisplayAdapter } from './adapters/anthropicOauthAlert';
 import { genericApiDisplayAdapter } from './adapters/genericApi';
 import { openaiOauthDisplayAdapter } from './adapters/openaiOauthAlert';
@@ -11,6 +13,8 @@ import type {
 } from './types';
 
 const DISPLAY_ADAPTERS: UsageDisplayAdapter[] = [
+  anthropicConsumerHybridDisplayAdapter,
+  consumerStatusDisplayAdapter,
   openaiOauthDisplayAdapter,
   anthropicOauthDisplayAdapter,
   openaiApiDisplayAdapter,

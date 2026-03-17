@@ -12,53 +12,52 @@ Examples:
 
 - `openaiOauth.ts`
 - `anthropicOauth.ts`
+- `anthropicConsumerMetrics.ts`
+- `consumerStatus.ts`
 - `openaiApi.ts`
 - `anthropicApi.ts`
 - `shared.ts`
 
 This matters because each source can represent usage differently:
 
-- OpenAI OAuth returns `used_percent` from `wham/usage`
+- Codex local sessions return `used_percent` values from recent local `token_count` events
 - API providers may return rolling cost and usage aggregates instead of quota windows
 - some sources report consumed quota, others report remaining quota
 
 Each adapter is responsible for converting those raw semantics into the normalized card UI, hover text, and either quota rings or metric tiles.
 
-## OpenAI OAuth display behavior
+## OpenAI local consumer display behavior
 
-OpenAI OAuth uses `https://chatgpt.com/backend-api/wham/usage`.
+Codex local consumer import uses recent JSONL session logs under `~/.codex/sessions`.
 
 The widget reads:
 
-- `rate_limit.primary_window.used_percent` for the `5h` ring
-- `rate_limit.secondary_window.used_percent` for the `week` ring
+- `rate_limits.primary.used_percent` for the `5h` ring
+- `rate_limits.secondary.used_percent` for the `week` ring
 
 The UI then converts usage into remaining quota for the display rings:
 
 - `23% used` becomes `77% left`
 - `24% used` becomes `76% left`
 
-The OpenAI OAuth hover text is adapter-specific and shows both used and remaining values.
-When the upstream response includes reset timestamps, the hover text also shows the next reset time for the `5h` and `week` windows.
+The Codex hover text is adapter-specific and shows both used and remaining values.
+When the local session entry includes reset timestamps, the hover text also shows the next reset time for the `5h` and `week` windows.
 
-## Anthropic OAuth display behavior
+## Anthropic local consumer behavior
 
-Anthropic OAuth uses `https://api.anthropic.com/api/oauth/usage`.
+Claude Code local import uses `%USERPROFILE%\.claude\.credentials.json` together with recent project logs under `%USERPROFILE%\.claude\projects`.
 
-The widget reads:
+The built-in local adapters render:
 
-- the five-hour utilization bucket for the `5h` ring
-- the seven-day utilization bucket for the `week` ring
+- an exact `5h` quota window from `claude -p --verbose --output-format stream-json "/insights"`
+- `7d` token activity from recent assistant messages
+- request counts derived from assistant messages in local project logs
 
-The Anthropic OAuth adapter also shows provider-specific hover text with:
-
-- current five-hour usage and remaining percentage
-- current seven-day usage and remaining percentage
-- reset timestamps for each bucket when Anthropic returns them
+The `5h` window is exact. The weekly consumer quota percentage is still unavailable in the safe local path, so the card shows local `7d` activity instead of a fake weekly quota ring.
 
 ## API display behavior
 
-OpenAI API and Anthropic API cards do not reuse the OAuth `5h` / `week` quota model.
+OpenAI API and Anthropic API cards do not reuse the consumer `5h` / `week` quota model.
 
 Instead, they render compact metric panels with:
 
@@ -87,6 +86,9 @@ The API hover text also explains the upstream source for each metric so billing-
 Current source values are:
 
 - `oauth`
+- `consumer_local`
+- `consumer_local_metrics`
+- `consumer_local_status`
 - `api`
 - `env`
 - `demo`
@@ -96,7 +98,7 @@ User-safe error state is carried separately in:
 - `status_code`
 - `status_message`
 - `api_metrics` for typed `Today` / `30d` API card data when present
-- `primary_reset_at` / `secondary_reset_at` for OAuth quota reset timestamps when present
+- `primary_reset_at` / `secondary_reset_at` for consumer quota reset timestamps when present
 
 That keeps the UI and CLI readable without leaking raw upstream response bodies.
 
@@ -112,9 +114,7 @@ That means:
 
 Current built-in remote fetch sources:
 
-- OpenAI OAuth
-- Anthropic OAuth
 - OpenAI API
 - Anthropic API
 
-Environment/log fallbacks and demo data still exist as non-remote fallback paths where applicable.
+Environment/log fallbacks, local consumer sources, and demo data still exist as non-remote fallback paths where applicable.
