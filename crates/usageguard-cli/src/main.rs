@@ -110,6 +110,7 @@ fn main() {
                 status_code: None,
                 status_message: None,
                 api_metrics: None,
+                consumer_quota: None,
                 primary_reset_at: None,
                 secondary_reset_at: None,
             };

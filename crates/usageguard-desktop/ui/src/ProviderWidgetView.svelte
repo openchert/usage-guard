@@ -304,6 +304,64 @@
               {/each}
             </div>
           </div>
+        {:else if card.kind === 'status'}
+          <div class="status-body">
+            <!-- Ghost ring: same 34px geometry as UsageRing, animated by state -->
+            <svg class="status-ring" viewBox="0 0 34 34" width="34" height="34" aria-hidden="true">
+              <!-- track -->
+              <circle cx="17" cy="17" r="13" fill="none" stroke="var(--ring-track)" stroke-width="3.5"/>
+              {#if card.statusKind === 'loading'}
+                <!-- Spinning partial arc — fetching data -->
+                <circle
+                  class="status-spin"
+                  cx="17" cy="17" r="13"
+                  fill="none" stroke={provider.color}
+                  stroke-width="3.5" stroke-linecap="round"
+                  stroke-dasharray="22 60"
+                />
+              {:else if card.statusKind === 'waiting'}
+                <!-- Pulsing dashed circle — needs a session -->
+                <circle
+                  class="status-pulse"
+                  cx="17" cy="17" r="13"
+                  fill="none" stroke={provider.color}
+                  stroke-width="3" stroke-linecap="round"
+                  stroke-dasharray="7 6.6"
+                />
+              {:else if card.statusKind === 'auth'}
+                <!-- Broken dashed ring + up-arrow — sign in required -->
+                <circle
+                  cx="17" cy="17" r="13"
+                  fill="none" stroke={provider.color}
+                  stroke-width="2.5" stroke-dasharray="4.5 3.5"
+                  opacity="0.4"
+                />
+                <text
+                  x="17" y="17"
+                  text-anchor="middle" dominant-baseline="central"
+                  font-size="12" fill={provider.color}
+                  font-family="Segoe UI, sans-serif"
+                  opacity="0.85"
+                >↑</text>
+              {:else}
+                <!-- Sparse dashed ring + exclamation — error / unavailable -->
+                <circle
+                  cx="17" cy="17" r="13"
+                  fill="none" stroke="#c25050"
+                  stroke-width="2.5" stroke-dasharray="3 4"
+                  opacity="0.55"
+                />
+                <text
+                  x="17" y="17"
+                  text-anchor="middle" dominant-baseline="central"
+                  font-size="14" font-weight="700" fill="#c25050"
+                  font-family="Segoe UI, sans-serif"
+                  opacity="0.8"
+                >!</text>
+              {/if}
+            </svg>
+            <span class="status-label">{card.label}</span>
+          </div>
         {:else}
           <div class="metric-grid">
             {#each card.stats as stat}
@@ -477,5 +535,51 @@
     font-weight: 700;
     line-height: 1;
     color: var(--metric-accent);
+  }
+
+  /* ── Status card (ghost ring) ─────────────────────────────────── */
+
+  .status-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+  }
+
+  .status-ring {
+    flex-shrink: 0;
+    display: block;
+  }
+
+  /* Loading: continuously spinning arc */
+  .status-spin {
+    transform-origin: 17px 17px;
+    animation: status-spin 1.4s linear infinite;
+  }
+
+  /* Waiting: dashed circle that pulses in/out */
+  .status-pulse {
+    animation: status-pulse 2.8s ease-in-out infinite;
+  }
+
+  .status-label {
+    font-size: 9px;
+    letter-spacing: 0.05em;
+    text-transform: lowercase;
+    color: var(--text-lo);
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  @keyframes status-spin {
+    from { transform: rotate(-90deg); }
+    to   { transform: rotate(270deg); }
+  }
+
+  @keyframes status-pulse {
+    0%, 100% { opacity: 0.18; }
+    50%      { opacity: 0.6;  }
   }
 </style>

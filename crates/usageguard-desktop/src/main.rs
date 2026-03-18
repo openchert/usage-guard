@@ -2,10 +2,10 @@
 
 mod icon_art;
 
-use chrono::{Local, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -17,10 +17,10 @@ use tauri::{
 use usageguard_core::{
     clamp_refresh_interval_secs, evaluate_alerts, has_provider_account_api_key, load_config,
     provider_catalog, provider_snapshots, save_config, secure_storage_status,
-    set_provider_account_api_key, should_notify_alert,
-    verify_anthropic_oauth_access_token, verify_openai_oauth_access_token, verify_provider_api_key,
-    Alert, AppConfig, ProviderAccount, ProviderCatalogEntry, SecureStorageStatus, UsageSnapshot,
-    MAX_REFRESH_INTERVAL_SECS, MIN_REFRESH_INTERVAL_SECS,
+    set_provider_account_api_key, should_notify_alert, verify_anthropic_oauth_access_token,
+    verify_openai_oauth_access_token, verify_provider_api_key, Alert, AppConfig, ProviderAccount,
+    ProviderCatalogEntry, SecureStorageStatus, UsageSnapshot, MAX_REFRESH_INTERVAL_SECS,
+    MIN_REFRESH_INTERVAL_SECS,
 };
 
 #[derive(Default)]
@@ -37,6 +37,18 @@ struct SnapshotView {
     alerts: Vec<Alert>,
 }
 
+/// Tracks when a specific alert was last sent and with which cycle key.
+/// Used to deduplicate native notifications so they fire at most once per
+/// cycle (window rotation) within a per-type cooldown period.
+#[derive(Debug, Clone)]
+struct NotifiedAlertEntry {
+    /// Value returned by `alert_cycle_key` at the time the notification was sent.
+    /// When this changes to a *new real timestamp* the alert is allowed to re-fire.
+    cycle_key: String,
+    /// Wall-clock time the notification was fired, for cooldown enforcement.
+    fired_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 struct ManualAlert {
     alert: Alert,
@@ -45,7 +57,9 @@ struct ManualAlert {
 
 struct AppState {
     cfg: Mutex<AppConfig>,
-    notified_alerts: Mutex<HashSet<String>>,
+    /// Key: `"provider::account_label::alert_code"` (no cycle component).
+    /// Value: the entry from the last time this alert was actually fired.
+    notified_alerts: Mutex<HashMap<String, NotifiedAlertEntry>>,
     snapshots: Mutex<Vec<SnapshotView>>,
     manual_alerts: Mutex<HashMap<String, ManualAlert>>,
     refresh: Mutex<RefreshState>,
@@ -54,38 +68,74 @@ struct AppState {
     tray_start_on_login_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
 }
 
+/// After an alert notification is fired, suppress re-notification for this
+/// duration *unless* the window cycle genuinely rotates (new reset timestamp).
+
+const FIVE_HOUR_ALERT_COOLDOWN_SECS: i64 = 4 * 3600;
+
+const WEEKLY_ALERT_COOLDOWN_SECS: i64 = 23 * 3600;
+
+const DEFAULT_ALERT_COOLDOWN_SECS: i64 = 4 * 3600;
+
 const TRAY_TOGGLE_ID: &str = "tray.toggle";
+
 const TRAY_PROVIDERS_ID: &str = "tray.providers";
+
 const TRAY_START_ON_LOGIN_ID: &str = "tray.start_on_login";
+
 const TRAY_QUIT_ID: &str = "tray.quit";
+
 const CTX_REFRESH_ID: &str = "widget.refresh";
+
 const CTX_PROVIDERS_ID: &str = "widget.providers";
+
 const CTX_START_ON_LOGIN_ID: &str = "widget.start_on_login";
+
 const CTX_ALWAYS_ON_TOP_ID: &str = "widget.always_on_top";
+
 const CTX_LIGHT_MODE_ID: &str = "widget.light_mode";
+
 const CTX_HIDE_ID: &str = "widget.hide";
+
 const CTX_QUIT_ID: &str = "widget.quit";
+
 const REFRESH_EVENT: &str = "usageguard://refresh";
+
 const SETTINGS_LABEL: &str = "settings";
+
 const RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/openchert/usage-guard/releases/latest";
+
 const RELEASE_CHECK_TITLE: &str = "UsageGuard update available";
+
 const TEST_ALERT_CODE: &str = "manual_test_alert";
+
 const TEST_ALERT_MESSAGE: &str = "Test alert: notifications and widget badges are working.";
+
 const TEST_ALERT_DURATION: Duration = Duration::from_secs(10);
+
 const START_ON_LOGIN_LABEL: &str = "Start on Login";
+
 const START_ON_LOGIN_FAILURE_MESSAGE: &str = "Could not update Start on Login.";
+
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_VALUE_NAME: &str = "UsageGuard";
+
 #[cfg(target_os = "linux")]
 const LINUX_AUTOSTART_FILE_NAME: &str = "com.usageguard.app.desktop";
+
 #[cfg(target_os = "linux")]
 const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
+
 const DEFAULT_WIDGET_WIDTH: f64 = 244.0;
+
 const DEFAULT_WIDGET_HEIGHT: f64 = 100.0;
+
 const DEFAULT_WIDGET_MARGIN_RIGHT: f64 = 30.0;
+
 const DEFAULT_WIDGET_MARGIN_BOTTOM: f64 = 14.0;
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,11 +204,13 @@ fn refresh_snapshots(app: AppHandle) {
 
 fn validate_refresh_interval_secs(refresh_interval_secs: u32) -> Result<u32, String> {
     let normalized = clamp_refresh_interval_secs(refresh_interval_secs);
+
     if normalized != refresh_interval_secs {
         return Err(format!(
             "Refresh interval must be between {MIN_REFRESH_INTERVAL_SECS} and {MAX_REFRESH_INTERVAL_SECS} seconds."
         ));
     }
+
     Ok(refresh_interval_secs)
 }
 
@@ -170,20 +222,26 @@ fn set_refresh_interval_secs(
     app: AppHandle,
 ) -> Result<u32, String> {
     require_window_label(&window, SETTINGS_LABEL, "set_refresh_interval_secs")?;
+
     let refresh_interval_secs = validate_refresh_interval_secs(refresh_interval_secs)?;
 
     let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
+
     guard.refresh_interval_secs = refresh_interval_secs;
+
     save_config(&guard).map_err(|error| error.to_string())?;
+
     drop(guard);
 
     emit_widget_refresh(&app);
+
     Ok(refresh_interval_secs)
 }
 
 fn normalize_optional(value: Option<String>) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
+
         if trimmed.is_empty() {
             None
         } else {
@@ -194,6 +252,7 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
 
 fn normalize_required(value: &str, field: &str) -> Result<String, String> {
     let trimmed = value.trim();
+
     if trimmed.is_empty() {
         Err(format!("{field} is required"))
     } else {
@@ -211,7 +270,9 @@ fn apply_provider_account_save(
     persist_config: impl Fn(&AppConfig) -> Result<(), String>,
 ) -> Result<(), String> {
     let provider = normalize_required(&input.provider, "Provider")?;
+
     let label = normalize_required(&input.label, "Name")?;
+
     let api_key = normalize_optional(input.api_key.clone());
 
     let provider_meta = catalog
@@ -231,6 +292,7 @@ fn apply_provider_account_save(
 
     if let Some(index) = existing_index {
         let existing = &cfg.provider_accounts[index];
+
         if existing.provider != provider {
             return Err("Provider cannot be changed for an existing account".to_string());
         }
@@ -269,6 +331,7 @@ fn apply_provider_account_save(
     }
 
     let original_cfg = cfg.clone();
+
     let account = ProviderAccount {
         id: account_id.clone(),
         provider,
@@ -284,13 +347,16 @@ fn apply_provider_account_save(
 
     if let Err(error) = persist_config(cfg) {
         *cfg = original_cfg;
+
         return Err(error);
     }
 
     if let Some(ref key) = api_key {
         if let Err(error) = persist_api_key(&account_id, key) {
             *cfg = original_cfg.clone();
+
             let _ = persist_config(&original_cfg);
+
             return Err(error);
         }
     }
@@ -309,20 +375,24 @@ fn make_account_id(provider: &str, label: &str) -> String {
             }
         })
         .collect();
+
     let slug = slug
         .split('-')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-");
+
     let slug = if slug.is_empty() {
         "account".to_string()
     } else {
         slug
     };
+
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+
     format!("acct_{provider}_{slug}_{ts}")
 }
 
@@ -342,6 +412,7 @@ fn require_window_label(
 
 fn provider_settings_payload(cfg: &AppConfig) -> ProviderSettingsPayload {
     let providers = provider_catalog();
+
     let provider_map: HashMap<&str, &ProviderCatalogEntry> = providers
         .iter()
         .map(|provider| (provider.id.as_str(), provider))
@@ -352,6 +423,7 @@ fn provider_settings_payload(cfg: &AppConfig) -> ProviderSettingsPayload {
         .iter()
         .filter_map(|account| {
             let meta = provider_map.get(account.provider.as_str())?;
+
             Some(ProviderAccountView {
                 id: account.id.clone(),
                 provider: account.provider.clone(),
@@ -386,6 +458,7 @@ fn secure_storage_unavailable_message(status: &SecureStorageStatus) -> String {
 
 fn require_secure_storage_available() -> Result<(), String> {
     let status = secure_storage_status();
+
     if status.available {
         Ok(())
     } else {
@@ -419,6 +492,7 @@ fn snapshot_key(snapshot: &UsageSnapshot) -> String {
 
 fn prune_manual_alerts(manual_alerts: &mut HashMap<String, ManualAlert>) {
     let now = Instant::now();
+
     manual_alerts.retain(|_, manual_alert| manual_alert.expires_at > now);
 }
 
@@ -427,7 +501,9 @@ fn active_manual_alerts(state: &AppState) -> HashMap<String, ManualAlert> {
         .manual_alerts
         .lock()
         .expect("AppState manual_alerts lock poisoned");
+
     prune_manual_alerts(&mut manual_alerts);
+
     manual_alerts.clone()
 }
 
@@ -440,29 +516,15 @@ fn apply_manual_alerts(
             snapshot_view
                 .alerts
                 .retain(|alert| alert.code != manual_alert.alert.code);
+
             snapshot_view.alerts.push(manual_alert.alert.clone());
         }
     }
 }
 
-fn refresh_notified_alert_signatures(state: &AppState) {
-    let active_signatures = state
-        .snapshots
-        .lock()
-        .expect("AppState snapshots lock poisoned")
-        .iter()
-        .flat_map(|view| {
-            view.alerts
-                .iter()
-                .map(|alert| alert_signature(&view.snapshot, alert))
-        })
-        .collect::<HashSet<_>>();
-
-    state
-        .notified_alerts
-        .lock()
-        .expect("AppState notified_alerts lock poisoned")
-        .retain(|signature| active_signatures.contains(signature));
+fn refresh_notified_alert_signatures(_state: &AppState) {
+    // No-op: deduplication is now time-based (see NotifiedAlertEntry / collect_pending_notifications)
+    // and entries are not evicted on alert clear to prevent spurious re-notification.
 }
 
 fn find_snapshot_for_test_alert(
@@ -488,11 +550,13 @@ fn spawn_manual_alert_expiry(app: AppHandle, target_key: String, expires_at: Ins
         }
 
         let state = app.state::<AppState>();
+
         let removed = {
             let mut manual_alerts = state
                 .manual_alerts
                 .lock()
                 .expect("AppState manual_alerts lock poisoned");
+
             prune_manual_alerts(&mut manual_alerts);
 
             let is_current = manual_alerts
@@ -502,6 +566,7 @@ fn spawn_manual_alert_expiry(app: AppHandle, target_key: String, expires_at: Ins
 
             if is_current {
                 manual_alerts.remove(&target_key);
+
                 true
             } else {
                 false
@@ -517,6 +582,7 @@ fn spawn_manual_alert_expiry(app: AppHandle, target_key: String, expires_at: Ins
                 .snapshots
                 .lock()
                 .expect("AppState snapshots lock poisoned");
+
             for snapshot_view in snapshots
                 .iter_mut()
                 .filter(|view| snapshot_key(&view.snapshot) == target_key)
@@ -528,6 +594,7 @@ fn spawn_manual_alert_expiry(app: AppHandle, target_key: String, expires_at: Ins
         }
 
         refresh_notified_alert_signatures(state.inner());
+
         emit_widget_refresh(&app);
     });
 }
@@ -555,30 +622,39 @@ fn refresh_snapshot_alert_state(state: &AppState, cfg: &AppConfig) {
         .iter()
         .map(|view| view.snapshot.clone())
         .collect::<Vec<_>>();
+
     let manual_alerts = active_manual_alerts(state);
+
     let mut refreshed = snapshot_views(&snapshots, Utc::now(), cfg);
+
     apply_manual_alerts(&mut refreshed, &manual_alerts);
 
     *state
         .snapshots
         .lock()
         .expect("AppState snapshots lock poisoned") = refreshed;
+
     refresh_notified_alert_signatures(state);
 }
 
 fn spawn_snapshot_refresh(app: AppHandle) {
     let should_spawn = {
         let state = app.state::<AppState>();
+
         let mut refresh = state
             .refresh
             .lock()
             .expect("AppState refresh lock poisoned");
+
         if refresh.in_flight {
             refresh.queued = true;
+
             false
         } else {
             refresh.in_flight = true;
+
             refresh.queued = false;
+
             true
         }
     };
@@ -589,16 +665,23 @@ fn spawn_snapshot_refresh(app: AppHandle) {
 
     std::thread::spawn(move || loop {
         let state = app.state::<AppState>();
+
         let cfg = state
             .cfg
             .lock()
             .expect("AppState cfg lock poisoned")
             .clone();
+
         let snapshots = provider_snapshots(&cfg);
+
         let now_local = Local::now();
+
         let now_utc = now_local.with_timezone(&Utc);
+
         let manual_alerts = active_manual_alerts(state.inner());
+
         let mut snapshot_views = snapshot_views(&snapshots, now_utc, &cfg);
+
         apply_manual_alerts(&mut snapshot_views, &manual_alerts);
 
         {
@@ -606,6 +689,7 @@ fn spawn_snapshot_refresh(app: AppHandle) {
                 .snapshots
                 .lock()
                 .expect("AppState snapshots lock poisoned");
+
             *cache = snapshot_views.clone();
         }
 
@@ -618,6 +702,7 @@ fn spawn_snapshot_refresh(app: AppHandle) {
                 .lock()
                 .expect("AppState notified_alerts lock poisoned"),
         );
+
         emit_widget_refresh(&app);
 
         let should_continue = {
@@ -625,11 +710,14 @@ fn spawn_snapshot_refresh(app: AppHandle) {
                 .refresh
                 .lock()
                 .expect("AppState refresh lock poisoned");
+
             if refresh.queued {
                 refresh.queued = false;
+
                 true
             } else {
                 refresh.in_flight = false;
+
                 false
             }
         };
@@ -650,10 +738,15 @@ struct LogicalWorkArea {
 
 fn logical_work_area(monitor: &tauri::Monitor) -> LogicalWorkArea {
     let scale = monitor.scale_factor();
+
     let work_area = monitor.work_area();
+
     let left = work_area.position.x as f64 / scale;
+
     let top = work_area.position.y as f64 / scale;
+
     let width = work_area.size.width as f64 / scale;
+
     let height = work_area.size.height as f64 / scale;
 
     LogicalWorkArea {
@@ -670,6 +763,7 @@ fn work_area_contains_point(area: LogicalWorkArea, x: f64, y: f64) -> bool {
 
 fn clamp_widget_origin_to_area(area: LogicalWorkArea, x: f64, y: f64) -> (f64, f64) {
     let max_x = (area.right - DEFAULT_WIDGET_WIDTH).max(area.left);
+
     let max_y = (area.bottom - DEFAULT_WIDGET_HEIGHT).max(area.top);
 
     (x.clamp(area.left, max_x), y.clamp(area.top, max_y))
@@ -728,29 +822,42 @@ fn restore_widget_position(win: &WebviewWindow, saved_position: Option<[f64; 2]>
 fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = win.set_always_on_top(true);
+
         let _ = win.show();
+
         let _ = win.set_focus();
+
         return Ok(());
     }
 
     const SETTINGS_W: f64 = 360.0;
+
     const SETTINGS_H: f64 = 540.0;
+
     const GAP: f64 = 8.0;
 
     // Position the settings window to the left of the main widget, bottom-aligned.
     // No clamping so it follows the widget to whichever monitor it lives on.
     let position = app.get_webview_window("main").and_then(|main_win| {
         let scale = main_win.scale_factor().ok()?;
+
         let phys_pos = main_win.outer_position().ok()?;
+
         let phys_size = main_win.inner_size().ok()?;
+
         let widget_x = phys_pos.x as f64 / scale;
+
         let widget_y = phys_pos.y as f64 / scale;
+
         let widget_h = phys_size.height as f64 / scale;
+
         // Left of the widget, bottom-aligned with the widget background edge.
         // +8 compensates for the settings shell padding so the visible panel
         // bottom lines up with the widget window bottom.
         let x = widget_x - SETTINGS_W - GAP;
+
         let y = widget_y + widget_h - SETTINGS_H + 8.0;
+
         Some((x, y))
     });
 
@@ -798,10 +905,15 @@ fn update_config(
     app: AppHandle,
 ) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "update_config")?;
+
     config.refresh_interval_secs = clamp_refresh_interval_secs(config.refresh_interval_secs);
+
     save_config(&config).map_err(|e| e.to_string())?;
+
     *state.cfg.lock().expect("AppState cfg lock poisoned") = config;
+
     emit_widget_refresh(&app);
+
     Ok(())
 }
 
@@ -829,7 +941,9 @@ fn save_provider_account(
     app: AppHandle,
 ) -> Result<ProviderSettingsPayload, String> {
     require_window_label(&window, SETTINGS_LABEL, "save_provider_account")?;
+
     require_secure_storage_available()?;
+
     // Clone out because apply_provider_account_save may perform HTTP validation,
     // and we must not hold the mutex across network I/O.
     let mut cfg = state
@@ -837,7 +951,9 @@ fn save_provider_account(
         .lock()
         .expect("AppState cfg lock poisoned")
         .clone();
+
     let catalog = provider_catalog();
+
     apply_provider_account_save(
         &mut cfg,
         &input,
@@ -853,7 +969,9 @@ fn save_provider_account(
     )?;
 
     *state.cfg.lock().expect("AppState cfg lock poisoned") = cfg.clone();
+
     spawn_snapshot_refresh(app);
+
     Ok(provider_settings_payload(&cfg))
 }
 
@@ -865,19 +983,29 @@ fn delete_provider_account(
     app: AppHandle,
 ) -> Result<ProviderSettingsPayload, String> {
     require_window_label(&window, SETTINGS_LABEL, "delete_provider_account")?;
+
     require_secure_storage_available()?;
+
     let cfg = {
         let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
+
         let before = guard.provider_accounts.len();
+
         guard.provider_accounts.retain(|account| account.id != id);
+
         if guard.provider_accounts.len() == before {
             return Err("Provider account not found".to_string());
         }
+
         save_config(&guard).map_err(|e| e.to_string())?;
+
         let _ = set_provider_account_api_key(&id, None);
+
         guard.clone()
     };
+
     spawn_snapshot_refresh(app);
+
     Ok(provider_settings_payload(&cfg))
 }
 
@@ -886,19 +1014,26 @@ fn delete_provider_account(
 /// We save the right-bottom corner (not left-top) so that resizeToFit, which
 /// anchors the widget to its right-bottom edge, correctly restores the position
 /// regardless of how many provider cards are shown on next launch.
+
 fn save_position_and_exit(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if let (Ok(pos), Ok(size), Ok(scale)) =
             (win.outer_position(), win.inner_size(), win.scale_factor())
         {
             let right = (pos.x as f64 + size.width as f64) / scale;
+
             let bottom = (pos.y as f64 + size.height as f64) / scale;
+
             let state = app.state::<AppState>();
+
             let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
+
             guard.widget_position = Some([right, bottom]);
+
             let _ = save_config(&guard);
         }
     }
+
     app.exit(0);
 }
 
@@ -910,6 +1045,7 @@ fn quit(app: AppHandle) {
 #[tauri::command]
 fn show_context_menu(window: WebviewWindow, x: f64, y: f64) -> Result<(), String> {
     let menu = create_widget_menu(&window).map_err(|e| e.to_string())?;
+
     let result = window
         .popup_menu_at(&menu, tauri::LogicalPosition::new(x, y))
         .map_err(|e| e.to_string());
@@ -934,12 +1070,17 @@ fn flush_context_menu(window: &WebviewWindow) {
 /// Inline FFI bindings — no external crate needed, user32.dll is always present.
 #[cfg(target_os = "windows")]
 mod win32 {
+
     pub const SWP_NOACTIVATE: u32 = 0x0010;
+
     pub const SWP_NOZORDER: u32 = 0x0004;
+
     pub const WM_NULL: u32 = 0x0000;
 
     #[link(name = "user32")]
+
     extern "system" {
+
         pub fn SetWindowPos(
             hwnd: isize,
             hwnd_insert_after: isize,
@@ -951,6 +1092,7 @@ mod win32 {
         ) -> i32;
 
         pub fn PostMessageW(hwnd: isize, msg: u32, w_param: usize, l_param: isize) -> i32;
+
     }
 }
 
@@ -976,9 +1118,11 @@ fn set_window_rect(window: tauri::WebviewWindow, x: i32, y: i32, w: i32, h: i32)
             }
         }
     }
+
     #[cfg(not(target_os = "windows"))]
     {
         let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+
         let _ = window.set_size(tauri::PhysicalSize::new(w.max(0) as u32, h.max(0) as u32));
     }
 }
@@ -987,7 +1131,7 @@ fn fire_notifications(
     snapshots: &[SnapshotView],
     now: chrono::DateTime<Local>,
     cfg: &AppConfig,
-    notified_alerts: &mut HashSet<String>,
+    notified_alerts: &mut HashMap<String, NotifiedAlertEntry>,
 ) {
     for (title, body) in collect_pending_notifications(snapshots, now, cfg, notified_alerts) {
         emit_native_notification(&title, &body);
@@ -998,9 +1142,10 @@ fn collect_pending_notifications(
     snapshots: &[SnapshotView],
     now: chrono::DateTime<Local>,
     cfg: &AppConfig,
-    notified_alerts: &mut HashSet<String>,
+    notified_alerts: &mut HashMap<String, NotifiedAlertEntry>,
 ) -> Vec<(String, String)> {
-    let mut active_signatures = HashSet::new();
+    let now_utc = now.with_timezone(&Utc);
+
     let mut pending = Vec::new();
 
     for snapshot_view in snapshots {
@@ -1009,14 +1154,47 @@ fn collect_pending_notifications(
         }
 
         for alert in &snapshot_view.alerts {
-            let signature = alert_signature(&snapshot_view.snapshot, alert);
-            active_signatures.insert(signature.clone());
-
-            if notified_alerts.contains(&signature) || !should_notify_alert(alert, now, cfg) {
+            if !should_notify_alert(alert, now, cfg) {
                 continue;
             }
 
-            notified_alerts.insert(signature);
+            let base_key = alert_base_key(&snapshot_view.snapshot, alert);
+
+            let cycle_key = alert_cycle_key(&snapshot_view.snapshot, alert);
+
+            let cooldown = alert_cooldown_secs(&alert.code);
+
+            let suppressed = match notified_alerts.get(&base_key) {
+                None => false,
+                Some(prev) => {
+                    // Suppress if we are in the same window cycle AND within the cooldown.
+                    // Two cycle keys are considered the "same cycle" when either key is a
+                    // stable fallback (meaning reset_at is unknown) — this prevents a
+                    // None→Some(timestamp) transition from being mistaken for a new cycle.
+                    let is_stable = |k: &str| k.ends_with("-stable") || k == "stable";
+
+                    let same_cycle = prev.cycle_key == cycle_key
+                        || is_stable(&prev.cycle_key)
+                        || is_stable(&cycle_key);
+
+                    same_cycle
+                        && now_utc.signed_duration_since(prev.fired_at)
+                            < chrono::Duration::seconds(cooldown)
+                }
+            };
+
+            if suppressed {
+                continue;
+            }
+
+            notified_alerts.insert(
+                base_key,
+                NotifiedAlertEntry {
+                    cycle_key,
+                    fired_at: now_utc,
+                },
+            );
+
             pending.push((
                 "UsageGuard".to_string(),
                 format!(
@@ -1027,19 +1205,22 @@ fn collect_pending_notifications(
         }
     }
 
-    notified_alerts.retain(|signature| active_signatures.contains(signature));
     pending
 }
 
-fn alert_signature(snapshot: &UsageSnapshot, alert: &Alert) -> String {
+/// Stable map key for an alert: identifies the alert type without a cycle component.
+/// The cycle is tracked separately inside `NotifiedAlertEntry`.
+
+fn alert_base_key(snapshot: &UsageSnapshot, alert: &Alert) -> String {
     format!(
-        "{}::{}::{}::{}",
-        snapshot.provider,
-        snapshot.account_label,
-        alert.code,
-        alert_cycle_key(snapshot, alert)
+        "{}::{}::{}",
+        snapshot.provider, snapshot.account_label, alert.code
     )
 }
+
+/// Returns the "cycle discriminator" for an alert — a value that changes when the
+/// underlying quota window genuinely resets. Used to allow re-notification after
+/// a window rotation even if the cooldown has not yet elapsed.
 
 fn alert_cycle_key(snapshot: &UsageSnapshot, alert: &Alert) -> String {
     match alert.code.as_str() {
@@ -1054,6 +1235,21 @@ fn alert_cycle_key(snapshot: &UsageSnapshot, alert: &Alert) -> String {
                 .unwrap_or_else(|| "week-stable".to_string())
         }
         _ => "stable".to_string(),
+    }
+}
+
+/// Per-alert-type cooldown: minimum seconds between repeated notifications
+/// for the same alert while the window cycle has not changed.
+
+fn alert_cooldown_secs(code: &str) -> i64 {
+    match code {
+        "quota_5h_exhausted" | "quota_5h_near_limit" | "quota_5h_unused_before_reset" => {
+            FIVE_HOUR_ALERT_COOLDOWN_SECS
+        }
+        "quota_week_exhausted" | "quota_week_near_limit" | "quota_week_unused_before_reset" => {
+            WEEKLY_ALERT_COOLDOWN_SECS
+        }
+        _ => DEFAULT_ALERT_COOLDOWN_SECS,
     }
 }
 
@@ -1116,6 +1312,7 @@ fn spawn_release_check(app: AppHandle) {
             Ok(tag_name) => tag_name,
             Err(error) => {
                 eprintln!("release check failed: {error}");
+
                 return;
             }
         };
@@ -1126,14 +1323,18 @@ fn spawn_release_check(app: AppHandle) {
 
         let should_notify = {
             let state = app.state::<AppState>();
+
             let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned");
+
             if cfg.last_update_notified_version.as_deref() == Some(latest_tag.as_str()) {
                 false
             } else {
                 cfg.last_update_notified_version = Some(latest_tag.clone());
+
                 if let Err(error) = save_config(&cfg) {
                     eprintln!("failed to persist release notification state: {error}");
                 }
+
                 true
             }
         };
@@ -1149,6 +1350,7 @@ fn fetch_latest_release_tag() -> Result<String, String> {
         .timeout(std::time::Duration::from_secs(4))
         .build()
         .map_err(|error| error.to_string())?;
+
     let response = client
         .get(RELEASES_LATEST_URL)
         .header(
@@ -1158,20 +1360,26 @@ fn fetch_latest_release_tag() -> Result<String, String> {
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .map_err(|error| error.to_string())?;
+
     let release = response
         .json::<LatestReleaseResponse>()
         .map_err(|error| error.to_string())?;
+
     Ok(release.tag_name)
 }
 
 fn compare_versions(left: &str, right: &str) -> Option<Ordering> {
     let left_parts = parse_version_parts(left)?;
+
     let right_parts = parse_version_parts(right)?;
+
     let len = left_parts.len().max(right_parts.len());
 
     for index in 0..len {
         let left = *left_parts.get(index).unwrap_or(&0);
+
         let right = *right_parts.get(index).unwrap_or(&0);
+
         match left.cmp(&right) {
             Ordering::Equal => continue,
             non_equal => return Some(non_equal),
@@ -1187,6 +1395,7 @@ fn parse_version_parts(version: &str) -> Option<Vec<u64>> {
         .trim_start_matches('v')
         .split(|ch| ch == '-' || ch == '+')
         .next()?;
+
     let parts = core
         .split('.')
         .map(|part| part.parse::<u64>().ok())
@@ -1197,19 +1406,24 @@ fn parse_version_parts(version: &str) -> Option<Vec<u64>> {
 
 fn create_tray_icon() -> tauri::image::Image<'static> {
     static PIXELS: OnceLock<Box<[u8]>> = OnceLock::new();
+
     let size = icon_art::TRAY_ICON_SIZE;
+
     let data = PIXELS.get_or_init(|| icon_art::icon_rgba_pixels(size).into_boxed_slice());
+
     tauri::image::Image::new(data, size, size)
 }
 
 fn current_executable_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("failed to resolve current executable: {error}"))?;
+
     if exe.is_absolute() {
         Ok(exe)
     } else {
         let cwd = std::env::current_dir()
             .map_err(|error| format!("failed to resolve current directory: {error}"))?;
+
         Ok(cwd.join(exe))
     }
 }
@@ -1217,6 +1431,7 @@ fn current_executable_path() -> Result<PathBuf, String> {
 #[cfg(target_os = "windows")]
 fn windows_start_on_login_command() -> Result<String, String> {
     let exe = current_executable_path()?;
+
     Ok(format!("\"{}\"", exe.display()))
 }
 
@@ -1231,11 +1446,13 @@ fn run_reg_command(args: &[&str]) -> Result<std::process::Output, String> {
 #[cfg(target_os = "windows")]
 fn reg_command_error(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
     if !stderr.is_empty() {
         return stderr;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
     if !stdout.is_empty() {
         stdout
     } else {
@@ -1260,6 +1477,7 @@ fn linux_autostart_dir() -> Result<PathBuf, String> {
 
     let home =
         dirs::home_dir().ok_or_else(|| "failed to resolve HOME for autostart".to_string())?;
+
     Ok(home.join(".config").join("autostart"))
 }
 
@@ -1274,12 +1492,14 @@ fn desktop_exec_value(path: &std::path::Path) -> String {
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
+
     format!("\"{escaped}\"")
 }
 
 #[cfg(target_os = "linux")]
 fn linux_autostart_file_contents() -> Result<String, String> {
     let exe = current_executable_path()?;
+
     Ok(format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName=UsageGuard\nExec={}\nTerminal=false\n",
         desktop_exec_value(&exe)
@@ -1326,6 +1546,7 @@ fn set_cached_start_on_login_enabled(app: &AppHandle, enabled: bool) {
 fn set_start_on_login_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
         let startup_command = windows_start_on_login_command()?;
+
         let output = run_reg_command(&[
             "add",
             WINDOWS_RUN_KEY,
@@ -1355,6 +1576,7 @@ fn set_start_on_login_enabled(enabled: bool) -> Result<(), String> {
             WINDOWS_RUN_VALUE_NAME,
             "/f",
         ])?;
+
         if output.status.success() {
             Ok(())
         } else {
@@ -1366,18 +1588,22 @@ fn set_start_on_login_enabled(enabled: bool) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn set_start_on_login_enabled(enabled: bool) -> Result<(), String> {
     let path = linux_autostart_path()?;
+
     if enabled {
         let dir = path
             .parent()
             .ok_or_else(|| "failed to resolve autostart directory".to_string())?;
+
         std::fs::create_dir_all(dir)
             .map_err(|error| format!("failed to create Linux autostart directory: {error}"))?;
+
         std::fs::write(&path, linux_autostart_file_contents()?)
             .map_err(|error| format!("failed to write Linux autostart file: {error}"))?;
     } else if path.exists() {
         std::fs::remove_file(&path)
             .map_err(|error| format!("failed to remove Linux autostart file: {error}"))?;
     }
+
     Ok(())
 }
 
@@ -1388,13 +1614,16 @@ fn set_start_on_login_enabled(_enabled: bool) -> Result<(), String> {
 
 fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>> {
     let app = window.app_handle();
+
     let always_on_top = window.is_always_on_top().unwrap_or(true);
+
     let light_mode = app
         .state::<AppState>()
         .cfg
         .lock()
         .expect("AppState cfg lock poisoned")
         .light_mode;
+
     let first_sep = PredefinedMenuItem::separator(app)?;
     let second_sep = PredefinedMenuItem::separator(app)?;
     let third_sep = PredefinedMenuItem::separator(app)?;
@@ -1402,6 +1631,7 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
     #[cfg(target_os = "windows")]
     {
         let startup_enabled = cached_start_on_login_enabled(&app);
+
         let startup_toggle = CheckMenuItem::with_id(
             app,
             CTX_START_ON_LOGIN_ID,
@@ -1451,6 +1681,7 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
     #[cfg(target_os = "linux")]
     {
         let startup_enabled = cached_start_on_login_enabled(&app);
+
         let startup_toggle = CheckMenuItem::with_id(
             app,
             CTX_START_ON_LOGIN_ID,
@@ -1611,12 +1842,15 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
 
 fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let first_sep = PredefinedMenuItem::separator(app)?;
+
     let second_sep = PredefinedMenuItem::separator(app)?;
 
     #[cfg(target_os = "windows")]
     {
         let third_sep = PredefinedMenuItem::separator(app)?;
+
         let startup_enabled = cached_start_on_login_enabled(app);
+
         let startup_toggle = CheckMenuItem::with_id(
             app,
             TRAY_START_ON_LOGIN_ID,
@@ -1625,6 +1859,7 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             startup_enabled,
             None::<&str>,
         )?;
+
         *app.state::<AppState>()
             .tray_start_on_login_item
             .lock()
@@ -1654,7 +1889,9 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     #[cfg(target_os = "linux")]
     {
         let third_sep = PredefinedMenuItem::separator(app)?;
+
         let startup_enabled = cached_start_on_login_enabled(app);
+
         let startup_toggle = CheckMenuItem::with_id(
             app,
             TRAY_START_ON_LOGIN_ID,
@@ -1663,6 +1900,7 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             startup_enabled,
             None::<&str>,
         )?;
+
         *app.state::<AppState>()
             .tray_start_on_login_item
             .lock()
@@ -1775,8 +2013,10 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         TRAY_PROVIDERS_ID | CTX_PROVIDERS_ID => spawn_open_provider_settings(app.clone()),
         TRAY_START_ON_LOGIN_ID | CTX_START_ON_LOGIN_ID => {
             let enabled = !cached_start_on_login_enabled(app);
+
             if let Err(error) = set_start_on_login_enabled(enabled) {
                 eprintln!("failed to update {START_ON_LOGIN_LABEL}: {error}");
+
                 emit_native_notification("UsageGuard", START_ON_LOGIN_FAILURE_MESSAGE);
             } else {
                 set_cached_start_on_login_enabled(app, enabled);
@@ -1785,6 +2025,9 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         TRAY_QUIT_ID | CTX_QUIT_ID => save_position_and_exit(app),
         CTX_REFRESH_ID => {
             usageguard_core::invalidate_claude_local_insights_cache();
+
+            usageguard_core::invalidate_codex_wham_cache();
+
             spawn_snapshot_refresh(app.clone());
         }
         CTX_ALWAYS_ON_TOP_ID => {
@@ -1796,12 +2039,17 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         }
         CTX_LIGHT_MODE_ID => {
             let state = app.state::<AppState>();
+
             {
                 let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned");
+
                 cfg.light_mode = !cfg.light_mode;
+
                 let _ = save_config(&cfg);
             }
+
             emit_widget_refresh(app);
+
             if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
                 let _ = win.emit(REFRESH_EVENT, ());
             }
@@ -1818,7 +2066,6 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 }
 
 // --- OAuth PKCE helpers ---
-
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum OAuthTokenEncoding {
@@ -1882,8 +2129,11 @@ const ANTHROPIC_OAUTH_PROVIDER: OAuthProviderConfig = OAuthProviderConfig {
 fn pkce_verifier() -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use rand::RngCore;
+
     let mut bytes = [0u8; 32];
+
     rand::thread_rng().fill_bytes(&mut bytes);
+
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -1891,7 +2141,9 @@ fn pkce_verifier() -> String {
 fn pkce_challenge(verifier: &str) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use sha2::{Digest, Sha256};
+
     let hash = Sha256::digest(verifier.as_bytes());
+
     URL_SAFE_NO_PAD.encode(hash)
 }
 
@@ -1914,9 +2166,11 @@ fn bind_oauth_listener(
                 provider.callback_port
             )
         })?;
+
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("Unable to configure loopback callback: {e}"))?;
+
     Ok((listener, oauth_redirect_uri(provider)))
 }
 
@@ -1931,11 +2185,13 @@ fn parse_callback_code(
     expected_state: &str,
 ) -> Result<String, String> {
     let path = target.split('?').next().unwrap_or_default();
+
     if path != callback_path {
         return Err("Unexpected callback path".to_string());
     }
 
     let query = target.split('?').nth(1).unwrap_or_default();
+
     let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
         .into_owned()
         .collect();
@@ -1947,6 +2203,7 @@ fn parse_callback_code(
     let state = params
         .get("state")
         .ok_or_else(|| "Missing state in callback URL".to_string())?;
+
     if state != expected_state {
         return Err("OAuth state mismatch".to_string());
     }
@@ -1977,13 +2234,16 @@ fn wait_for_callback(
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let _ = stream.set_nonblocking(false);
+
                 let mut reader = BufReader::new(&stream);
 
                 let mut first_line = String::new();
+
                 let _ = reader.read_line(&mut first_line);
 
                 loop {
                     let mut line = String::new();
+
                     match reader.read_line(&mut line) {
                         Ok(0) | Err(_) => break,
                         Ok(_) if line == "\r\n" => break,
@@ -1995,17 +2255,21 @@ fn wait_for_callback(
                     .split_whitespace()
                     .nth(1)
                     .ok_or_else(|| "Malformed callback request".to_string())?;
+
                 let code = parse_callback_code(target, &callback_path, &expected_state);
+
                 let body = oauth_callback_body(match &code {
                     Ok(_) => "Connected to UsageGuard. You can close this tab.",
                     Err(_) => "Sign-in failed. You can close this tab and try again.",
                 });
+
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
+
                 return code;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2034,9 +2298,13 @@ fn oauth_tokens_from_response(
         .as_str()
         .ok_or("No access_token in response")?
         .to_string();
+
     let refresh = response["refresh_token"].as_str().unwrap_or("").to_string();
+
     let expires_in = response["expires_in"].as_i64().unwrap_or(45 * 60).max(61);
+
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in - 60);
+
     Ok((access, refresh, expires_at))
 }
 
@@ -2055,6 +2323,7 @@ fn exchange_code(
         .map_err(|e| e.to_string())?;
 
     let request = client.post(provider.token_url);
+
     let response = match provider.token_encoding {
         OAuthTokenEncoding::Form => {
             let params = vec![
@@ -2064,6 +2333,7 @@ fn exchange_code(
                 ("redirect_uri", redirect_uri.to_string()),
                 ("client_id", provider.client_id.to_string()),
             ];
+
             request.form(&params)
         }
         OAuthTokenEncoding::Json => {
@@ -2074,9 +2344,11 @@ fn exchange_code(
                 "redirect_uri": redirect_uri,
                 "client_id": provider.client_id,
             });
+
             if provider.include_state_in_token_request {
                 body["state"] = serde_json::Value::String(state.to_string());
             }
+
             request
                 .header("Content-Type", "application/json")
                 .json(&body)
@@ -2105,13 +2377,18 @@ async fn authorize_with_oauth(
     String,
 > {
     let verifier = pkce_verifier();
+
     let challenge = pkce_challenge(&verifier);
+
     let state = pkce_verifier();
+
     let (listener, redirect_uri) = bind_oauth_listener(provider)?;
 
     let mut auth_url = reqwest::Url::parse(provider.authorize_url).map_err(|e| e.to_string())?;
+
     {
         let mut query = auth_url.query_pairs_mut();
+
         query
             .append_pair("response_type", "code")
             .append_pair("client_id", provider.client_id)
@@ -2120,6 +2397,7 @@ async fn authorize_with_oauth(
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &state);
+
         for (key, value) in provider.auth_extra_params {
             query.append_pair(key, value);
         }
@@ -2128,7 +2406,9 @@ async fn authorize_with_oauth(
     open::that(auth_url.as_str()).map_err(|e| format!("Could not open browser: {e}"))?;
 
     let callback_path = provider.callback_path.to_string();
+
     let callback_state = state.clone();
+
     let code = tauri::async_runtime::spawn_blocking(move || {
         wait_for_callback(listener, callback_path, callback_state)
     })
@@ -2138,9 +2418,13 @@ async fn authorize_with_oauth(
 
     let response = {
         let code = code.clone();
+
         let verifier = verifier.clone();
+
         let redirect_uri = redirect_uri.clone();
+
         let state = state.clone();
+
         tauri::async_runtime::spawn_blocking(move || {
             exchange_code(provider, &code, &verifier, &redirect_uri, &state)
         })
@@ -2150,6 +2434,7 @@ async fn authorize_with_oauth(
     };
 
     let (access, refresh, expires_at) = oauth_tokens_from_response(&response)?;
+
     Ok((response, access, refresh, expires_at))
 }
 
@@ -2157,10 +2442,14 @@ async fn authorize_with_oauth(
 #[tauri::command]
 async fn connect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<String, String> {
     require_window_label(&window, SETTINGS_LABEL, "connect_openai_oauth")?;
+
     require_secure_storage_available()?;
+
     let (_, access, refresh, expires_at) = authorize_with_oauth(OPENAI_OAUTH_PROVIDER).await?;
+
     let verified = {
         let access = access.clone();
+
         tauri::async_runtime::spawn_blocking(move || verify_openai_oauth_access_token(&access, ""))
             .await
             .map_err(|e| e.to_string())?
@@ -2177,6 +2466,7 @@ async fn connect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<S
     .map_err(|e| e.to_string())?;
 
     spawn_snapshot_refresh(app);
+
     Ok(verified.plan_type)
 }
 
@@ -2184,7 +2474,9 @@ async fn connect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<S
 #[tauri::command]
 async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Result<String, String> {
     require_window_label(&window, SETTINGS_LABEL, "connect_anthropic_oauth")?;
+
     require_secure_storage_available()?;
+
     let (response, access, refresh, expires_at) =
         authorize_with_oauth(ANTHROPIC_OAUTH_PROVIDER).await?;
 
@@ -2198,13 +2490,18 @@ async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Resul
         ],
     )
     .unwrap_or_default();
+
     let rate_limit_tier =
         oauth_response_string(&response, &["rateLimitTier", "rate_limit_tier", "tier"])
             .unwrap_or_default();
+
     let verified = {
         let access = access.clone();
+
         let subscription_type = subscription_type.clone();
+
         let rate_limit_tier = rate_limit_tier.clone();
+
         tauri::async_runtime::spawn_blocking(move || {
             verify_anthropic_oauth_access_token(&access, &subscription_type, &rate_limit_tier)
         })
@@ -2223,6 +2520,7 @@ async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Resul
     .map_err(|e| e.to_string())?;
 
     spawn_snapshot_refresh(app);
+
     Ok(verified.plan_type)
 }
 
@@ -2230,9 +2528,13 @@ async fn connect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Resul
 #[tauri::command]
 fn disconnect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "disconnect_openai_oauth")?;
+
     require_secure_storage_available()?;
+
     usageguard_core::clear_openai_oauth_tokens();
+
     spawn_snapshot_refresh(app);
+
     Ok(())
 }
 
@@ -2240,9 +2542,13 @@ fn disconnect_openai_oauth(window: WebviewWindow, app: AppHandle) -> Result<(), 
 #[tauri::command]
 fn disconnect_anthropic_oauth(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "disconnect_anthropic_oauth")?;
+
     require_secure_storage_available()?;
+
     usageguard_core::clear_anthropic_oauth_tokens();
+
     spawn_snapshot_refresh(app);
+
     Ok(())
 }
 
@@ -2263,19 +2569,25 @@ struct ConsumerStatus {
 #[tauri::command]
 fn get_openai_consumer_status(state: State<AppState>) -> ConsumerStatus {
     let connected = usageguard_core::has_openai_consumer_source();
+
     let supports_usage = usageguard_core::has_openai_consumer_usage();
+
     let supports_5h_usage = supports_usage;
+
     let supports_week_usage = supports_usage;
+
     let plan_type = if connected {
         usageguard_core::get_openai_consumer_plan_type().filter(|s| !s.is_empty())
     } else {
         None
     };
+
     let cfg = state
         .cfg
         .lock()
         .expect("AppState cfg lock poisoned")
         .clone();
+
     ConsumerStatus {
         connected,
         plan_type,
@@ -2299,19 +2611,25 @@ fn get_openai_consumer_status(state: State<AppState>) -> ConsumerStatus {
 #[tauri::command]
 fn get_anthropic_consumer_status(state: State<AppState>) -> ConsumerStatus {
     let connected = usageguard_core::has_anthropic_consumer_source();
+
     let supports_5h_usage = usageguard_core::has_anthropic_consumer_5h_usage();
+
     let supports_week_usage = usageguard_core::has_anthropic_consumer_week_usage();
+
     let supports_usage = supports_5h_usage || supports_week_usage;
+
     let plan_type = if connected {
         usageguard_core::get_anthropic_consumer_plan_type().filter(|s| !s.is_empty())
     } else {
         None
     };
+
     let cfg = state
         .cfg
         .lock()
         .expect("AppState cfg lock poisoned")
         .clone();
+
     ConsumerStatus {
         connected,
         plan_type,
@@ -2347,21 +2665,29 @@ fn set_consumer_label(
     app: AppHandle,
 ) -> Result<(), String> {
     require_window_label(&window, SETTINGS_LABEL, "set_consumer_label")?;
+
     let trimmed = label.trim().to_string();
+
     let label_opt = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed)
     };
+
     let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
+
     match provider.as_str() {
         "openai" => guard.openai_oauth_label = label_opt,
         "anthropic" => guard.anthropic_oauth_label = label_opt,
         _ => return Err(format!("Unknown consumer provider: {provider}")),
     }
+
     save_config(&guard).map_err(|e| e.to_string())?;
+
     drop(guard);
+
     spawn_snapshot_refresh(app);
+
     Ok(())
 }
 
@@ -2379,8 +2705,10 @@ fn set_consumer_window_alerts_enabled(
         SETTINGS_LABEL,
         "set_consumer_window_alerts_enabled",
     )?;
+
     {
         let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned");
+
         match (provider.as_str(), window_key.as_str()) {
             ("openai", "5h") => cfg.openai_oauth_5h_alerts_enabled = enabled,
             ("openai", "week") => cfg.openai_oauth_week_alerts_enabled = enabled,
@@ -2388,11 +2716,16 @@ fn set_consumer_window_alerts_enabled(
             ("anthropic", "week") => cfg.anthropic_oauth_week_alerts_enabled = enabled,
             _ => return Err(format!("Unknown consumer provider: {provider}")),
         }
+
         save_config(&cfg).map_err(|e| e.to_string())?;
+
         refresh_snapshot_alert_state(&state, &cfg);
     }
+
     emit_widget_refresh(&app);
+
     spawn_snapshot_refresh(app);
+
     Ok(())
 }
 
@@ -2417,7 +2750,9 @@ fn send_test_alert(
         code: TEST_ALERT_CODE.into(),
         message: TEST_ALERT_MESSAGE.into(),
     };
+
     let expires_at = Instant::now() + TEST_ALERT_DURATION;
+
     let target_key = snapshot_key(&snapshot);
 
     {
@@ -2425,7 +2760,9 @@ fn send_test_alert(
             .manual_alerts
             .lock()
             .expect("AppState manual_alerts lock poisoned");
+
         prune_manual_alerts(&mut manual_alerts);
+
         manual_alerts.insert(
             target_key.clone(),
             ManualAlert {
@@ -2440,6 +2777,7 @@ fn send_test_alert(
             .snapshots
             .lock()
             .expect("AppState snapshots lock poisoned");
+
         if let Some(snapshot_view) = snapshots
             .iter_mut()
             .find(|view| snapshot_key(&view.snapshot) == target_key)
@@ -2447,6 +2785,7 @@ fn send_test_alert(
             snapshot_view
                 .alerts
                 .retain(|existing_alert| existing_alert.code != TEST_ALERT_CODE);
+
             snapshot_view.alerts.push(alert.clone());
         }
     }
@@ -2455,13 +2794,21 @@ fn send_test_alert(
         .notified_alerts
         .lock()
         .expect("AppState notified_alerts lock poisoned")
-        .insert(alert_signature(&snapshot, &alert));
+        .insert(
+            alert_base_key(&snapshot, &alert),
+            NotifiedAlertEntry {
+                cycle_key: alert_cycle_key(&snapshot, &alert),
+                fired_at: Utc::now(),
+            },
+        );
 
     emit_native_notification(
         "UsageGuard",
         &format!("{}: {}", snapshot.account_label, alert.message),
     );
+
     emit_widget_refresh(&app);
+
     spawn_manual_alert_expiry(app, target_key, expires_at);
 
     Ok(snapshot.account_label)
@@ -2469,15 +2816,22 @@ fn send_test_alert(
 
 #[cfg(test)]
 mod tests {
+
     use super::{
         alert_signature, apply_manual_alerts, apply_provider_account_save,
         clamp_widget_origin_to_area, collect_pending_notifications, compare_versions,
         default_widget_origin_for_area, parse_callback_code, prune_manual_alerts,
-        work_area_contains_point, Alert, AppConfig, LogicalWorkArea, ManualAlert,
-        ProviderAccount, ProviderAccountInput, ProviderCatalogEntry, SnapshotView, UsageSnapshot,
+        work_area_contains_point, Alert, AppConfig, LogicalWorkArea, ManualAlert, ProviderAccount,
+        ProviderAccountInput, ProviderCatalogEntry, SnapshotView, UsageSnapshot,
         ANTHROPIC_OAUTH_PROVIDER, DEFAULT_WIDGET_HEIGHT, DEFAULT_WIDGET_MARGIN_BOTTOM,
-        DEFAULT_WIDGET_MARGIN_RIGHT, DEFAULT_WIDGET_WIDTH, OPENAI_OAUTH_PROVIDER,
-        TEST_ALERT_CODE, TEST_ALERT_MESSAGE,
+        DEFAULT_WIDGET_MARGIN_RIGHT, DEFAULT_WIDGET_WIDTH, OPENAI_OAUTH_PROVIDER, TEST_ALERT_CODE,
+        TEST_ALERT_MESSAGE,
+    };
+    #[cfg(target_os = "linux")]
+    use super::{
+        current_executable_path, desktop_exec_value, is_start_on_login_enabled,
+        linux_autostart_file_contents, linux_autostart_path, set_start_on_login_enabled,
+        XDG_CONFIG_HOME_ENV,
     };
     use chrono::Local;
     use std::cell::Cell;
@@ -2485,14 +2839,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
-    #[cfg(target_os = "linux")]
-    use super::{
-        current_executable_path, desktop_exec_value, is_start_on_login_enabled,
-        linux_autostart_file_contents, linux_autostart_path, set_start_on_login_enabled,
-        XDG_CONFIG_HOME_ENV,
-    };
-
     #[test]
+
     fn callback_requires_matching_state() {
         let err = parse_callback_code(
             "/auth/callback?code=test&state=wrong",
@@ -2500,10 +2848,12 @@ mod tests {
             "expected",
         )
         .unwrap_err();
+
         assert!(err.contains("state mismatch"));
     }
 
     #[test]
+
     fn callback_requires_expected_path() {
         let err = parse_callback_code(
             "/other?code=test&state=expected",
@@ -2511,20 +2861,24 @@ mod tests {
             "expected",
         )
         .unwrap_err();
+
         assert!(err.contains("Unexpected callback path"));
     }
 
     #[test]
+
     fn version_compare_ignores_leading_v_prefix() {
         assert_eq!(compare_versions("v0.2.0", "0.1.9"), Some(Ordering::Greater));
     }
 
     #[test]
+
     fn version_compare_pads_shorter_versions_with_zeroes() {
         assert_eq!(compare_versions("1.2", "1.2.0"), Some(Ordering::Equal));
     }
 
     #[test]
+
     fn version_compare_handles_prerelease_suffixes() {
         assert_eq!(
             compare_versions("1.2.3-beta1", "1.2.2"),
@@ -2533,6 +2887,7 @@ mod tests {
     }
 
     #[test]
+
     fn work_area_contains_point_rejects_offscreen_corner() {
         let area = LogicalWorkArea {
             left: 0.0,
@@ -2542,10 +2897,12 @@ mod tests {
         };
 
         assert!(work_area_contains_point(area, 1919.0, 1079.0));
+
         assert!(!work_area_contains_point(area, -1.0, 1079.0));
     }
 
     #[test]
+
     fn clamp_widget_origin_to_area_keeps_widget_fully_visible() {
         let area = LogicalWorkArea {
             left: 0.0,
@@ -2557,10 +2914,12 @@ mod tests {
         let (x, y) = clamp_widget_origin_to_area(area, 700.0, 550.0);
 
         assert_eq!(x, area.right - DEFAULT_WIDGET_WIDTH);
+
         assert_eq!(y, area.bottom - DEFAULT_WIDGET_HEIGHT);
     }
 
     #[test]
+
     fn default_widget_origin_anchors_to_bottom_right_margin() {
         let area = LogicalWorkArea {
             left: 0.0,
@@ -2575,6 +2934,7 @@ mod tests {
             x,
             area.right - DEFAULT_WIDGET_WIDTH - DEFAULT_WIDGET_MARGIN_RIGHT
         );
+
         assert_eq!(
             y,
             area.bottom - DEFAULT_WIDGET_HEIGHT - DEFAULT_WIDGET_MARGIN_BOTTOM
@@ -2582,6 +2942,7 @@ mod tests {
     }
 
     #[test]
+
     fn callback_extracts_code() {
         let code = parse_callback_code(
             "/auth/callback?code=test-code&state=expected",
@@ -2589,10 +2950,12 @@ mod tests {
             "expected",
         )
         .unwrap();
+
         assert_eq!(code, "test-code");
     }
 
     #[test]
+
     fn anthropic_callback_extracts_code() {
         let code = parse_callback_code(
             "/callback?code=claude-code&state=expected",
@@ -2600,6 +2963,7 @@ mod tests {
             "expected",
         )
         .unwrap();
+
         assert_eq!(code, "claude-code");
     }
 
@@ -2617,58 +2981,79 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+
     fn autostart_env_lock() -> &'static std::sync::Mutex<()> {
         use std::sync::{Mutex, OnceLock};
 
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[cfg(target_os = "linux")]
+
     fn with_autostart_test_dir(name: &str, test: impl FnOnce(std::path::PathBuf)) {
         let _guard = autostart_env_lock().lock().unwrap();
+
         let root = std::env::temp_dir().join(format!(
             "usageguard_autostart_{name}_{}",
             std::process::id()
         ));
+
         let _ = std::fs::remove_dir_all(&root);
+
         std::fs::create_dir_all(&root).unwrap();
+
         std::env::set_var(XDG_CONFIG_HOME_ENV, &root);
+
         test(root.join("autostart"));
+
         std::env::remove_var(XDG_CONFIG_HOME_ENV);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
+
     fn linux_autostart_path_uses_xdg_config_home() {
         with_autostart_test_dir("path", |autostart_dir| {
             let path = linux_autostart_path().unwrap();
+
             assert_eq!(path, autostart_dir.join("com.usageguard.app.desktop"));
         });
     }
 
     #[cfg(target_os = "linux")]
     #[test]
+
     fn linux_autostart_file_has_required_fields() {
         with_autostart_test_dir("contents", |_autostart_dir| {
             let contents = linux_autostart_file_contents().unwrap();
+
             let exe = current_executable_path().unwrap();
 
             assert!(contents.starts_with("[Desktop Entry]\n"));
+
             assert!(contents.contains("Type=Application\n"));
+
             assert!(contents.contains("Version=1.0\n"));
+
             assert!(contents.contains("Name=UsageGuard\n"));
+
             assert!(contents.contains(&format!("Exec={}\n", desktop_exec_value(&exe))));
+
             assert!(contents.contains("Terminal=false\n"));
         });
     }
 
     #[cfg(target_os = "linux")]
     #[test]
+
     fn linux_autostart_state_detects_managed_file() {
         with_autostart_test_dir("detect", |autostart_dir| {
             std::fs::create_dir_all(&autostart_dir).unwrap();
+
             std::fs::write(
                 autostart_dir.join("com.usageguard.app.desktop"),
                 "[Desktop Entry]\nType=Application\nName=UsageGuard\n",
@@ -2681,26 +3066,34 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+
     fn linux_autostart_enable_disable_round_trip() {
         with_autostart_test_dir("round_trip", |_autostart_dir| {
             let path = linux_autostart_path().unwrap();
 
             assert!(!is_start_on_login_enabled());
+
             assert!(!path.exists());
 
             set_start_on_login_enabled(true).unwrap();
+
             assert!(path.exists());
+
             assert!(is_start_on_login_enabled());
 
             set_start_on_login_enabled(false).unwrap();
+
             assert!(!path.exists());
+
             assert!(!is_start_on_login_enabled());
         });
     }
 
     #[test]
+
     fn provider_change_on_edit_is_rejected_server_side() {
         let mut cfg = AppConfig::default();
+
         cfg.provider_accounts.push(ProviderAccount {
             id: "acct_openai_work".into(),
             provider: "openai".into(),
@@ -2730,6 +3123,7 @@ mod tests {
     }
 
     #[test]
+
     fn provider_account_input_rejects_removed_individual_fields() {
         let error = serde_json::from_value::<ProviderAccountInput>(serde_json::json!({
             "provider": "openai",
@@ -2744,15 +3138,19 @@ mod tests {
     }
 
     #[test]
+
     fn label_only_edit_keeps_existing_key_without_validation() {
         let mut cfg = AppConfig::default();
+
         cfg.provider_accounts.push(ProviderAccount {
             id: "acct_openai_work".into(),
             provider: "openai".into(),
             label: "Work".into(),
             endpoint: None,
         });
+
         let validation_called = Cell::new(false);
+
         let persist_key_called = Cell::new(false);
 
         let input = ProviderAccountInput {
@@ -2769,10 +3167,12 @@ mod tests {
             |_| true,
             |_, _| {
                 validation_called.set(true);
+
                 Ok(())
             },
             |_, _| {
                 persist_key_called.set(true);
+
                 Ok(())
             },
             |_| Ok(()),
@@ -2780,14 +3180,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.provider_accounts[0].label, "Renamed");
+
         assert!(!validation_called.get());
+
         assert!(!persist_key_called.get());
     }
 
     #[test]
+
     fn invalid_new_api_key_rejects_without_persisting() {
         let mut cfg = AppConfig::default();
+
         let persisted_key = Cell::new(false);
+
         let persisted_config = Cell::new(false);
 
         let input = ProviderAccountInput {
@@ -2805,31 +3210,40 @@ mod tests {
             |_, _| Err("OpenAI API key is invalid. Nothing was saved.".into()),
             |_, _| {
                 persisted_key.set(true);
+
                 Ok(())
             },
             |_| {
                 persisted_config.set(true);
+
                 Ok(())
             },
         )
         .unwrap_err();
 
         assert!(error.contains("invalid"));
+
         assert!(cfg.provider_accounts.is_empty());
+
         assert!(!persisted_key.get());
+
         assert!(!persisted_config.get());
     }
 
     #[test]
+
     fn key_replacement_failure_keeps_old_key_and_config() {
         let mut cfg = AppConfig::default();
+
         cfg.provider_accounts.push(ProviderAccount {
             id: "acct_openai_work".into(),
             provider: "openai".into(),
             label: "Work".into(),
             endpoint: None,
         });
+
         let persisted_key = Cell::new(false);
+
         let persisted_config = Cell::new(false);
 
         let input = ProviderAccountInput {
@@ -2847,18 +3261,23 @@ mod tests {
             |_, _| Err("OpenAI API key is invalid. Nothing was saved.".into()),
             |_, _| {
                 persisted_key.set(true);
+
                 Ok(())
             },
             |_| {
                 persisted_config.set(true);
+
                 Ok(())
             },
         )
         .unwrap_err();
 
         assert!(error.contains("invalid"));
+
         assert_eq!(cfg.provider_accounts[0].label, "Work");
+
         assert!(!persisted_key.get());
+
         assert!(!persisted_config.get());
     }
 
@@ -2888,10 +3307,14 @@ mod tests {
     }
 
     #[test]
+
     fn notification_state_does_not_reemit_unchanged_alerts() {
         let cfg = AppConfig::default();
+
         let now = Local::now();
-        let mut notified = HashSet::new();
+
+        let mut notified = HashMap::new();
+
         let snapshot = snapshot_view_with_alerts(
             Some("2026-03-10T12:00:00Z"),
             vec![Alert {
@@ -2907,6 +3330,7 @@ mod tests {
             &cfg,
             &mut notified,
         );
+
         let second = collect_pending_notifications(
             std::slice::from_ref(&snapshot),
             now,
@@ -2915,14 +3339,21 @@ mod tests {
         );
 
         assert_eq!(first.len(), 1);
+
         assert!(second.is_empty());
     }
 
     #[test]
-    fn notification_state_rearms_after_alert_clears_and_returns() {
+
+    fn notification_state_suppressed_during_cooldown_even_after_clear() {
+        // After firing once, alert is suppressed for cooldown window even if it clears and returns.
+        // This prevents the alert from re-firing on transient fluctuations.
         let cfg = AppConfig::default();
+
         let now = Local::now();
-        let mut notified = HashSet::new();
+
+        let mut notified = HashMap::new();
+
         let active = snapshot_view_with_alerts(
             Some("2026-03-10T12:00:00Z"),
             vec![Alert {
@@ -2931,6 +3362,7 @@ mod tests {
                 message: "5h quota nearly used up".into(),
             }],
         );
+
         let cleared = snapshot_view_with_alerts(Some("2026-03-10T12:00:00Z"), vec![]);
 
         assert_eq!(
@@ -2938,6 +3370,7 @@ mod tests {
                 .len(),
             1
         );
+
         assert!(collect_pending_notifications(
             std::slice::from_ref(&cleared),
             now,
@@ -2945,14 +3378,19 @@ mod tests {
             &mut notified
         )
         .is_empty());
-        assert_eq!(
-            collect_pending_notifications(std::slice::from_ref(&active), now, &cfg, &mut notified)
-                .len(),
-            1
-        );
+
+        // Same `now` = well within 4h cooldown — should NOT re-fire.
+        assert!(collect_pending_notifications(
+            std::slice::from_ref(&active),
+            now,
+            &cfg,
+            &mut notified
+        )
+        .is_empty());
     }
 
     #[test]
+
     fn notification_signature_rearms_for_new_reset_cycle() {
         let current_cycle = snapshot_view_with_alerts(
             Some("2026-03-10T12:00:00Z"),
@@ -2962,6 +3400,7 @@ mod tests {
                 message: "5h quota nearly used up".into(),
             }],
         );
+
         let next_cycle = snapshot_view_with_alerts(
             Some("2026-03-10T17:00:00Z"),
             vec![Alert {
@@ -2972,18 +3411,22 @@ mod tests {
         );
 
         let current_signature = alert_signature(&current_cycle.snapshot, &current_cycle.alerts[0]);
+
         let next_signature = alert_signature(&next_cycle.snapshot, &next_cycle.alerts[0]);
 
         assert_ne!(current_signature, next_signature);
     }
 
     #[test]
+
     fn manual_test_alert_overlays_matching_snapshot() {
         let mut snapshot_views = vec![snapshot_view_with_alerts(
             Some("2026-03-10T12:00:00Z"),
             vec![],
         )];
+
         let mut manual_alerts = HashMap::new();
+
         manual_alerts.insert(
             "openai::ChatGPT Plus".into(),
             ManualAlert {
@@ -2999,12 +3442,15 @@ mod tests {
         apply_manual_alerts(&mut snapshot_views, &manual_alerts);
 
         assert_eq!(snapshot_views[0].alerts.len(), 1);
+
         assert_eq!(snapshot_views[0].alerts[0].code, TEST_ALERT_CODE);
     }
 
     #[test]
+
     fn prune_manual_alerts_drops_expired_entries() {
         let mut manual_alerts = HashMap::new();
+
         manual_alerts.insert(
             "expired".into(),
             ManualAlert {
@@ -3016,6 +3462,7 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(1),
             },
         );
+
         manual_alerts.insert(
             "fresh".into(),
             ManualAlert {
@@ -3031,6 +3478,7 @@ mod tests {
         prune_manual_alerts(&mut manual_alerts);
 
         assert!(!manual_alerts.contains_key("expired"));
+
         assert!(manual_alerts.contains_key("fresh"));
     }
 }
@@ -3039,11 +3487,14 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let cfg = load_config().map_err(|error| std::io::Error::other(error.to_string()))?;
+
             let saved_position = cfg.widget_position;
+
             let startup_enabled = is_start_on_login_enabled();
+
             app.manage(AppState {
                 cfg: Mutex::new(cfg),
-                notified_alerts: Mutex::new(HashSet::new()),
+                notified_alerts: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(Vec::new()),
                 manual_alerts: Mutex::new(HashMap::new()),
                 refresh: Mutex::new(RefreshState::default()),
@@ -3062,13 +3513,16 @@ fn main() {
             app.on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()));
 
             let tray_is_available = setup_tray(app)?;
+
             set_tray_available(&app.handle(), tray_is_available);
+
             #[cfg(target_os = "linux")]
             if !tray_is_available {
                 show_main_window(&app.handle());
             }
 
             spawn_snapshot_refresh(app.handle().clone());
+
             spawn_release_check(app.handle().clone());
 
             Ok(())

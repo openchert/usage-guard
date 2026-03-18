@@ -77,7 +77,15 @@ export interface HybridUsageCardSpec extends UsageCardBase {
   stats: MetricStatSpec[];
 }
 
-export type UsageCardSpec = QuotaUsageCardSpec | MetricsUsageCardSpec | HybridUsageCardSpec;
+export interface StatusUsageCardSpec extends UsageCardBase {
+  kind: 'status';
+  /** Visual state of the ring animation. */
+  statusKind: 'loading' | 'waiting' | 'auth' | 'error';
+  /** Short label shown beneath the ring (e.g. "syncing", "sign in"). */
+  label: string;
+}
+
+export type UsageCardSpec = QuotaUsageCardSpec | MetricsUsageCardSpec | HybridUsageCardSpec | StatusUsageCardSpec;
 
 export interface UsageDisplayContext {
   providerLabel: string;
