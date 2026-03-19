@@ -11,24 +11,22 @@ UsageGuard stores secrets through OS-native secure storage:
 - Windows: DPAPI-encrypted blob at `%APPDATA%\usage-guard\secrets.bin`
 - Linux: desktop Secret Service keyring through the OS credential store (for example GNOME Keyring or a KWallet-backed Secret Service provider)
 
-For normal operation, the app reads and writes secrets only through secure OS storage for API keys and any legacy secrets from older builds. Consumer usage import reads local Codex and Claude Code files directly from the current user profile.
+For normal operation, the app reads and writes secrets only through secure OS storage for provider API keys. Consumer monitoring reads local Codex and Claude Code files directly from the current user profile and uses those local credentials only in memory when a built-in consumer usage fetch is needed.
 
 The encrypted payload currently contains:
 
 - Provider API keys for OpenAI and Anthropic accounts
-- Legacy OpenAI OAuth refresh token, `account_id`, and `plan_type` fields from earlier builds
-- Legacy Anthropic OAuth refresh token, `subscription_type`, and `rate_limit_tier` fields from earlier builds
 
-OAuth access tokens are not written to disk. The current default consumer flow does not request or refresh consumer OAuth tokens.
+Legacy browser-sign-in payloads from earlier builds are ignored and cleaned up during migration. The current consumer flow does not request, store, or refresh consumer tokens inside UsageGuard.
 
 ## Supported connection types
 
 Current built-in connection types are:
 
-- OpenAI `consumer_local`: Codex consumer usage via local Codex session logs under `~/.codex/sessions`
-- Anthropic `consumer_local`: Claude Code exact `5h` quota via local CLI insights
-- Anthropic `consumer_local_metrics`: Claude Code local token activity via `~/.claude/projects`
-- Anthropic `consumer_local_status`: Claude Code local status via `~/.claude/.credentials.json`
+- OpenAI `consumer_local`: Codex consumer usage via fresh local session logs under `~/.codex/sessions`, with a built-in fallback fetch that uses the local token from `~/.codex/auth.json`
+- OpenAI `consumer_local_status`: Codex local signed-in status when quota data is not available yet
+- Anthropic `consumer_local`: Claude Code consumer usage via the local credentials file plus a built-in usage fetch that uses the local token from `~/.claude/.credentials.json`
+- Anthropic `consumer_local_status`: Claude Code local status via `~/.claude/.credentials.json` when quota data is not available yet
 - OpenAI `api`: `GET https://api.openai.com/v1/organization/costs` and `GET https://api.openai.com/v1/organization/usage/completions`
 - Anthropic `api`: `GET https://api.anthropic.com/v1/organizations/cost_report` and `GET https://api.anthropic.com/v1/organizations/usage_report/messages`
 
@@ -39,24 +37,24 @@ Outbound requests are limited to these built-in audited endpoints. Custom endpoi
 Codex consumer usage is imported from local files created by the official Codex client.
 
 1. The official Codex client signs the user in locally.
-2. UsageGuard detects local auth state from `~/.codex/auth.json`.
+2. UsageGuard detects local sign-in and reads the local access token and account id from `~/.codex/auth.json`.
 3. UsageGuard scans recent session logs under `~/.codex/sessions`.
-4. The latest `token_count` event with `rate_limits` becomes the normalized `5h` and `week` quota snapshot.
-
-No consumer OAuth token exchange is performed in the default UI path.
+4. The latest fresh `token_count` event with `rate_limits` becomes the normalized `5h` and `week` quota snapshot.
+5. If the session logs are stale or missing, UsageGuard uses the local access token from `auth.json` in memory to call the built-in Codex consumer usage endpoint.
+6. The fallback response is normalized into the same consumer quota model and cached briefly.
 
 ## Anthropic local consumer detection
 
 Claude Code local state is read from the user profile.
 
 1. The official Claude Code client signs the user in locally.
-2. UsageGuard reads `subscriptionType` and `rateLimitTier` from `%USERPROFILE%\.claude\.credentials.json`.
-3. UsageGuard runs `claude -p --verbose --output-format stream-json "/insights"` and parses the local `five_hour` quota event.
-4. UsageGuard scans recent JSONL project logs under `%USERPROFILE%\.claude\projects`.
-5. Recent assistant-message token counts are aggregated into rolling local activity windows.
-6. The widget shows exact local `5h` quota and local `7d` activity.
+2. UsageGuard reads `subscriptionType`, `rateLimitTier`, `accessToken`, and `expiresAt` from `%USERPROFILE%\.claude\.credentials.json` or `~/.claude/.credentials.json`.
+3. `subscriptionType` and `rateLimitTier` drive the local plan label shown by the widget.
+4. If the local `accessToken` is still valid, UsageGuard uses it in memory to call the built-in Claude Code usage endpoint.
+5. The response is normalized into the shared consumer quota model and cached briefly for the widget refresh loop.
+6. If quota data is not available yet, the widget still shows the local Claude Code status snapshot instead of a browser sign-in prompt.
 
-UsageGuard does not import Claude access tokens from that file for normal operation. Weekly consumer quota percentage is not exposed through the local Claude Code client, so the built-in view shows exact `5h` quota plus local activity instead of a fake weekly percentage.
+The current desktop status/settings flow officially treats Claude `5h` quota as supported. A longer secondary window can still appear in the widget when the upstream response includes it.
 
 ## API-key authentication
 
@@ -83,7 +81,7 @@ This protects secrets at rest against casual disclosure such as:
 - copied config directories
 - inspecting files in `%APPDATA%`
 - copying Linux config directories without also having access to the user's unlocked secret-service session
-- accidental plaintext token leakage from local app files
+- accidental plaintext token leakage from UsageGuard-managed storage
 
 It does not attempt to defend against:
 
@@ -96,4 +94,4 @@ It does not attempt to defend against:
 - Secure persistence is implemented on Windows and Linux in this release.
 - If secure persistence is unavailable, UsageGuard does not intentionally fall back to plaintext secret storage.
 - On Linux, a Secret Service provider must be available and unlocked for credential persistence to work.
-- Claude Code local detection currently does not include a reliable local weekly consumer quota percentage.
+- Claude Code desktop status/settings currently expose the `5h` window as the supported local quota signal, even though the normalized snapshot can carry a longer secondary window when the upstream response includes it.

@@ -17,35 +17,11 @@ const LINUX_BACKEND_ID: &str = "linux-secret-service";
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 const UNSUPPORTED_BACKEND_ID: &str = "unsupported";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct OpenAiOAuthSecret {
-    #[serde(default)]
-    pub refresh_token: String,
-    #[serde(default)]
-    pub account_id: String,
-    #[serde(default)]
-    pub plan_type: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct AnthropicOAuthSecret {
-    #[serde(default)]
-    pub refresh_token: String,
-    #[serde(default)]
-    pub subscription_type: String,
-    #[serde(default)]
-    pub rate_limit_tier: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretPayload {
     pub version: u32,
     #[serde(default)]
     pub provider_api_keys: HashMap<String, String>,
-    #[serde(default)]
-    pub openai_oauth: OpenAiOAuthSecret,
-    #[serde(default)]
-    pub anthropic_oauth: AnthropicOAuthSecret,
 }
 
 impl Default for SecretPayload {
@@ -53,10 +29,14 @@ impl Default for SecretPayload {
         Self {
             version: SECRET_PAYLOAD_VERSION,
             provider_api_keys: HashMap::new(),
-            openai_oauth: OpenAiOAuthSecret::default(),
-            anthropic_oauth: AnthropicOAuthSecret::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct LegacySecretPayload {
+    #[serde(default)]
+    provider_api_keys: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,8 +90,13 @@ impl SecretStore {
             return Ok(SecretPayload::default());
         };
 
-        let payload = serde_json::from_slice::<SecretPayload>(&raw)
+        let payload = serde_json::from_slice::<LegacySecretPayload>(&raw)
             .context("Secret store is invalid JSON")?;
+
+        let payload = SecretPayload {
+            version: SECRET_PAYLOAD_VERSION,
+            provider_api_keys: payload.provider_api_keys,
+        };
 
         if payload.version != SECRET_PAYLOAD_VERSION {
             return Err(anyhow!(
@@ -134,6 +119,7 @@ impl SecretStore {
         save_payload_bytes(&raw)
     }
 
+    #[cfg(test)]
     pub fn clear() -> Result<()> {
         clear_payload_bytes()
     }
@@ -247,7 +233,7 @@ fn save_payload_bytes(_raw: &[u8]) -> Result<()> {
     ))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(test, target_os = "windows"))]
 fn clear_payload_bytes() -> Result<()> {
     let path = SecretStore::path()?;
     if path.exists() {
@@ -257,7 +243,7 @@ fn clear_payload_bytes() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn clear_payload_bytes() -> Result<()> {
     let entry = linux_secret_entry()?;
     match entry.delete_credential() {
@@ -268,7 +254,7 @@ fn clear_payload_bytes() -> Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(all(test, not(any(target_os = "windows", target_os = "linux"))))]
 fn clear_payload_bytes() -> Result<()> {
     Err(anyhow!(
         "Secure secret persistence is only implemented for Windows and Linux in this release"
@@ -393,18 +379,45 @@ mod tests {
         payload
             .provider_api_keys
             .insert("openai".into(), "sk-test".into());
-        payload.openai_oauth.refresh_token = "refresh-token".into();
-        payload.openai_oauth.account_id = "acct_123".into();
-        payload.openai_oauth.plan_type = "plus".into();
-        payload.anthropic_oauth.refresh_token = "claude-refresh".into();
-        payload.anthropic_oauth.subscription_type = "max".into();
-        payload.anthropic_oauth.rate_limit_tier = "premium".into();
 
         let raw = serde_json::to_vec(&payload).unwrap();
         let encrypted = encrypt_bytes(&raw).unwrap();
         let decrypted = decrypt_bytes(&encrypted).unwrap();
         let loaded = serde_json::from_slice::<SecretPayload>(&decrypted).unwrap();
         assert_eq!(loaded, payload);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn legacy_secret_payload_loads_and_drops_oauth_fields() {
+        with_test_dir("legacy", |app_dir| {
+            fs::create_dir_all(app_dir).unwrap();
+            let legacy = serde_json::json!({
+                "version": 1,
+                "provider_api_keys": {
+                    "openai": "sk-test"
+                },
+                "openai_oauth": {
+                    "refresh_token": "refresh-token",
+                    "account_id": "acct_123",
+                    "plan_type": "plus"
+                },
+                "anthropic_oauth": {
+                    "refresh_token": "claude-refresh",
+                    "subscription_type": "max",
+                    "rate_limit_tier": "premium"
+                }
+            });
+            let encrypted = encrypt_bytes(serde_json::to_string(&legacy).unwrap().as_bytes()).unwrap();
+            fs::write(app_dir.join(SECRET_STORE_FILE_NAME), encrypted).unwrap();
+
+            let loaded = SecretStore::load().unwrap();
+            assert_eq!(loaded.provider_api_keys.get("openai"), Some(&"sk-test".to_string()));
+            assert_eq!(loaded, SecretPayload {
+                version: SECRET_PAYLOAD_VERSION,
+                provider_api_keys: HashMap::from([("openai".into(), "sk-test".into())]),
+            });
+        });
     }
 
     #[cfg(target_os = "windows")]

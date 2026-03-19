@@ -4,7 +4,7 @@ import type {
   UsageDisplayContext,
   UsageSnapshot,
 } from '../types';
-import { formatResetTime } from './shared';
+import { buildCardTitle, formatResetTime, quotaResetAt, quotaUsedPercent } from './shared';
 
 function clampRatio(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -20,25 +20,24 @@ function displayLabel(snapshot: UsageSnapshot, context: UsageDisplayContext): st
   return snapshot.account_label?.trim() || context.providerLabel;
 }
 
-export const openaiOauthDisplayAdapter: UsageDisplayAdapter = {
-  id: 'openai-oauth',
+export const openaiConsumerQuotaDisplayAdapter: UsageDisplayAdapter = {
+  id: 'openai-consumer-quota',
   matches(snapshot) {
-    return snapshot.provider === 'openai'
-      && (snapshot.source === 'oauth' || snapshot.source === 'consumer_local');
+    return snapshot.provider === 'openai' && snapshot.source === 'consumer_local';
   },
   toCard(snapshot, context): UsageCardSpec {
     const label = displayLabel(snapshot, context);
-    const primaryUsed = snapshot.tokens_in ?? 0;
-    const secondaryUsed = snapshot.spent_usd ?? 0;
+    const primaryUsed = quotaUsedPercent(snapshot, 'primary') ?? 0;
+    const secondaryUsed = quotaUsedPercent(snapshot, 'secondary') ?? 0;
     const primaryLeft = Math.round(remainingRatio(primaryUsed) * 100);
     const secondaryLeft = Math.round(remainingRatio(secondaryUsed) * 100);
 
-    const primaryReset = formatResetTime(snapshot.primary_reset_at);
-    const secondaryReset = formatResetTime(snapshot.secondary_reset_at);
+    const primaryReset = formatResetTime(quotaResetAt(snapshot, 'primary'));
+    const secondaryReset = formatResetTime(quotaResetAt(snapshot, 'secondary'));
     const titleLines = [label];
     titleLines.push(`5h used: ${primaryUsed}% | left: ${primaryLeft}%`);
     if (primaryReset) titleLines.push(`  resets: ${primaryReset}`);
-    titleLines.push('─────────────────────');
+    titleLines.push('---------------------');
     titleLines.push(`week used: ${secondaryUsed}% | left: ${secondaryLeft}%`);
     if (secondaryReset) titleLines.push(`  resets: ${secondaryReset}`);
     if (snapshot.status_message) {
@@ -48,10 +47,10 @@ export const openaiOauthDisplayAdapter: UsageDisplayAdapter = {
     return {
       kind: 'quota',
       displayLabel: label,
-      title: titleLines.join('\n'),
+      title: buildCardTitle(snapshot, titleLines),
       rings: [
-        { label: '5h', ratio: remainingRatio(snapshot.tokens_in) },
-        { ratio: remainingRatio(snapshot.spent_usd) },
+        { label: '5h', ratio: remainingRatio(primaryUsed) },
+        { ratio: remainingRatio(secondaryUsed) },
       ],
     };
   },

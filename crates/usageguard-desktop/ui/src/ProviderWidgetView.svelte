@@ -29,8 +29,10 @@
   let refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS;
   let refreshTimer: number | null = null;
   let startupRevealTimer: number | null = null;
+  let contextMenuResetTimer: number | null = null;
   let lastRenderedCardCount: number | null = null;
   let unlistenRefresh: (() => void) | null = null;
+  let contextMenuActive = false;
 
   type AlertLevel = 'critical' | 'warning' | 'info';
 
@@ -184,12 +186,45 @@
     }
   }
 
+  function clearContextMenuCursor(): void {
+    contextMenuActive = false;
+    if (contextMenuResetTimer !== null) {
+      window.clearTimeout(contextMenuResetTimer);
+      contextMenuResetTimer = null;
+    }
+
+    window.removeEventListener('mousedown', clearContextMenuCursor, true);
+    window.removeEventListener('mousemove', clearContextMenuCursor, true);
+    window.removeEventListener('wheel', clearContextMenuCursor, true);
+    window.removeEventListener('keydown', clearContextMenuCursor, true);
+    window.removeEventListener('blur', clearContextMenuCursor);
+  }
+
+  function armContextMenuCursorReset(): void {
+    clearContextMenuCursor();
+    contextMenuActive = true;
+
+    window.addEventListener('mousedown', clearContextMenuCursor, true);
+    window.addEventListener('mousemove', clearContextMenuCursor, true);
+    window.addEventListener('wheel', clearContextMenuCursor, true);
+    window.addEventListener('keydown', clearContextMenuCursor, true);
+    window.addEventListener('blur', clearContextMenuCursor);
+
+    // Native context menus do not emit a close event back into the page.
+    // Reset on the next user interaction, with a timeout fallback.
+    contextMenuResetTimer = window.setTimeout(() => {
+      clearContextMenuCursor();
+    }, 5000);
+  }
+
   function onContextMenu(event: MouseEvent): void {
     event.preventDefault();
+    armContextMenuCursorReset();
     if (!invoke) return;
 
     void invoke('show_context_menu', { x: event.clientX, y: event.clientY }).catch((error) => {
       console.error('show_context_menu failed:', error);
+      clearContextMenuCursor();
     });
   }
 
@@ -243,6 +278,7 @@
   });
 
   onDestroy(() => {
+    clearContextMenuCursor();
     document.removeEventListener('contextmenu', onContextMenu);
     document.removeEventListener('selectstart', onSelectStart);
     unlistenRefresh?.();
@@ -251,7 +287,12 @@
   });
 </script>
 
-<div class="widget-shell" on:mousedown={startDrag} role="presentation">
+<div
+  class="widget-shell"
+  class:context-menu-active={contextMenuActive}
+  on:mousedown={startDrag}
+  role="presentation"
+>
   {#if bootstrapComplete && snapshots.length === 0 && !isLoading && !hasConfiguredSources}
     <div class="empty-state">
       <span class="empty-copy">Right-click to connect a provider</span>
@@ -328,21 +369,6 @@
                   stroke-width="3" stroke-linecap="round"
                   stroke-dasharray="7 6.6"
                 />
-              {:else if card.statusKind === 'auth'}
-                <!-- Broken dashed ring + up-arrow — sign in required -->
-                <circle
-                  cx="17" cy="17" r="13"
-                  fill="none" stroke={provider.color}
-                  stroke-width="2.5" stroke-dasharray="4.5 3.5"
-                  opacity="0.4"
-                />
-                <text
-                  x="17" y="17"
-                  text-anchor="middle" dominant-baseline="central"
-                  font-size="12" fill={provider.color}
-                  font-family="Segoe UI, sans-serif"
-                  opacity="0.85"
-                >↑</text>
               {:else}
                 <!-- Sparse dashed ring + exclamation — error / unavailable -->
                 <circle
@@ -395,6 +421,11 @@
 
   .widget-shell:active {
     cursor: grabbing;
+  }
+
+  .widget-shell.context-menu-active,
+  .widget-shell.context-menu-active * {
+    cursor: default !important;
   }
 
   .empty-state {
@@ -583,3 +614,5 @@
     50%      { opacity: 0.6;  }
   }
 </style>
+
+

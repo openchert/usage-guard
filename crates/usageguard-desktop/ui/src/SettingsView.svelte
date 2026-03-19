@@ -364,28 +364,28 @@
       <div class="section-label">Local consumer apps</div>
 
       <!-- Codex local status -->
-      <div class="oauth-row" class:oauth-connected={openaiConsumerStatus.connected}>
+      <div class="consumer-row" class:consumer-connected={openaiConsumerStatus.connected}>
         <div class="account-dot" style="--accent:{openaiConsumerStatus.connected ? '#10a37f' : 'rgba(130, 138, 165, 0.35)'}"></div>
         {#if false}
-          <span class="account-vendor" style="flex:1">Waiting for browser…</span>
+          <span class="account-vendor" style="flex:1">Waiting for local data…</span>
         {:else if openaiConsumerStatus.connected}
           <input
-            class="oauth-name"
+            class="consumer-name"
             type="text"
             bind:value={openaiEditLabel}
             on:blur={() => saveConsumerLabel('openai', openaiEditLabel)}
             on:mousedown|stopPropagation
           />
-          <span class="oauth-provider-label">{openaiConsumerStatus.source_label}</span>
+          <span class="consumer-provider-label">{openaiConsumerStatus.source_label}</span>
         {:else}
-          <span class="oauth-provider-label">Codex</span>
+          <span class="consumer-provider-label">Codex</span>
           <span class="account-vendor">{openaiConsumerStatus.source_label}</span>
         {/if}
       </div>
       {#if openaiConsumerStatus.connected}
-        <div class="oauth-subrow">
-          <span class="oauth-subrow-label">Alerts</span>
-          <label class="oauth-checkbox">
+        <div class="consumer-subrow">
+          <span class="consumer-subrow-label">Alerts</span>
+          <label class="consumer-checkbox">
             <input
               type="checkbox"
               checked={openaiConsumerStatus.alerts_5h_enabled}
@@ -395,7 +395,7 @@
             />
             <span>5h</span>
           </label>
-          <label class="oauth-checkbox">
+          <label class="consumer-checkbox">
             <input
               type="checkbox"
               checked={openaiConsumerStatus.alerts_week_enabled}
@@ -421,28 +421,28 @@
       {/if}
 
       <!-- Claude Code local status -->
-      <div class="oauth-row" class:oauth-connected={anthropicConsumerStatus.connected}>
+      <div class="consumer-row" class:consumer-connected={anthropicConsumerStatus.connected}>
         <div class="account-dot" style="--accent:{anthropicConsumerStatus.connected ? '#d97a4e' : 'rgba(130, 138, 165, 0.35)'}"></div>
         {#if false}
-          <span class="account-vendor" style="flex:1">Waiting for browser…</span>
+          <span class="account-vendor" style="flex:1">Waiting for local data…</span>
         {:else if anthropicConsumerStatus.connected}
           <input
-            class="oauth-name"
+            class="consumer-name"
             type="text"
             bind:value={anthropicEditLabel}
             on:blur={() => saveConsumerLabel('anthropic', anthropicEditLabel)}
             on:mousedown|stopPropagation
           />
-          <span class="oauth-provider-label">{anthropicConsumerStatus.source_label}</span>
+          <span class="consumer-provider-label">{anthropicConsumerStatus.source_label}</span>
         {:else}
-          <span class="oauth-provider-label">Claude Code</span>
+          <span class="consumer-provider-label">Claude Code</span>
           <span class="account-vendor">{anthropicConsumerStatus.source_label}</span>
         {/if}
       </div>
       {#if anthropicConsumerStatus.connected}
-        <div class="oauth-subrow">
-          <span class="oauth-subrow-label">Alerts</span>
-          <label class="oauth-checkbox">
+        <div class="consumer-subrow">
+          <span class="consumer-subrow-label">Alerts</span>
+          <label class="consumer-checkbox">
             <input
               type="checkbox"
               checked={anthropicConsumerStatus.alerts_5h_enabled}
@@ -452,7 +452,7 @@
             />
             <span>5h</span>
           </label>
-          <label class="oauth-checkbox">
+          <label class="consumer-checkbox">
             <input
               type="checkbox"
               checked={anthropicConsumerStatus.alerts_week_enabled}
@@ -700,8 +700,8 @@
     color: var(--text-lo);
   }
 
-  /* OAuth rows */
-  .oauth-row {
+  /* Consumer rows */
+  .consumer-row {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -712,7 +712,7 @@
     flex-shrink: 0;
   }
 
-  .oauth-subrow {
+  .consumer-subrow {
     display: flex;
     align-items: center;
     gap: 10px;
@@ -722,13 +722,13 @@
     flex-shrink: 0;
   }
 
-  .oauth-subrow-label {
+  .consumer-subrow-label {
     font-size: 10px;
     color: var(--text-lo);
     line-height: 1;
   }
 
-  .oauth-checkbox {
+  .consumer-checkbox {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -740,7 +740,7 @@
     -webkit-user-select: none;
   }
 
-  .oauth-checkbox input {
+  .consumer-checkbox input {
     width: 11px;
     height: 11px;
     margin: 0;
@@ -748,13 +748,13 @@
     cursor: pointer;
   }
 
-  .oauth-provider-label {
+  .consumer-provider-label {
     flex: 1;
     font-size: 12px;
     color: var(--text-mid);
   }
 
-  .oauth-name {
+  .consumer-name {
     flex: 1;
     border: none;
     background: transparent;
@@ -766,7 +766,7 @@
     padding: 0;
     min-width: 0;
   }
-  .oauth-name:focus {
+  .consumer-name:focus {
     border-bottom: 1px solid rgba(100, 140, 255, 0.4);
   }
 
@@ -1043,3 +1043,4 @@
   .save-btn:hover:not(:disabled) { background: var(--surface-btn-hover); }
   .save-btn:disabled { opacity: 0.5; cursor: default; }
 </style>
+

@@ -1,7 +1,7 @@
 # UsageGuard Project
 
 > Historical note: parts of this document predate the security hardening pass.
-> Current secret-storage and OAuth behavior is documented in `docs/SECURITY.md`.
+> Current secret-storage and local consumer behavior is documented in `docs/SECURITY.md` and `docs/LOCAL_CONSUMER_SOURCES.md`.
 > Current provider/source display behavior is documented in `docs/PROVIDERS.md`.
 
 UsageGuard is a local-first AI usage monitor built as a Rust workspace. It normalizes usage data from multiple providers into one shared snapshot model, then exposes that data through a CLI and a compact desktop widget.
@@ -17,7 +17,18 @@ UsageGuard is a local-first AI usage monitor built as a Rust workspace. It norma
 
 ## Snapshot pipeline
 
-For each provider, `usageguard-core` resolves data in this order:
+`usageguard-core` uses two different acquisition paths depending on the provider type.
+
+### Local consumer sources
+
+- OpenAI / Codex:
+  fresh `~/.codex/sessions/**/*.jsonl` quota data first, then a built-in fallback fetch using the local token from `~/.codex/auth.json`, then a local status snapshot if Codex is signed in but quota data is not available yet.
+- Anthropic / Claude Code:
+  local plan metadata from `~/.claude/.credentials.json`, then a built-in usage fetch using the local token from that file, then a local status snapshot if Claude Code is signed in but quota data is not available yet.
+
+### API and admin monitoring sources
+
+For API/admin providers, `usageguard-core` resolves data in this order:
 
 1. Provider usage log from `*_USAGE_LOG` if present.
 2. HTTP API call using configured endpoint and API key.
@@ -36,7 +47,7 @@ Every provider is normalized into the shared `UsageSnapshot` model with:
 
 Alerts are evaluated after snapshot collection. Current alert logic covers:
 
-- OAuth quota alerts for `5h` and `week` windows
+- local consumer quota alerts for `5h` and `week` windows where available
 - near-limit warnings when quota is almost exhausted
 - use-before-reset reminders when reset is close and usage is still low
 - legacy budget and inactivity alerts for API/admin monitoring sources
@@ -64,10 +75,9 @@ The current desktop app is a Tauri 2 widget, not the older `eframe/egui` shell.
 ## Configuration and secrets
 
 - Shared config is stored at the OS config directory under `usage-guard/config.json`.
-- On Windows, API keys and OAuth refresh tokens are stored in `%APPDATA%\usage-guard\secrets.bin` using DPAPI.
-- On Linux, API keys and OAuth refresh tokens are stored in the desktop Secret Service keyring.
-- OpenAI OAuth access tokens stay in memory only and are refreshed when needed.
-- Legacy plaintext OAuth storage and legacy keyring entries are migrated into the encrypted store on load.
+- On Windows, provider API keys are stored in `%APPDATA%\usage-guard\secrets.bin` using DPAPI.
+- On Linux, provider API keys are stored in the desktop Secret Service keyring.
+- Legacy browser-sign-in storage from older builds is cleaned up on load and is not used by the current runtime.
 - Named provider accounts are stored in `provider_accounts` and can reuse the same vendor multiple times with different labels and keys.
 - The first hardened desktop deploy is locked to built-in audited endpoints for outbound fetches.
 - Legacy custom provider profiles are no longer used for outbound fetches.
@@ -92,8 +102,8 @@ The desktop build uses Tauri's `beforeBuildCommand` to build the Svelte UI from 
 
 ## Related docs
 
+- `docs/LOCAL_CONSUMER_SOURCES.md`: exact local-file and token-backed consumer acquisition flow.
+- `docs/SECURITY.md`: secret storage, local credential usage boundaries, and threat model.
+- `docs/PROVIDERS.md`: provider/source display adapters and normalized card behavior.
 - `docs/SESSION_2026-03-08_DESKTOP_REWRITE.md`: recap of the desktop rewrite and native context menu work.
 - `docs/ALERTS.md`: quota alert thresholds, reminder windows, and delivery behavior.
-- `docs/INTERFACES.md`: provider adapter contracts and normalized schema.
-- `docs/ADAPTER_EXAMPLES.md`: examples for custom providers and NDJSON inputs.
-- `docs/NEXT_STEPS.md`: public roadmap summary.

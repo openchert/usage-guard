@@ -10,6 +10,9 @@
 /crates/usageguard-cli/target_*/
 /docs/*
 !/docs/ALERTS.md
+!/docs/ARCHIVE_BROWSER_SIGNIN_DESIGN.md
+!/docs/ARCHIVE_BROWSER_SIGNIN_IMPLEMENTATION.md
+!/docs/LOCAL_CONSUMER_SOURCES.md
 !/docs/PROJECT.md
 !/docs/PROVIDERS.md
 !/docs/SECURITY.md

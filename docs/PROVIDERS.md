@@ -10,9 +10,8 @@ Instead, each provider/source combination can define its own display adapter und
 
 Examples:
 
-- `openaiOauth.ts`
-- `anthropicOauth.ts`
-- `anthropicConsumerMetrics.ts`
+- `openaiConsumerQuota.ts`
+- `anthropicConsumerHybrid.ts`
 - `consumerStatus.ts`
 - `openaiApi.ts`
 - `anthropicApi.ts`
@@ -28,7 +27,14 @@ Each adapter is responsible for converting those raw semantics into the normaliz
 
 ## OpenAI local consumer display behavior
 
-Codex local consumer import uses recent JSONL session logs under `~/.codex/sessions`.
+Codex local consumer import uses recent JSONL session logs under `~/.codex/sessions`, with a token-backed fallback sourced from `~/.codex/auth.json`.
+
+Acquisition order:
+
+1. Read the freshest `token_count` event with `rate_limits` from `~/.codex/sessions/**/*.jsonl`.
+2. If that payload is fresh, normalize it directly into the `5h` and `week` consumer windows.
+3. If local session data is stale or missing, call the built-in Codex consumer usage endpoint using the access token and account id from `~/.codex/auth.json`.
+4. Cache that fallback snapshot briefly so the widget refresh loop can reuse it.
 
 The widget reads:
 
@@ -42,18 +48,27 @@ The UI then converts usage into remaining quota for the display rings:
 
 The Codex hover text is adapter-specific and shows both used and remaining values.
 When the local session entry includes reset timestamps, the hover text also shows the next reset time for the `5h` and `week` windows.
+When the fallback fetch is used instead, the same normalized ring model is filled from the provider response so the card still behaves like a local consumer quota card.
 
 ## Anthropic local consumer behavior
 
-Claude Code local import uses `%USERPROFILE%\.claude\.credentials.json` together with recent project logs under `%USERPROFILE%\.claude\projects`.
+Claude Code local import uses `%USERPROFILE%\.claude\.credentials.json` or `~/.claude/.credentials.json`.
+
+The credentials file provides both local status metadata and, when available, the local access token used for the built-in consumer usage fetch.
+
+Acquisition order:
+
+1. Read `subscriptionType` and `rateLimitTier` from the local credentials file to derive the Claude Code account label.
+2. Read `accessToken` and `expiresAt` from that same file.
+3. If the token is still valid, call the built-in Claude Code usage endpoint and normalize the response into consumer quota windows.
+4. Cache the normalized windows briefly so the desktop status path stays cheap and startup does not block on a live fetch.
 
 The built-in local adapters render:
 
-- an exact `5h` quota window from `claude -p --verbose --output-format stream-json "/insights"`
-- `7d` token activity from recent assistant messages
-- request counts derived from assistant messages in local project logs
+- the `5h` quota window when the provider response includes it
+- an optional longer secondary window when the provider response includes one
 
-The `5h` window is exact. The weekly consumer quota percentage is still unavailable in the safe local path, so the card shows local `7d` activity instead of a fake weekly quota ring.
+If quota data is not available yet, the widget falls back to a `consumer_local_status` snapshot with the local plan label instead of a fake quota ring.
 
 ## API display behavior
 
@@ -85,9 +100,7 @@ The API hover text also explains the upstream source for each metric so billing-
 
 Current source values are:
 
-- `oauth`
 - `consumer_local`
-- `consumer_local_metrics`
 - `consumer_local_status`
 - `api`
 - `env`
@@ -116,5 +129,7 @@ Current built-in remote fetch sources:
 
 - OpenAI API
 - Anthropic API
+- OpenAI Codex consumer usage endpoint, reached with the local token from `~/.codex/auth.json` only when fresh session logs are unavailable
+- Anthropic Claude Code consumer usage endpoint, reached with the local token from `~/.claude/.credentials.json`
 
 Environment/log fallbacks, local consumer sources, and demo data still exist as non-remote fallback paths where applicable.

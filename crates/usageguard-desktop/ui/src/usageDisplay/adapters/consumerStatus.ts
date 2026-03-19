@@ -6,19 +6,17 @@ import type {
   UsageSnapshot,
 } from '../types';
 
-type StatusKind = 'loading' | 'waiting' | 'auth' | 'error';
+type StatusKind = 'loading' | 'waiting' | 'error';
 
 function statusKindForCode(code: string | null | undefined): StatusKind {
   if (code === 'consumer_local_usage_pending') return 'loading';
   if (code === 'consumer_local_waiting_for_usage') return 'waiting';
-  if (code === 'oauth_reauth_required') return 'auth';
   return 'error';
 }
 
 function statusLabel(kind: StatusKind): string {
   if (kind === 'loading') return 'syncing';
   if (kind === 'waiting') return 'start session';
-  if (kind === 'auth') return 'sign in';
   return 'unavailable';
 }
 
@@ -42,9 +40,6 @@ function statusTitleLines(
         ? 'Run a Codex task to begin tracking'
         : 'Run a Claude Code task to begin tracking',
     );
-  } else if (kind === 'auth') {
-    lines.push('Sign-in expired');
-    lines.push('Open settings to re-authenticate');
   } else {
     lines.push('Usage data unavailable');
     if (snapshot.status_message) lines.push(snapshot.status_message);

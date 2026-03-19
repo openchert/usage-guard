@@ -3,9 +3,7 @@ mod secret_store;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, Local, Timelike, Utc};
 pub use secret_store::SecureStorageStatus;
-use secret_store::{
-    app_config_dir, AnthropicOAuthSecret, OpenAiOAuthSecret, SecretPayload, SecretStore,
-};
+use secret_store::{app_config_dir, SecretPayload, SecretStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -14,61 +12,44 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 const KEYRING_SERVICE: &str = "usage-guard";
-const ACCESS_TOKEN_EXPIRY_SKEW_SECS: i64 = 60;
-const DEFAULT_ACCESS_TOKEN_LIFETIME_SECS: i64 = 45 * 60;
-const ANTHROPIC_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
-const ANTHROPIC_OAUTH_SCOPE: &str =
-    "user:inference user:mcp_servers user:profile user:sessions:claude_code";
 const CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV: &str = "USAGEGUARD_CLAUDE_CREDENTIALS_PATH_OVERRIDE";
 #[cfg(test)]
-const CLAUDE_PROJECTS_DIR_OVERRIDE_ENV: &str = "USAGEGUARD_CLAUDE_PROJECTS_DIR_OVERRIDE";
+const OPENAI_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV: &str =
+    "USAGEGUARD_OPENAI_LOCAL_USAGE_RESPONSE_OVERRIDE";
+#[cfg(test)]
+const CLAUDE_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV: &str =
+    "USAGEGUARD_CLAUDE_LOCAL_USAGE_RESPONSE_OVERRIDE";
 const CODEX_AUTH_PATH_OVERRIDE_ENV: &str = "USAGEGUARD_CODEX_AUTH_PATH_OVERRIDE";
 const CODEX_SESSIONS_DIR_OVERRIDE_ENV: &str = "USAGEGUARD_CODEX_SESSIONS_DIR_OVERRIDE";
 const CONSUMER_LOCAL_SOURCE: &str = "consumer_local";
 const CONSUMER_LOCAL_STATUS_SOURCE: &str = "consumer_local_status";
 const CLAUDE_CODE_USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const CLAUDE_CODE_USAGE_CACHE_TTL_SECS: i64 = 300;
+const ANTHROPIC_LOCAL_USAGE_BETA_HEADER: &str = "oauth-2025-04-20";
+const CLAUDE_LOCAL_USAGE_CACHE_TTL_SECS: i64 = 300;
+const CODEX_WHAM_CACHE_TTL_SECS: i64 = 60;
 const CODEX_SESSION_SCAN_FILE_LIMIT: usize = 32;
 const CODEX_SESSION_SCAN_LINE_LIMIT: usize = 256;
 const CODEX_RATE_LIMIT_STALENESS_THRESHOLD_SECS: u64 = 15 * 60;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 15;
 pub const MIN_REFRESH_INTERVAL_SECS: u32 = 15;
 pub const MAX_REFRESH_INTERVAL_SECS: u32 = 900;
-const OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT: f64 = 90.0;
-const OAUTH_WEEKLY_NEAR_LIMIT_PERCENT: f64 = 80.0;
-const OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX: f64 = 20.0;
-const OAUTH_WEEKLY_UNUSED_PERCENT_MAX: f64 = 40.0;
-const OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES: i64 = 45;
-const OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS: i64 = 24;
+const CONSUMER_FIVE_HOUR_NEAR_LIMIT_PERCENT: f64 = 90.0;
+const CONSUMER_WEEKLY_NEAR_LIMIT_PERCENT: f64 = 80.0;
+const CONSUMER_FIVE_HOUR_UNUSED_PERCENT_MAX: f64 = 20.0;
+const CONSUMER_WEEKLY_UNUSED_PERCENT_MAX: f64 = 40.0;
+const CONSUMER_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES: i64 = 45;
+const CONSUMER_WEEKLY_RESET_REMINDER_WINDOW_HOURS: i64 = 24;
 
 fn default_refresh_interval_secs() -> u32 {
     DEFAULT_REFRESH_INTERVAL_SECS
 }
 
-fn default_oauth_alerts_enabled() -> bool {
+fn default_consumer_alerts_enabled() -> bool {
     true
 }
 
 pub fn clamp_refresh_interval_secs(value: u32) -> u32 {
     value.clamp(MIN_REFRESH_INTERVAL_SECS, MAX_REFRESH_INTERVAL_SECS)
-}
-
-#[derive(Debug, Clone, Default)]
-struct OpenAiSessionState {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    account_id: String,
-    plan_type: String,
-    expires_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct AnthropicSessionState {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    subscription_type: String,
-    rate_limit_tier: String,
-    expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -251,27 +232,27 @@ pub struct AppConfig {
     /// Saved on quit and restored on next launch.
     #[serde(default)]
     pub widget_position: Option<[f64; 2]>,
-    /// User-defined display name for the ChatGPT OAuth subscription connection.
-    #[serde(default)]
-    pub openai_oauth_label: Option<String>,
-    /// User-defined display name for the Claude OAuth subscription connection.
-    #[serde(default)]
-    pub anthropic_oauth_label: Option<String>,
+    /// User-defined display name for the local Codex consumer connection.
+    #[serde(default, alias = "openai_oauth_label")]
+    pub openai_consumer_label: Option<String>,
+    /// User-defined display name for the local Claude Code consumer connection.
+    #[serde(default, alias = "anthropic_oauth_label")]
+    pub anthropic_consumer_label: Option<String>,
     /// Whether the UI should display in light mode instead of the default dark mode.
     #[serde(default)]
     pub light_mode: bool,
-    /// Whether ChatGPT 5h subscription alerts are enabled.
-    #[serde(default = "default_oauth_alerts_enabled")]
-    pub openai_oauth_5h_alerts_enabled: bool,
-    /// Whether ChatGPT weekly subscription alerts are enabled.
-    #[serde(default = "default_oauth_alerts_enabled")]
-    pub openai_oauth_week_alerts_enabled: bool,
-    /// Whether Claude 5h subscription alerts are enabled.
-    #[serde(default = "default_oauth_alerts_enabled")]
-    pub anthropic_oauth_5h_alerts_enabled: bool,
-    /// Whether Claude weekly subscription alerts are enabled.
-    #[serde(default = "default_oauth_alerts_enabled")]
-    pub anthropic_oauth_week_alerts_enabled: bool,
+    /// Whether Codex 5h consumer alerts are enabled.
+    #[serde(default = "default_consumer_alerts_enabled", alias = "openai_oauth_5h_alerts_enabled")]
+    pub openai_consumer_5h_alerts_enabled: bool,
+    /// Whether Codex weekly consumer alerts are enabled.
+    #[serde(default = "default_consumer_alerts_enabled", alias = "openai_oauth_week_alerts_enabled")]
+    pub openai_consumer_week_alerts_enabled: bool,
+    /// Whether Claude Code 5h consumer alerts are enabled.
+    #[serde(default = "default_consumer_alerts_enabled", alias = "anthropic_oauth_5h_alerts_enabled")]
+    pub anthropic_consumer_5h_alerts_enabled: bool,
+    /// Whether Claude Code weekly consumer alerts are enabled.
+    #[serde(default = "default_consumer_alerts_enabled", alias = "anthropic_oauth_week_alerts_enabled")]
+    pub anthropic_consumer_week_alerts_enabled: bool,
     /// Last release tag that already triggered an update notification.
     #[serde(default)]
     pub last_update_notified_version: Option<String>,
@@ -288,13 +269,13 @@ impl Default for AppConfig {
             provider_accounts: vec![],
             profiles: vec![],
             widget_position: None,
-            openai_oauth_label: None,
-            anthropic_oauth_label: None,
+            openai_consumer_label: None,
+            anthropic_consumer_label: None,
             light_mode: false,
-            openai_oauth_5h_alerts_enabled: true,
-            openai_oauth_week_alerts_enabled: true,
-            anthropic_oauth_5h_alerts_enabled: true,
-            anthropic_oauth_week_alerts_enabled: true,
+            openai_consumer_5h_alerts_enabled: true,
+            openai_consumer_week_alerts_enabled: true,
+            anthropic_consumer_5h_alerts_enabled: true,
+            anthropic_consumer_week_alerts_enabled: true,
             last_update_notified_version: None,
         }
     }
@@ -424,18 +405,6 @@ pub fn secure_storage_status() -> SecureStorageStatus {
     SecretStore::status()
 }
 
-fn openai_session() -> &'static Mutex<OpenAiSessionState> {
-    static SESSION: OnceLock<Mutex<OpenAiSessionState>> = OnceLock::new();
-
-    SESSION.get_or_init(|| Mutex::new(OpenAiSessionState::default()))
-}
-
-fn anthropic_session() -> &'static Mutex<AnthropicSessionState> {
-    static SESSION: OnceLock<Mutex<AnthropicSessionState>> = OnceLock::new();
-
-    SESSION.get_or_init(|| Mutex::new(AnthropicSessionState::default()))
-}
-
 fn claude_insights_cache() -> &'static Mutex<ClaudeInsightsCacheState> {
     static CACHE: OnceLock<Mutex<ClaudeInsightsCacheState>> = OnceLock::new();
 
@@ -458,276 +427,6 @@ fn load_secret_payload() -> SecretPayload {
 
 fn save_secret_payload(payload: &SecretPayload) -> Result<()> {
     SecretStore::save(payload)
-}
-
-fn has_remaining_secret_payload(payload: &SecretPayload) -> bool {
-    !payload.provider_api_keys.is_empty()
-        || payload.openai_oauth != OpenAiOAuthSecret::default()
-        || payload.anthropic_oauth != AnthropicOAuthSecret::default()
-}
-
-fn payload_after_clearing_openai_secret(mut payload: SecretPayload) -> Option<SecretPayload> {
-    payload.openai_oauth = OpenAiOAuthSecret::default();
-
-    has_remaining_secret_payload(&payload).then_some(payload)
-}
-
-fn payload_after_clearing_anthropic_secret(mut payload: SecretPayload) -> Option<SecretPayload> {
-    payload.anthropic_oauth = AnthropicOAuthSecret::default();
-
-    has_remaining_secret_payload(&payload).then_some(payload)
-}
-
-// --- OpenAI OAuth token storage (legacy migration helpers) ---
-fn oauth_tokens_path() -> Result<PathBuf> {
-    Ok(app_config_dir()?.join("oauth_tokens.json"))
-}
-
-fn oauth_tokens_entry() -> Result<keyring::Entry> {
-    Ok(keyring::Entry::new(KEYRING_SERVICE, "openai.oauth.tokens")?)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct OAuthTokenFile {
-    #[serde(default)]
-    openai_access_token: String,
-    #[serde(default)]
-    openai_refresh_token: String,
-    #[serde(default)]
-    openai_account_id: String,
-    #[serde(default)]
-    openai_plan_type: String,
-}
-
-fn load_legacy_oauth_file() -> OAuthTokenFile {
-    let path = match oauth_tokens_path() {
-        Ok(p) => p,
-        Err(_) => return OAuthTokenFile::default(),
-    };
-
-    if !path.exists() {
-        return OAuthTokenFile::default();
-    }
-
-    let raw = fs::read_to_string(&path).unwrap_or_default();
-
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-fn oauth_tokens_present(file: &OAuthTokenFile) -> bool {
-    !file.openai_access_token.is_empty()
-        || !file.openai_refresh_token.is_empty()
-        || !file.openai_account_id.is_empty()
-        || !file.openai_plan_type.is_empty()
-}
-
-fn load_legacy_keyring_oauth_tokens() -> OAuthTokenFile {
-    let entry = match oauth_tokens_entry() {
-        Ok(entry) => entry,
-        Err(_) => return OAuthTokenFile::default(),
-    };
-
-    let raw = match entry.get_password() {
-        Ok(raw) if !raw.trim().is_empty() => raw,
-        _ => return OAuthTokenFile::default(),
-    };
-
-    let file = match serde_json::from_str::<OAuthTokenFile>(&raw) {
-        Ok(file) if oauth_tokens_present(&file) => file,
-        _ => return OAuthTokenFile::default(),
-    };
-
-    file
-}
-
-fn load_stored_openai_secret() -> OpenAiOAuthSecret {
-    load_secret_payload().openai_oauth
-}
-
-fn persist_openai_secret(secret: &OpenAiOAuthSecret) -> Result<()> {
-    let mut payload = load_secret_payload();
-
-    payload.openai_oauth = secret.clone();
-
-    save_secret_payload(&payload)
-}
-
-fn clear_stored_openai_secret() -> Result<()> {
-    let payload = load_secret_payload();
-
-    if let Some(payload) = payload_after_clearing_openai_secret(payload) {
-        save_secret_payload(&payload)
-    } else {
-        SecretStore::clear()
-    }
-}
-
-fn load_stored_anthropic_secret() -> AnthropicOAuthSecret {
-    load_secret_payload().anthropic_oauth
-}
-
-fn persist_anthropic_secret(secret: &AnthropicOAuthSecret) -> Result<()> {
-    let mut payload = load_secret_payload();
-
-    payload.anthropic_oauth = secret.clone();
-
-    save_secret_payload(&payload)
-}
-
-fn clear_stored_anthropic_secret() -> Result<()> {
-    let payload = load_secret_payload();
-
-    if let Some(payload) = payload_after_clearing_anthropic_secret(payload) {
-        save_secret_payload(&payload)
-    } else {
-        SecretStore::clear()
-    }
-}
-
-fn update_in_memory_oauth_session(
-    access_token: Option<String>,
-    expires_at: Option<DateTime<Utc>>,
-    refresh_token: Option<String>,
-    account_id: Option<String>,
-    plan_type: Option<String>,
-) {
-    let mut session = openai_session().lock().unwrap();
-
-    if let Some(access) = access_token {
-        session.access_token = Some(access);
-
-        session.expires_at = expires_at;
-    }
-
-    if let Some(refresh) = refresh_token {
-        session.refresh_token = if is_non_empty(&refresh) {
-            Some(refresh)
-        } else {
-            None
-        };
-    }
-
-    if let Some(account_id) = account_id {
-        session.account_id = account_id;
-    }
-
-    if let Some(plan_type) = plan_type {
-        session.plan_type = plan_type;
-    }
-}
-
-fn clear_in_memory_oauth_session() {
-    *openai_session().lock().unwrap() = OpenAiSessionState::default();
-}
-
-fn current_cached_access_token() -> Option<String> {
-    let session = openai_session().lock().unwrap();
-
-    let expires_at = session.expires_at?;
-
-    if expires_at <= Utc::now() {
-        return None;
-    }
-
-    session.access_token.clone()
-}
-
-fn stored_or_cached_account_id() -> String {
-    let session = openai_session().lock().unwrap().clone();
-
-    if is_non_empty(&session.account_id) {
-        session.account_id
-    } else {
-        load_stored_openai_secret().account_id
-    }
-}
-
-fn token_expiry_from_now(expires_in_secs: Option<i64>) -> DateTime<Utc> {
-    let ttl = expires_in_secs
-        .unwrap_or(DEFAULT_ACCESS_TOKEN_LIFETIME_SECS)
-        .max(ACCESS_TOKEN_EXPIRY_SKEW_SECS + 1);
-
-    Utc::now() + Duration::seconds(ttl - ACCESS_TOKEN_EXPIRY_SKEW_SECS)
-}
-
-fn current_refresh_token() -> Option<String> {
-    let session_refresh = openai_session().lock().unwrap().refresh_token.clone();
-
-    if let Some(refresh) = session_refresh.filter(|value| is_non_empty(value)) {
-        return Some(refresh);
-    }
-
-    let stored = load_stored_openai_secret();
-
-    if is_non_empty(&stored.refresh_token) {
-        Some(stored.refresh_token)
-    } else {
-        None
-    }
-}
-
-fn update_in_memory_anthropic_session(
-    access_token: Option<String>,
-    expires_at: Option<DateTime<Utc>>,
-    refresh_token: Option<String>,
-    subscription_type: Option<String>,
-    rate_limit_tier: Option<String>,
-) {
-    let mut session = anthropic_session().lock().unwrap();
-
-    if let Some(access) = access_token {
-        session.access_token = Some(access);
-
-        session.expires_at = expires_at;
-    }
-
-    if let Some(refresh) = refresh_token {
-        session.refresh_token = if is_non_empty(&refresh) {
-            Some(refresh)
-        } else {
-            None
-        };
-    }
-
-    if let Some(subscription_type) = subscription_type {
-        session.subscription_type = subscription_type;
-    }
-
-    if let Some(rate_limit_tier) = rate_limit_tier {
-        session.rate_limit_tier = rate_limit_tier;
-    }
-}
-
-fn clear_in_memory_anthropic_session() {
-    *anthropic_session().lock().unwrap() = AnthropicSessionState::default();
-}
-
-fn current_cached_anthropic_access_token() -> Option<String> {
-    let session = anthropic_session().lock().unwrap();
-
-    let expires_at = session.expires_at?;
-
-    if expires_at <= Utc::now() {
-        return None;
-    }
-
-    session.access_token.clone()
-}
-
-fn current_anthropic_refresh_token() -> Option<String> {
-    let session_refresh = anthropic_session().lock().unwrap().refresh_token.clone();
-
-    if let Some(refresh) = session_refresh.filter(|value| is_non_empty(value)) {
-        return Some(refresh);
-    }
-
-    let stored = load_stored_anthropic_secret();
-
-    if is_non_empty(&stored.refresh_token) {
-        Some(stored.refresh_token)
-    } else {
-        None
-    }
 }
 
 fn normalize_plan_label(value: &str) -> String {
@@ -809,19 +508,6 @@ fn claude_credentials_path() -> Option<PathBuf> {
     }
 
     Some(dirs::home_dir()?.join(".claude").join(".credentials.json"))
-}
-
-#[cfg(test)]
-fn claude_projects_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV) {
-        let trimmed = path.trim();
-
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-
-    Some(dirs::home_dir()?.join(".claude").join("projects"))
 }
 
 fn codex_auth_path() -> Option<PathBuf> {
@@ -910,6 +596,28 @@ fn consumer_quota_window(used_percent: f64, reset_at: Option<String>) -> Consume
     }
 }
 
+pub fn invalidate_claude_local_insights_cache() {
+    *claude_insights_cache().lock().unwrap() = ClaudeInsightsCacheState::default();
+}
+
+#[cfg(test)]
+fn openai_local_usage_response_override() -> Option<String> {
+    std::env::var(OPENAI_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+fn claude_local_usage_response_override() -> Option<String> {
+    std::env::var(CLAUDE_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+pub fn invalidate_codex_wham_cache() {
+    *codex_wham_cache().lock().unwrap() = CodexWhamCacheState::default();
+}
+
 fn get_valid_claude_code_access_token() -> Option<String> {
     let path = claude_credentials_path()?;
 
@@ -919,9 +627,8 @@ fn get_valid_claude_code_access_token() -> Option<String> {
 
     let oauth = credentials.claude_ai_oauth;
 
-    let access_token = oauth.access_token.filter(|t| !t.trim().is_empty())?;
+    let access_token = oauth.access_token.filter(|token| !token.trim().is_empty())?;
 
-    // Check expiry (60 second skew)
     if let Some(expires_at_ms) = oauth.expires_at_ms {
         let now_ms = Utc::now().timestamp_millis();
 
@@ -936,55 +643,23 @@ fn get_valid_claude_code_access_token() -> Option<String> {
 fn fetch_claude_code_usage_from_api(
     access_token: &str,
 ) -> Option<(ConsumerQuotaWindow, Option<ConsumerQuotaWindow>)> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
+    let value = match fetch_claude_local_usage_value(access_token) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[usageguard] claude local usage fetch failed: {error:?}");
 
-    let resp: Value = client
-        .get(CLAUDE_CODE_USAGE_API_URL)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER)
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .ok()?;
-
-    let five_hour = resp.get("five_hour")?;
-
-    let primary_used = five_hour["utilization"].as_f64()?.clamp(0.0, 100.0);
-
-    let primary_reset_at = five_hour["resets_at"].as_str().map(str::to_string);
-
-    let primary = ConsumerQuotaWindow {
-        available: true,
-        used_percent: Some(primary_used),
-        reset_at: primary_reset_at,
+            return None;
+        }
     };
 
-    let secondary = resp.get("seven_day").and_then(|seven_day| {
-        let used_percent = seven_day["utilization"].as_f64()?.clamp(0.0, 100.0);
+    match parse_claude_local_usage_response(&value) {
+        Ok(windows) => Some(windows),
+        Err(error) => {
+            eprintln!("[usageguard] claude local usage parse failed: {error}");
 
-        let reset_at = seven_day["resets_at"].as_str().map(str::to_string);
-
-        Some(ConsumerQuotaWindow {
-            available: true,
-            used_percent: Some(used_percent),
-            reset_at,
-        })
-    });
-
-    Some((primary, secondary))
-}
-
-pub fn invalidate_claude_local_insights_cache() {
-    *claude_insights_cache().lock().unwrap() = ClaudeInsightsCacheState::default();
-}
-
-pub fn invalidate_codex_wham_cache() {
-    *codex_wham_cache().lock().unwrap() = CodexWhamCacheState::default();
+            None
+        }
+    }
 }
 
 fn fetch_claude_local_quota_windows() -> Option<(ConsumerQuotaWindow, Option<ConsumerQuotaWindow>)>
@@ -996,7 +671,7 @@ fn fetch_claude_local_quota_windows() -> Option<(ConsumerQuotaWindow, Option<Con
 
         if let Some(fetched_at) = cache.fetched_at {
             if now.signed_duration_since(fetched_at)
-                < Duration::seconds(CLAUDE_CODE_USAGE_CACHE_TTL_SECS)
+                < Duration::seconds(CLAUDE_LOCAL_USAGE_CACHE_TTL_SECS)
             {
                 return cache
                     .primary_window
@@ -1006,11 +681,10 @@ fn fetch_claude_local_quota_windows() -> Option<(ConsumerQuotaWindow, Option<Con
         }
     }
 
-    let windows = get_valid_claude_code_access_token()
+    let (primary_window, secondary_window) = match get_valid_claude_code_access_token()
         .as_deref()
-        .and_then(fetch_claude_code_usage_from_api);
-
-    let (primary_window, secondary_window) = match windows {
+        .and_then(fetch_claude_code_usage_from_api)
+    {
         Some((p, s)) => (Some(p), s),
         None => (None, None),
     };
@@ -1024,55 +698,41 @@ fn fetch_claude_local_quota_windows() -> Option<(ConsumerQuotaWindow, Option<Con
     primary_window.map(|p| (p, secondary_window))
 }
 
-#[cfg(test)]
-fn normalize_claude_utilization_percent(value: f64) -> Option<f64> {
-    if !value.is_finite() || value < 0.0 {
-        return None;
+fn openai_consumer_plan_label(value: &str) -> String {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        return "Subscription".to_string();
     }
 
-    let percent = if value <= 1.0 { value * 100.0 } else { value };
+    let mut chars = trimmed.chars();
 
-    Some(percent.clamp(0.0, 100.0))
-}
-
-#[cfg(test)]
-fn parse_claude_rate_limit_event(value: &Value) -> Option<ConsumerQuotaWindow> {
-    if pick_str(value, &["type"]) != Some("rate_limit_event") {
-        return None;
+    match chars.next() {
+        None => "Subscription".to_string(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
     }
-
-    let info = value.get("rate_limit_info")?;
-
-    let rate_limit_type = pick_str(info, &["rateLimitType", "rate_limit_type"])?;
-
-    if rate_limit_type != "five_hour" {
-        return None;
-    }
-
-    let used_percent =
-        pick_f64(info, &["utilization"]).and_then(normalize_claude_utilization_percent)?;
-
-    let reset_at = info
-        .get("resetsAt")
-        .and_then(value_reset_at)
-        .or_else(|| info.get("resetAt").and_then(value_reset_at))
-        .or_else(|| info.get("resets_at").and_then(value_reset_at))
-        .or_else(|| info.get("reset_at").and_then(value_reset_at));
-
-    Some(consumer_quota_window(used_percent, reset_at))
 }
 
 fn codex_plan_type_from_payload(payload: &Value) -> Option<String> {
     pick_str(payload, &["plan_type", "planType"])
         .filter(|value| is_non_empty(value) && !value.eq_ignore_ascii_case("unknown"))
-        .map(openai_oauth_plan_label)
+        .map(openai_consumer_plan_label)
 }
 
 fn codex_account_label(plan_type: Option<&str>) -> String {
     match plan_type.filter(|value| is_non_empty(value)) {
-        Some(plan_type) => format!("Codex {}", openai_oauth_plan_label(plan_type)),
+        Some(plan_type) => format!("Codex {}", openai_consumer_plan_label(plan_type)),
         None => "Codex".to_string(),
     }
+}
+
+fn codex_plan_type_from_snapshot(snapshot: &UsageSnapshot) -> Option<String> {
+    snapshot
+        .account_label
+        .strip_prefix("Codex ")
+        .map(str::trim)
+        .filter(|value| is_non_empty(value))
+        .map(str::to_string)
 }
 
 fn codex_rate_limits(payload: &Value) -> Option<&Value> {
@@ -1175,7 +835,7 @@ fn build_claude_local_consumer_snapshot(
     }
 }
 
-fn load_local_claude_oauth_metadata() -> Option<(String, String)> {
+fn load_local_claude_consumer_metadata() -> Option<(String, String)> {
     let path = claude_credentials_path()?;
     let raw = fs::read_to_string(path).ok()?;
     let credentials = serde_json::from_str::<ClaudeDesktopCredentials>(&raw).ok()?;
@@ -1199,41 +859,12 @@ fn load_local_claude_oauth_metadata() -> Option<(String, String)> {
     }
 }
 
-fn sync_anthropic_plan_metadata_from_local_credentials() -> Option<(String, String)> {
-    let (subscription_type, rate_limit_tier) = load_local_claude_oauth_metadata()?;
-    let mut stored = load_stored_anthropic_secret();
-
-    if is_non_empty(&subscription_type) {
-        stored.subscription_type = subscription_type.clone();
-    }
-
-    if is_non_empty(&rate_limit_tier) {
-        stored.rate_limit_tier = rate_limit_tier.clone();
-    }
-
-    let _ = persist_anthropic_secret(&stored);
-
-    update_in_memory_anthropic_session(
-        None,
-        None,
-        None,
-        is_non_empty(&stored.subscription_type).then_some(stored.subscription_type.clone()),
-        is_non_empty(&stored.rate_limit_tier).then_some(stored.rate_limit_tier.clone()),
-    );
-
-    Some((stored.subscription_type, stored.rate_limit_tier))
-}
-
 fn anthropic_plan_type_from_fields(
     subscription_type: &str,
     rate_limit_tier: &str,
 ) -> Option<String> {
     anthropic_plan_label_from_subscription_type(subscription_type)
         .or_else(|| anthropic_plan_label_from_rate_limit_tier(rate_limit_tier))
-}
-
-pub fn has_openai_oauth_session() -> bool {
-    current_refresh_token().is_some() || current_cached_access_token().is_some()
 }
 
 pub fn has_openai_consumer_source() -> bool {
@@ -1246,35 +877,19 @@ pub fn has_openai_consumer_usage() -> bool {
         || codex_wham_cache().lock().unwrap().snapshot.is_some()
 }
 
-pub fn get_openai_oauth_access_token() -> Option<String> {
-    current_cached_access_token()
-}
-
-pub fn get_openai_oauth_plan_type() -> Option<String> {
-    let session_plan = openai_session().lock().unwrap().plan_type.clone();
-
-    if is_non_empty(&session_plan) {
-        return Some(openai_oauth_plan_label(&session_plan));
-    }
-
-    let stored = load_stored_openai_secret();
-
-    if is_non_empty(&stored.plan_type) {
-        Some(openai_oauth_plan_label(&stored.plan_type))
-    } else {
-        None
-    }
-}
-
 pub fn get_openai_consumer_plan_type() -> Option<String> {
     latest_codex_rate_limit_payload()
         .as_ref()
         .and_then(|(payload, _)| codex_rate_limits(payload))
         .and_then(codex_plan_type_from_payload)
-}
-
-pub fn has_anthropic_oauth_session() -> bool {
-    current_anthropic_refresh_token().is_some() || current_cached_anthropic_access_token().is_some()
+        .or_else(|| {
+            codex_wham_cache()
+                .lock()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .and_then(codex_plan_type_from_snapshot)
+        })
 }
 
 pub fn has_anthropic_consumer_source() -> bool {
@@ -1301,185 +916,10 @@ pub fn has_anthropic_consumer_usage() -> bool {
     has_anthropic_consumer_5h_usage()
 }
 
-pub fn get_anthropic_oauth_plan_type() -> Option<String> {
-    let session = anthropic_session().lock().unwrap().clone();
-
-    if let Some(plan_type) =
-        anthropic_plan_type_from_fields(&session.subscription_type, &session.rate_limit_tier)
-    {
-        return Some(plan_type);
-    }
-
-    let stored = load_stored_anthropic_secret();
-
-    anthropic_plan_type_from_fields(&stored.subscription_type, &stored.rate_limit_tier).or_else(
-        || {
-            let (subscription_type, rate_limit_tier) =
-                sync_anthropic_plan_metadata_from_local_credentials()?;
-
-            anthropic_plan_type_from_fields(&subscription_type, &rate_limit_tier)
-        },
-    )
-}
-
 pub fn get_anthropic_consumer_plan_type() -> Option<String> {
-    get_anthropic_oauth_plan_type()
-}
-
-pub fn set_openai_oauth_tokens(
-    access: &str,
-    access_expires_at: DateTime<Utc>,
-    refresh: &str,
-    account_id: &str,
-    plan_type: &str,
-) -> Result<()> {
-    update_in_memory_oauth_session(
-        Some(access.to_string()),
-        Some(access_expires_at),
-        Some(refresh.to_string()),
-        Some(account_id.to_string()),
-        Some(plan_type.to_string()),
-    );
-
-    if !is_non_empty(refresh) {
-        return Ok(());
-    }
-
-    let mut stored = load_stored_openai_secret();
-
-    stored.refresh_token = refresh.to_string();
-
-    if is_non_empty(account_id) {
-        stored.account_id = account_id.to_string();
-    }
-
-    if is_non_empty(plan_type) {
-        stored.plan_type = plan_type.to_string();
-    }
-
-    persist_openai_secret(&stored)
-}
-
-pub fn set_anthropic_oauth_tokens(
-    access: &str,
-    access_expires_at: DateTime<Utc>,
-    refresh: &str,
-    subscription_type: &str,
-    rate_limit_tier: &str,
-) -> Result<()> {
-    update_in_memory_anthropic_session(
-        Some(access.to_string()),
-        Some(access_expires_at),
-        Some(refresh.to_string()),
-        Some(subscription_type.to_string()),
-        Some(rate_limit_tier.to_string()),
-    );
-
-    if !is_non_empty(refresh) {
-        return Ok(());
-    }
-
-    let mut stored = load_stored_anthropic_secret();
-
-    stored.refresh_token = refresh.to_string();
-
-    if is_non_empty(subscription_type) {
-        stored.subscription_type = subscription_type.to_string();
-    }
-
-    if is_non_empty(rate_limit_tier) {
-        stored.rate_limit_tier = rate_limit_tier.to_string();
-    }
-
-    persist_anthropic_secret(&stored)
-}
-
-pub fn clear_openai_oauth_tokens() {
-    clear_in_memory_oauth_session();
-
-    let _ = clear_stored_openai_secret();
-
-    if let Ok(entry) = oauth_tokens_entry() {
-        let _ = entry.delete_credential();
-    }
-
-    if let Ok(path) = oauth_tokens_path() {
-        let _ = fs::remove_file(path);
-    }
-}
-
-pub fn clear_anthropic_oauth_tokens() {
-    clear_in_memory_anthropic_session();
-
-    let _ = clear_stored_anthropic_secret();
-}
-
-pub fn fetch_openai_oauth_usage() -> Option<UsageSnapshot> {
-    if !has_openai_oauth_session() {
-        return None;
-    }
-
-    let account_id = stored_or_cached_account_id();
-
-    let access_token = match current_cached_access_token() {
-        Some(token) => token,
-        None => match try_refresh_oauth_token() {
-            Ok(token) => token,
-            Err(error) => {
-                eprintln!("[usageguard] token refresh failed: {error}");
-
-                return Some(error_snapshot(
-                    "openai",
-                    "ChatGPT",
-                    "oauth",
-                    Some("oauth_reauth_required"),
-                    Some("ChatGPT sign-in expired. Sign in again."),
-                ));
-            }
-        },
-    };
-
-    match do_fetch_wham_usage(&access_token, &account_id) {
-        Ok(snapshot) => Some(snapshot),
-        Err(error) => {
-            eprintln!("[usageguard] wham/usage failed: {error}");
-
-            // Token may be expired — try to refresh once
-            match try_refresh_oauth_token() {
-                Ok(new_access) => {
-                    match do_fetch_wham_usage(&new_access, &stored_or_cached_account_id()) {
-                        Ok(snapshot) => Some(snapshot),
-                        Err(refresh_error) => {
-                            eprintln!(
-                                "[usageguard] wham/usage after refresh failed: {refresh_error}"
-                            );
-
-                            Some(error_snapshot(
-                                "openai",
-                                "ChatGPT",
-                                "oauth",
-                                Some("oauth_usage_unavailable"),
-                                Some("Unable to load ChatGPT usage right now."),
-                            ))
-                        }
-                    }
-                }
-                Err(refresh_error) => {
-                    eprintln!(
-                        "[usageguard] token refresh failed after usage error: {refresh_error}"
-                    );
-
-                    Some(error_snapshot(
-                        "openai",
-                        "ChatGPT",
-                        "oauth",
-                        Some("oauth_reauth_required"),
-                        Some("ChatGPT sign-in expired. Sign in again."),
-                    ))
-                }
-            }
-        }
-    }
+    load_local_claude_consumer_metadata().and_then(|(subscription_type, rate_limit_tier)| {
+        anthropic_plan_type_from_fields(&subscription_type, &rate_limit_tier)
+    })
 }
 
 fn parse_codex_local_usage_payload(payload: &Value) -> Result<UsageSnapshot> {
@@ -1544,7 +984,14 @@ fn parse_codex_local_usage_payload(payload: &Value) -> Result<UsageSnapshot> {
     })
 }
 
-const CODEX_WHAM_CACHE_TTL_SECS: i64 = 60;
+#[derive(Debug, Clone)]
+struct CodexWhamUsageData {
+    plan_type: String,
+    primary_percent: f64,
+    secondary_percent: f64,
+    primary_reset_at: Option<String>,
+    secondary_reset_at: Option<String>,
+}
 
 fn get_codex_auth_tokens() -> Option<(String, String)> {
     let path = codex_auth_path()?;
@@ -1555,33 +1002,122 @@ fn get_codex_auth_tokens() -> Option<(String, String)> {
 
     let access_token = value
         .pointer("/tokens/access_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())?;
+        .and_then(|entry| entry.as_str())
+        .filter(|value| !value.trim().is_empty())?;
 
     let account_id = value
         .pointer("/tokens/account_id")
-        .and_then(|v| v.as_str())
+        .and_then(|entry| entry.as_str())
         .unwrap_or_default();
 
     Some((access_token.to_string(), account_id.to_string()))
 }
 
+fn openai_local_usage_window_reset_at(
+    value: &Value,
+    primary_key: &str,
+    camel_key: &str,
+    fallback_key: &str,
+) -> Option<String> {
+    let paths = [
+        format!("/rate_limit/{primary_key}/resets_at"),
+        format!("/rate_limit/{primary_key}/reset_at"),
+        format!("/rate_limit/{primary_key}/resetsAt"),
+        format!("/rate_limit/{primary_key}/resetAt"),
+        format!("/rate_limit/{camel_key}/resets_at"),
+        format!("/rate_limit/{camel_key}/reset_at"),
+        format!("/rate_limit/{camel_key}/resetsAt"),
+        format!("/rate_limit/{camel_key}/resetAt"),
+        format!("/{primary_key}/resets_at"),
+        format!("/{primary_key}/reset_at"),
+        format!("/{primary_key}/resetsAt"),
+        format!("/{primary_key}/resetAt"),
+        format!("/{camel_key}/resets_at"),
+        format!("/{camel_key}/reset_at"),
+        format!("/{camel_key}/resetsAt"),
+        format!("/{camel_key}/resetAt"),
+        format!("/{fallback_key}/resets_at"),
+        format!("/{fallback_key}/reset_at"),
+        format!("/{fallback_key}/resetsAt"),
+        format!("/{fallback_key}/resetAt"),
+    ];
+
+    paths.iter().find_map(|pointer| {
+        let entry = value.pointer(pointer)?;
+
+        value_reset_at(entry)
+    })
+}
+
+fn parse_openai_local_usage_data(value: &Value) -> Result<CodexWhamUsageData> {
+    let primary_percent = value
+        .pointer("/rate_limit/primary_window/used_percent")
+        .or_else(|| value.pointer("/primary_window/used_percent"))
+        .and_then(|entry| entry.as_f64());
+
+    let secondary_percent = value
+        .pointer("/rate_limit/secondary_window/used_percent")
+        .or_else(|| value.pointer("/secondary_window/used_percent"))
+        .and_then(|entry| entry.as_f64());
+
+    if primary_percent.is_none() && secondary_percent.is_none() {
+        return Err(anyhow!(
+            "OpenAI local usage response missing supported quota window data"
+        ));
+    }
+
+    let primary_reset_at = openai_local_usage_window_reset_at(
+        value,
+        "primary_window",
+        "primaryWindow",
+        "short_window",
+    );
+
+    let secondary_reset_at = openai_local_usage_window_reset_at(
+        value,
+        "secondary_window",
+        "secondaryWindow",
+        "long_window",
+    );
+
+    Ok(CodexWhamUsageData {
+        plan_type: openai_consumer_plan_label(
+            value
+                .get("plan_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
+        primary_percent: primary_percent
+            .or(secondary_percent)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0),
+        secondary_percent: secondary_percent
+            .or(primary_percent)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0),
+        primary_reset_at: primary_reset_at
+            .clone()
+            .or_else(|| secondary_reset_at.clone()),
+        secondary_reset_at: secondary_reset_at.or(primary_reset_at),
+    })
+}
+
 fn fetch_codex_wham_usage_live() -> Option<UsageSnapshot> {
     let (access_token, account_id) = get_codex_auth_tokens()?;
 
-    let value = match fetch_openai_oauth_usage_value(&access_token, &account_id) {
-        Ok(v) => v,
+    let value = match fetch_openai_local_usage_value(&access_token, &account_id) {
+        Ok(value) => value,
         Err(error) => {
-            eprintln!("[usageguard] codex wham/usage fetch failed: {error:?}");
+            eprintln!("[usageguard] codex local usage fetch failed: {error:?}");
 
             return None;
         }
     };
 
-    let usage = match parse_openai_oauth_usage_data(&value) {
-        Ok(u) => u,
+    let usage = match parse_openai_local_usage_data(&value) {
+        Ok(usage) => usage,
         Err(error) => {
-            eprintln!("[usageguard] codex wham/usage parse failed: {error}");
+            eprintln!("[usageguard] codex local usage parse failed: {error}");
 
             return None;
         }
@@ -1643,7 +1179,7 @@ fn fetch_codex_wham_usage() -> Option<UsageSnapshot> {
 }
 
 pub fn fetch_openai_consumer_usage() -> Option<UsageSnapshot> {
-    // 1. Prefer fresh local JSONL data (written by Codex within the last 15 minutes)
+    // Prefer fresh local JSONL data written by Codex within the last 15 minutes.
     if let Some((payload, modified)) = latest_codex_rate_limit_payload() {
         if codex_rate_limit_is_fresh(modified) {
             match parse_codex_local_usage_payload(&payload) {
@@ -1655,12 +1191,10 @@ pub fn fetch_openai_consumer_usage() -> Option<UsageSnapshot> {
         }
     }
 
-    // 2. JSONL is stale or missing — fetch live usage from wham/usage via Codex OAuth token
     if let Some(snapshot) = fetch_codex_wham_usage() {
         return Some(snapshot);
     }
 
-    // 3. No live data available either — show placeholder if Codex is at least signed in
     if !has_openai_consumer_source() {
         return None;
     }
@@ -1670,71 +1204,94 @@ pub fn fetch_openai_consumer_usage() -> Option<UsageSnapshot> {
         &codex_account_label(get_openai_consumer_plan_type().as_deref()),
         CONSUMER_LOCAL_STATUS_SOURCE,
         Some("consumer_local_waiting_for_usage"),
-        Some("Wait for session to start."),
+        Some("Codex is signed in locally. Usage appears after your next Codex request."),
     ))
 }
 
-pub fn fetch_anthropic_oauth_usage() -> Option<UsageSnapshot> {
-    if !has_anthropic_oauth_session() {
+fn claude_local_usage_bucket<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| value.get(*key))
+}
+
+fn claude_local_usage_bucket_value(bucket: &Value) -> Option<f64> {
+    let value = match bucket {
+        Value::Number(number) => number.as_f64(),
+        Value::Object(_) => pick_f64(bucket, &["utilization", "usage", "percent", "value"]),
+        _ => None,
+    }?;
+
+    if !value.is_finite() || value < 0.0 {
         return None;
     }
 
-    let access_token = match current_cached_anthropic_access_token() {
-        Some(token) => token,
-        None => match try_refresh_anthropic_oauth_token() {
-            Ok(token) => token,
-            Err(error) => {
-                eprintln!("[usageguard] anthropic token refresh failed: {error}");
+    let percent = if value <= 1.0 { value * 100.0 } else { value };
 
-                return Some(error_snapshot(
-                    "anthropic",
-                    "Claude",
-                    "oauth",
-                    Some("oauth_reauth_required"),
-                    Some("Claude sign-in expired. Sign in again."),
-                ));
-            }
-        },
-    };
+    Some(percent.clamp(0.0, 100.0))
+}
 
-    match do_fetch_anthropic_oauth_usage(&access_token) {
-        Ok(snapshot) => Some(snapshot),
-        Err(error) => {
-            eprintln!("[usageguard] anthropic oauth usage failed: {error}");
+fn claude_local_usage_bucket_percent(value: &Value, keys: &[&str]) -> Option<f64> {
+    claude_local_usage_bucket(value, keys)
+        .and_then(claude_local_usage_bucket_value)
+        .or_else(|| {
+            keys.iter().find_map(|key| {
+                let utilization_key = format!("{key}_utilization");
 
-            match try_refresh_anthropic_oauth_token() {
-                Ok(new_access) => match do_fetch_anthropic_oauth_usage(&new_access) {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(refresh_error) => {
-                        eprintln!(
-                            "[usageguard] anthropic oauth usage after refresh failed: {refresh_error}"
-                        );
+                value
+                    .get(utilization_key.as_str())
+                    .and_then(claude_local_usage_bucket_value)
+            })
+        })
+}
 
-                        Some(error_snapshot(
-                            "anthropic",
-                            "Claude",
-                            "oauth",
-                            Some("oauth_usage_unavailable"),
-                            Some("Unable to load Claude usage right now."),
-                        ))
-                    }
-                },
-                Err(refresh_error) => {
-                    eprintln!(
-                        "[usageguard] anthropic token refresh failed after usage error: {refresh_error}"
-                    );
+fn claude_local_usage_bucket_reset_at(value: &Value, keys: &[&str]) -> Option<String> {
+    claude_local_usage_bucket(value, keys).and_then(|bucket| {
+        pick_str(bucket, &["resets_at", "reset_at", "resetsAt", "resetAt"])
+            .map(str::to_string)
+            .or_else(|| {
+                ["resets_at", "reset_at", "resetsAt", "resetAt"]
+                    .iter()
+                    .find_map(|key| bucket.get(*key).and_then(value_reset_at))
+            })
+    })
+}
 
-                    Some(error_snapshot(
-                        "anthropic",
-                        "Claude",
-                        "oauth",
-                        Some("oauth_reauth_required"),
-                        Some("Claude sign-in expired. Sign in again."),
-                    ))
-                }
-            }
-        }
+fn parse_claude_local_usage_response(
+    value: &Value,
+) -> Result<(ConsumerQuotaWindow, Option<ConsumerQuotaWindow>)> {
+    let five_hour_keys = &["five_hour", "fiveHour", "5_hour", "short_term", "shortTerm"];
+    let seven_day_keys = &[
+        "seven_day",
+        "seven_day_all",
+        "daily",
+        "sevenDayAll",
+        "7_day_all",
+        "long_term",
+        "longTerm",
+        "weekly",
+    ];
+
+    let five_hour_percent = claude_local_usage_bucket_percent(value, five_hour_keys);
+    let seven_day_percent = claude_local_usage_bucket_percent(value, seven_day_keys);
+
+    if five_hour_percent.is_none() && seven_day_percent.is_none() {
+        return Err(anyhow!(
+            "Claude local usage response missing supported utilization buckets"
+        ));
     }
+
+    let primary_used = five_hour_percent.or(seven_day_percent).unwrap_or(0.0);
+    let primary_reset_at = claude_local_usage_bucket_reset_at(value, five_hour_keys)
+        .or_else(|| claude_local_usage_bucket_reset_at(value, seven_day_keys));
+
+    let primary_window = consumer_quota_window(primary_used, primary_reset_at);
+
+    let secondary_window = seven_day_percent.map(|used_percent| {
+        consumer_quota_window(
+            used_percent,
+            claude_local_usage_bucket_reset_at(value, seven_day_keys),
+        )
+    });
+
+    Ok((primary_window, secondary_window))
 }
 
 pub fn fetch_anthropic_consumer_usage() -> Option<UsageSnapshot> {
@@ -1758,580 +1315,6 @@ pub fn fetch_anthropic_consumer_usage() -> Option<UsageSnapshot> {
         CONSUMER_LOCAL_STATUS_SOURCE,
         Some("consumer_local_usage_pending"),
         Some("Fetching Claude Code 5h quota… (appears ~10 s after app launch)"),
-    ))
-}
-
-fn try_refresh_oauth_token() -> Result<String> {
-    let refresh_token =
-        current_refresh_token().ok_or_else(|| anyhow!("No refresh token stored"))?;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token.as_str()),
-        ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
-    ];
-
-    let resp: Value = client
-        .post("https://auth.openai.com/oauth/token")
-        .form(&params)
-        .send()
-        .map_err(|error| {
-            clear_openai_oauth_tokens();
-
-            anyhow!(error)
-        })?
-        .error_for_status()
-        .map_err(|error| {
-            clear_openai_oauth_tokens();
-
-            anyhow!(error)
-        })?
-        .json()
-        .map_err(|error| {
-            clear_openai_oauth_tokens();
-
-            anyhow!(error)
-        })?;
-
-    let new_access = resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No access_token in refresh response"))?
-        .to_string();
-
-    let expires_at = token_expiry_from_now(resp["expires_in"].as_i64());
-
-    let new_refresh = resp["refresh_token"]
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or(refresh_token);
-
-    let mut stored = load_stored_openai_secret();
-
-    stored.refresh_token = new_refresh.clone();
-
-    update_in_memory_oauth_session(
-        Some(new_access.clone()),
-        Some(expires_at),
-        Some(new_refresh),
-        Some(stored.account_id.clone()),
-        Some(stored.plan_type.clone()),
-    );
-
-    if let Err(error) = persist_openai_secret(&stored) {
-        clear_in_memory_oauth_session();
-
-        return Err(error);
-    }
-
-    Ok(new_access)
-}
-
-fn try_refresh_anthropic_oauth_token() -> Result<String> {
-    let refresh_token = current_anthropic_refresh_token()
-        .ok_or_else(|| anyhow!("No Anthropic refresh token stored"))?;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let params = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-        "scope": ANTHROPIC_OAUTH_SCOPE,
-    });
-
-    let resp: Value = client
-        .post("https://platform.claude.com/v1/oauth/token")
-        .header("Content-Type", "application/json")
-        .json(&params)
-        .send()
-        .map_err(|error| {
-            clear_anthropic_oauth_tokens();
-
-            anyhow!(error)
-        })?
-        .error_for_status()
-        .map_err(|error| {
-            clear_anthropic_oauth_tokens();
-
-            anyhow!(error)
-        })?
-        .json()
-        .map_err(|error| {
-            clear_anthropic_oauth_tokens();
-
-            anyhow!(error)
-        })?;
-
-    let new_access = resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No access_token in Anthropic refresh response"))?
-        .to_string();
-
-    let expires_at = token_expiry_from_now(resp["expires_in"].as_i64());
-
-    let new_refresh = resp["refresh_token"]
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or(refresh_token);
-
-    let mut stored = load_stored_anthropic_secret();
-
-    stored.refresh_token = new_refresh.clone();
-
-    if let Some(subscription_type) = pick_str(
-        &resp,
-        &[
-            "subscriptionType",
-            "subscription_type",
-            "planType",
-            "plan_type",
-        ],
-    ) {
-        stored.subscription_type = subscription_type.to_string();
-    }
-
-    if let Some(rate_limit_tier) = pick_str(&resp, &["rateLimitTier", "rate_limit_tier", "tier"]) {
-        stored.rate_limit_tier = rate_limit_tier.to_string();
-    }
-
-    update_in_memory_anthropic_session(
-        Some(new_access.clone()),
-        Some(expires_at),
-        Some(new_refresh),
-        is_non_empty(&stored.subscription_type).then_some(stored.subscription_type.clone()),
-        is_non_empty(&stored.rate_limit_tier).then_some(stored.rate_limit_tier.clone()),
-    );
-
-    if let Err(error) = persist_anthropic_secret(&stored) {
-        clear_in_memory_anthropic_session();
-
-        return Err(error);
-    }
-
-    Ok(new_access)
-}
-
-#[derive(Debug, Clone)]
-struct OpenAiOAuthUsageData {
-    account_id: String,
-    plan_type: String,
-    primary_percent: f64,
-    secondary_percent: f64,
-    primary_reset_at: Option<String>,
-    secondary_reset_at: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct AnthropicOAuthUsageData {
-    subscription_type: String,
-    rate_limit_tier: String,
-    session_used: f64,
-    week_used: f64,
-    session_reset_at: Option<String>,
-    week_reset_at: Option<String>,
-}
-
-fn openai_oauth_plan_label(value: &str) -> String {
-    let trimmed = value.trim();
-
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
-        return "Subscription".to_string();
-    }
-
-    let mut chars = trimmed.chars();
-
-    match chars.next() {
-        None => "Subscription".to_string(),
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-    }
-}
-
-fn anthropic_oauth_plan_label(value: Option<String>) -> String {
-    value.unwrap_or_else(|| "Subscription".to_string())
-}
-
-fn fetch_openai_oauth_usage_value(
-    access_token: &str,
-    account_id: &str,
-) -> std::result::Result<Value, ApiFetchError> {
-    let client = client_with_timeout().map_err(ApiFetchError::Transport)?;
-
-    let mut req = client
-        .get("https://chatgpt.com/backend-api/wham/usage")
-        .bearer_auth(access_token)
-        .header("Accept", "application/json")
-        .header("User-Agent", "opencode/0.1");
-
-    if !account_id.is_empty() {
-        req = req.header("ChatGPT-Account-Id", account_id);
-    }
-
-    let resp = req
-        .send()
-        .map_err(|error| ApiFetchError::Transport(error.into()))?;
-
-    let status = resp.status();
-
-    if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-
-        return Err(ApiFetchError::Http { status, body });
-    }
-
-    resp.json()
-        .map_err(|error| ApiFetchError::InvalidResponse(error.into()))
-}
-
-fn fetch_anthropic_oauth_usage_value(
-    access_token: &str,
-) -> std::result::Result<Value, ApiFetchError> {
-    let client = client_with_timeout().map_err(ApiFetchError::Transport)?;
-
-    let resp = client
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .bearer_auth(access_token)
-        .header("Accept", "application/json")
-        .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER)
-        .header("User-Agent", "usageguard/0.1")
-        .send()
-        .map_err(|error| ApiFetchError::Transport(error.into()))?;
-
-    let status = resp.status();
-
-    if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-
-        return Err(ApiFetchError::Http { status, body });
-    }
-
-    resp.json()
-        .map_err(|error| ApiFetchError::InvalidResponse(error.into()))
-}
-
-fn parse_openai_oauth_usage_data(value: &Value) -> Result<OpenAiOAuthUsageData> {
-    let account_id = value["account_id"]
-        .as_str()
-        .or_else(|| value["user_id"].as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    let primary_percent = value
-        .pointer("/rate_limit/primary_window/used_percent")
-        .or_else(|| value.pointer("/primary_window/used_percent"))
-        .and_then(|entry| entry.as_f64());
-
-    let secondary_percent = value
-        .pointer("/rate_limit/secondary_window/used_percent")
-        .or_else(|| value.pointer("/secondary_window/used_percent"))
-        .and_then(|entry| entry.as_f64());
-
-    if primary_percent.is_none() && secondary_percent.is_none() {
-        return Err(anyhow!(
-            "OpenAI oauth usage response missing supported quota window data"
-        ));
-    }
-
-    let primary_reset_at =
-        openai_oauth_window_reset_at(value, "primary_window", "primaryWindow", "short_window");
-
-    let secondary_reset_at =
-        openai_oauth_window_reset_at(value, "secondary_window", "secondaryWindow", "long_window");
-
-    Ok(OpenAiOAuthUsageData {
-        account_id,
-        plan_type: openai_oauth_plan_label(value["plan_type"].as_str().unwrap_or_default()),
-        primary_percent: primary_percent
-            .or(secondary_percent)
-            .unwrap_or(0.0)
-            .clamp(0.0, 100.0),
-        secondary_percent: secondary_percent
-            .or(primary_percent)
-            .unwrap_or(0.0)
-            .clamp(0.0, 100.0),
-        primary_reset_at: primary_reset_at
-            .clone()
-            .or_else(|| secondary_reset_at.clone()),
-        secondary_reset_at: secondary_reset_at.or(primary_reset_at),
-    })
-}
-
-fn do_fetch_wham_usage(access_token: &str, account_id: &str) -> Result<UsageSnapshot> {
-    let value = fetch_openai_oauth_usage_value(access_token, account_id).map_err(|error| {
-        let detail = match &error {
-            ApiFetchError::Http { status, .. } => format!("HTTP {status}"),
-            ApiFetchError::Transport(error) | ApiFetchError::InvalidResponse(error) => {
-                error.to_string()
-            }
-        };
-
-        anyhow!(detail)
-    })?;
-
-    parse_wham_usage_response(&value)
-}
-
-fn do_fetch_anthropic_oauth_usage(access_token: &str) -> Result<UsageSnapshot> {
-    let value = fetch_anthropic_oauth_usage_value(access_token).map_err(|error| {
-        let detail = match &error {
-            ApiFetchError::Http { status, .. } => format!("HTTP {status}"),
-            ApiFetchError::Transport(error) | ApiFetchError::InvalidResponse(error) => {
-                error.to_string()
-            }
-        };
-
-        anyhow!(detail)
-    })?;
-
-    parse_anthropic_oauth_usage_response(&value)
-}
-
-fn parse_wham_usage_response(value: &Value) -> Result<UsageSnapshot> {
-    let usage = parse_openai_oauth_usage_data(value)?;
-
-    let plan_type = usage.plan_type.clone();
-
-    let mut stored = load_stored_openai_secret();
-
-    if is_non_empty(&usage.account_id) {
-        stored.account_id = usage.account_id.clone();
-    }
-
-    if is_non_empty(&usage.plan_type) {
-        stored.plan_type = usage.plan_type.clone();
-    }
-
-    let _ = persist_openai_secret(&stored);
-
-    update_in_memory_oauth_session(
-        None,
-        None,
-        None,
-        Some(stored.account_id.clone()),
-        Some(stored.plan_type.clone()),
-    );
-
-    // primary_window  = shorter window (e.g. 5 hours)  → maps to the "5h" ring
-    // secondary_window = longer window (e.g. 1 week)   → maps to the "week" ring
-    // Try nested path first (/rate_limit/…), then flat path (/primary_window/…)
-    let primary_percent = usage.primary_percent;
-
-    let secondary_percent = usage.secondary_percent;
-
-    // Capitalise first letter: "pro" → "Pro"
-    let plan_display = plan_type;
-
-    // Ring encoding for oauth snapshots (read back in WidgetView fiveHourRatio /
-    // weekRatio).  We store both windows as plain 0–100 percentages:
-    //   spent_usd / limit_usd(100) = secondary %  → week ring (outer/right)
-    //   tokens_in                  = primary %     → 5h ring  (inner/left)
-    Ok(UsageSnapshot {
-        provider: "openai".into(),
-        account_label: format!("ChatGPT {plan_display}"),
-        spent_usd: secondary_percent, // week ring = secondary / 100
-        limit_usd: 100.0,
-        tokens_in: primary_percent.round() as u64, // 5h ring reads this directly
-        tokens_out: 0,
-        inactive_hours: 0,
-        source: "oauth".to_string(),
-        status_code: None,
-        status_message: None,
-        api_metrics: None,
-        consumer_quota: None,
-        primary_reset_at: usage.primary_reset_at.clone(),
-        secondary_reset_at: usage.secondary_reset_at.clone(),
-    })
-}
-
-fn anthropic_oauth_bucket_value(bucket: &Value) -> Option<f64> {
-    match bucket {
-        Value::Number(number) => number.as_f64().map(|value| value.clamp(0.0, 100.0)),
-        Value::Object(_) => pick_f64(bucket, &["utilization", "usage", "percent", "value"])
-            .map(|value| value.clamp(0.0, 100.0)),
-        _ => None,
-    }
-}
-
-fn openai_oauth_window_reset_at(
-    value: &Value,
-    primary_key: &str,
-    camel_key: &str,
-    fallback_key: &str,
-) -> Option<String> {
-    let paths = [
-        format!("/rate_limit/{primary_key}/resets_at"),
-        format!("/rate_limit/{primary_key}/reset_at"),
-        format!("/rate_limit/{primary_key}/resetsAt"),
-        format!("/rate_limit/{primary_key}/resetAt"),
-        format!("/rate_limit/{camel_key}/resets_at"),
-        format!("/rate_limit/{camel_key}/reset_at"),
-        format!("/rate_limit/{camel_key}/resetsAt"),
-        format!("/rate_limit/{camel_key}/resetAt"),
-        format!("/{primary_key}/resets_at"),
-        format!("/{primary_key}/reset_at"),
-        format!("/{primary_key}/resetsAt"),
-        format!("/{primary_key}/resetAt"),
-        format!("/{camel_key}/resets_at"),
-        format!("/{camel_key}/reset_at"),
-        format!("/{camel_key}/resetsAt"),
-        format!("/{camel_key}/resetAt"),
-        format!("/{fallback_key}/resets_at"),
-        format!("/{fallback_key}/reset_at"),
-        format!("/{fallback_key}/resetsAt"),
-        format!("/{fallback_key}/resetAt"),
-    ];
-
-    paths.iter().find_map(|pointer| {
-        let val = value.pointer(pointer)?;
-
-        if let Some(s) = val.as_str() {
-            return Some(s.to_string());
-        }
-
-        // wham API returns reset_at as a Unix timestamp integer
-        if let Some(ts) = val.as_i64() {
-            return DateTime::from_timestamp(ts, 0).map(|dt| dt.to_rfc3339());
-        }
-
-        None
-    })
-}
-
-fn anthropic_oauth_bucket<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
-    keys.iter().find_map(|key| value.get(*key))
-}
-
-fn anthropic_oauth_bucket_percent(value: &Value, keys: &[&str]) -> Option<f64> {
-    anthropic_oauth_bucket(value, keys)
-        .and_then(anthropic_oauth_bucket_value)
-        .or_else(|| {
-            keys.iter().find_map(|key| {
-                let utilization_key = format!("{key}_utilization");
-
-                value
-                    .get(utilization_key.as_str())
-                    .and_then(anthropic_oauth_bucket_value)
-            })
-        })
-}
-
-fn anthropic_oauth_bucket_reset_at(value: &Value, keys: &[&str]) -> Option<String> {
-    anthropic_oauth_bucket(value, keys)
-        .and_then(|bucket| pick_str(bucket, &["resets_at", "reset_at", "resetsAt", "resetAt"]))
-        .map(str::to_string)
-}
-
-fn parse_anthropic_oauth_usage_data(value: &Value) -> Result<AnthropicOAuthUsageData> {
-    let five_hour_keys = &["five_hour", "fiveHour", "5_hour", "short_term", "shortTerm"];
-
-    let seven_day_keys = &[
-        "seven_day",
-        "seven_day_all",
-        "daily",
-        "sevenDayAll",
-        "7_day_all",
-        "long_term",
-        "longTerm",
-        "weekly",
-    ];
-
-    let five_hour_percent = anthropic_oauth_bucket_percent(value, five_hour_keys);
-
-    let seven_day_percent = anthropic_oauth_bucket_percent(value, seven_day_keys);
-
-    if five_hour_percent.is_none() && seven_day_percent.is_none() {
-        return Err(anyhow!(
-            "Anthropic oauth usage response missing supported utilization buckets"
-        ));
-    }
-
-    let five_hour_reset_at = anthropic_oauth_bucket_reset_at(value, five_hour_keys);
-
-    let seven_day_reset_at = anthropic_oauth_bucket_reset_at(value, seven_day_keys);
-
-    Ok(AnthropicOAuthUsageData {
-        subscription_type: pick_str(
-            value,
-            &[
-                "subscriptionType",
-                "subscription_type",
-                "planType",
-                "plan_type",
-            ],
-        )
-        .unwrap_or_default()
-        .to_string(),
-        rate_limit_tier: pick_str(value, &["rateLimitTier", "rate_limit_tier", "tier"])
-            .unwrap_or_default()
-            .to_string(),
-        session_used: five_hour_percent
-            .or(seven_day_percent)
-            .unwrap_or(0.0)
-            .clamp(0.0, 100.0),
-        week_used: seven_day_percent
-            .or(five_hour_percent)
-            .unwrap_or(0.0)
-            .clamp(0.0, 100.0),
-        session_reset_at: five_hour_reset_at
-            .clone()
-            .or_else(|| seven_day_reset_at.clone()),
-        week_reset_at: seven_day_reset_at.or(five_hour_reset_at),
-    })
-}
-
-fn anthropic_oauth_snapshot_from_usage(
-    usage: &AnthropicOAuthUsageData,
-    plan_type: Option<String>,
-) -> UsageSnapshot {
-    UsageSnapshot {
-        provider: "anthropic".into(),
-        account_label: format!("Claude {}", anthropic_oauth_plan_label(plan_type)),
-        spent_usd: usage.week_used,
-        limit_usd: 100.0,
-        tokens_in: usage.session_used.round() as u64,
-        tokens_out: 0,
-        inactive_hours: 0,
-        source: "oauth".to_string(),
-        status_code: None,
-        status_message: None,
-        api_metrics: None,
-        consumer_quota: None,
-        primary_reset_at: usage.session_reset_at.clone(),
-        secondary_reset_at: usage.week_reset_at.clone(),
-    }
-}
-
-fn parse_anthropic_oauth_usage_response(value: &Value) -> Result<UsageSnapshot> {
-    let usage = parse_anthropic_oauth_usage_data(value)?;
-
-    let mut stored = load_stored_anthropic_secret();
-
-    if is_non_empty(&usage.subscription_type) {
-        stored.subscription_type = usage.subscription_type.clone();
-    }
-
-    if is_non_empty(&usage.rate_limit_tier) {
-        stored.rate_limit_tier = usage.rate_limit_tier.clone();
-    }
-
-    let _ = persist_anthropic_secret(&stored);
-
-    update_in_memory_anthropic_session(
-        None,
-        None,
-        None,
-        is_non_empty(&stored.subscription_type).then_some(stored.subscription_type.clone()),
-        is_non_empty(&stored.rate_limit_tier).then_some(stored.rate_limit_tier.clone()),
-    );
-
-    Ok(anthropic_oauth_snapshot_from_usage(
-        &usage,
-        anthropic_plan_type_from_fields(&stored.subscription_type, &stored.rate_limit_tier),
     ))
 }
 
@@ -2444,46 +1427,6 @@ fn migrate_secret_payload(cfg: &mut AppConfig) -> Result<bool> {
         }
     }
 
-    let legacy_oauth = {
-        let file = load_legacy_oauth_file();
-
-        if oauth_tokens_present(&file) {
-            Some(file)
-        } else {
-            let keyring = load_legacy_keyring_oauth_tokens();
-
-            oauth_tokens_present(&keyring).then_some(keyring)
-        }
-    };
-
-    if let Some(legacy) = legacy_oauth {
-        cleanup_needed = true;
-
-        if is_non_empty(&legacy.openai_refresh_token) {
-            if payload.openai_oauth.refresh_token != legacy.openai_refresh_token {
-                changed = true;
-            }
-
-            payload.openai_oauth.refresh_token = legacy.openai_refresh_token;
-        }
-
-        if is_non_empty(&legacy.openai_account_id) {
-            if payload.openai_oauth.account_id != legacy.openai_account_id {
-                changed = true;
-            }
-
-            payload.openai_oauth.account_id = legacy.openai_account_id;
-        }
-
-        if is_non_empty(&legacy.openai_plan_type) {
-            if payload.openai_oauth.plan_type != legacy.openai_plan_type {
-                changed = true;
-            }
-
-            payload.openai_oauth.plan_type = legacy.openai_plan_type;
-        }
-    }
-
     if !changed && !cleanup_needed {
         return Ok(false);
     }
@@ -2496,11 +1439,11 @@ fn migrate_secret_payload(cfg: &mut AppConfig) -> Result<bool> {
         delete_keyring_password(&key_id);
     }
 
-    if let Ok(entry) = oauth_tokens_entry() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, "openai.oauth.tokens") {
         let _ = entry.delete_credential();
     }
 
-    if let Ok(path) = oauth_tokens_path() {
+    if let Ok(path) = app_config_dir().map(|dir| dir.join("oauth_tokens.json")) {
         let _ = fs::remove_file(path);
     }
 
@@ -2550,23 +1493,23 @@ fn migrate_legacy_provider_accounts(cfg: &mut AppConfig) -> bool {
     migrated
 }
 
-fn migrate_legacy_oauth_alert_preferences(raw: &Value, cfg: &mut AppConfig) -> bool {
+fn migrate_legacy_consumer_alert_preferences(raw: &Value, cfg: &mut AppConfig) -> bool {
     let mut migrated = false;
 
     for (legacy_key, short_key, week_key, short_value, week_value) in [
         (
             "openai_oauth_alerts_enabled",
-            "openai_oauth_5h_alerts_enabled",
-            "openai_oauth_week_alerts_enabled",
-            &mut cfg.openai_oauth_5h_alerts_enabled,
-            &mut cfg.openai_oauth_week_alerts_enabled,
+            "openai_consumer_5h_alerts_enabled",
+            "openai_consumer_week_alerts_enabled",
+            &mut cfg.openai_consumer_5h_alerts_enabled,
+            &mut cfg.openai_consumer_week_alerts_enabled,
         ),
         (
             "anthropic_oauth_alerts_enabled",
-            "anthropic_oauth_5h_alerts_enabled",
-            "anthropic_oauth_week_alerts_enabled",
-            &mut cfg.anthropic_oauth_5h_alerts_enabled,
-            &mut cfg.anthropic_oauth_week_alerts_enabled,
+            "anthropic_consumer_5h_alerts_enabled",
+            "anthropic_consumer_week_alerts_enabled",
+            &mut cfg.anthropic_consumer_5h_alerts_enabled,
+            &mut cfg.anthropic_consumer_week_alerts_enabled,
         ),
     ] {
         let legacy = raw.get(legacy_key).and_then(|value| value.as_bool());
@@ -2657,7 +1600,7 @@ pub fn load_config() -> Result<AppConfig> {
 
     migrated |= migrate_legacy_provider_accounts(&mut cfg);
 
-    migrated |= migrate_legacy_oauth_alert_preferences(&raw_value, &mut cfg);
+    migrated |= migrate_legacy_consumer_alert_preferences(&raw_value, &mut cfg);
 
     if !cfg.profiles.is_empty() {
         cfg.profiles.clear();
@@ -2806,7 +1749,7 @@ fn format_time_until_reset(duration: Duration) -> String {
     }
 }
 
-fn push_oauth_window_alerts(
+fn push_consumer_window_alerts(
     alerts: &mut Vec<Alert>,
     now: DateTime<Utc>,
     window_label: &str,
@@ -2865,7 +1808,7 @@ fn push_oauth_window_alerts(
     });
 }
 
-fn evaluate_oauth_alerts(
+fn evaluate_consumer_alerts(
     snapshot: &UsageSnapshot,
     now: DateTime<Utc>,
     cfg: &AppConfig,
@@ -2878,17 +1821,17 @@ fn evaluate_oauth_alerts(
 
     match snapshot.provider.as_str() {
         "openai" => {
-            if cfg.openai_oauth_5h_alerts_enabled {
+            if cfg.openai_consumer_5h_alerts_enabled {
                 if let Some((used_percent, reset_at)) = primary_quota {
-                    push_oauth_window_alerts(
+                    push_consumer_window_alerts(
                         &mut alerts,
                         now,
                         "5h",
                         used_percent,
                         reset_at,
-                        OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
-                        OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
-                        Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
+                        CONSUMER_FIVE_HOUR_NEAR_LIMIT_PERCENT,
+                        CONSUMER_FIVE_HOUR_UNUSED_PERCENT_MAX,
+                        Duration::minutes(CONSUMER_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
                         "quota_5h_exhausted",
                         "quota_5h_near_limit",
                         "quota_5h_unused_before_reset",
@@ -2896,17 +1839,17 @@ fn evaluate_oauth_alerts(
                 }
             }
 
-            if cfg.openai_oauth_week_alerts_enabled {
+            if cfg.openai_consumer_week_alerts_enabled {
                 if let Some((used_percent, reset_at)) = secondary_quota {
-                    push_oauth_window_alerts(
+                    push_consumer_window_alerts(
                         &mut alerts,
                         now,
                         "Week",
                         used_percent,
                         reset_at,
-                        OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
-                        OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
-                        Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
+                        CONSUMER_WEEKLY_NEAR_LIMIT_PERCENT,
+                        CONSUMER_WEEKLY_UNUSED_PERCENT_MAX,
+                        Duration::hours(CONSUMER_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
                         "quota_week_exhausted",
                         "quota_week_near_limit",
                         "quota_week_unused_before_reset",
@@ -2915,17 +1858,17 @@ fn evaluate_oauth_alerts(
             }
         }
         "anthropic" => {
-            if cfg.anthropic_oauth_5h_alerts_enabled {
+            if cfg.anthropic_consumer_5h_alerts_enabled {
                 if let Some((used_percent, reset_at)) = primary_quota {
-                    push_oauth_window_alerts(
+                    push_consumer_window_alerts(
                         &mut alerts,
                         now,
                         "5h",
                         used_percent,
                         reset_at,
-                        OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
-                        OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
-                        Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
+                        CONSUMER_FIVE_HOUR_NEAR_LIMIT_PERCENT,
+                        CONSUMER_FIVE_HOUR_UNUSED_PERCENT_MAX,
+                        Duration::minutes(CONSUMER_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
                         "quota_5h_exhausted",
                         "quota_5h_near_limit",
                         "quota_5h_unused_before_reset",
@@ -2933,17 +1876,17 @@ fn evaluate_oauth_alerts(
                 }
             }
 
-            if cfg.anthropic_oauth_week_alerts_enabled {
+            if cfg.anthropic_consumer_week_alerts_enabled {
                 if let Some((used_percent, reset_at)) = secondary_quota {
-                    push_oauth_window_alerts(
+                    push_consumer_window_alerts(
                         &mut alerts,
                         now,
                         "Week",
                         used_percent,
                         reset_at,
-                        OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
-                        OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
-                        Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
+                        CONSUMER_WEEKLY_NEAR_LIMIT_PERCENT,
+                        CONSUMER_WEEKLY_UNUSED_PERCENT_MAX,
+                        Duration::hours(CONSUMER_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
                         "quota_week_exhausted",
                         "quota_week_near_limit",
                         "quota_week_unused_before_reset",
@@ -2953,15 +1896,15 @@ fn evaluate_oauth_alerts(
         }
         _ => {
             if let Some((used_percent, reset_at)) = primary_quota {
-                push_oauth_window_alerts(
+                push_consumer_window_alerts(
                     &mut alerts,
                     now,
                     "5h",
                     used_percent,
                     reset_at,
-                    OAUTH_FIVE_HOUR_NEAR_LIMIT_PERCENT,
-                    OAUTH_FIVE_HOUR_UNUSED_PERCENT_MAX,
-                    Duration::minutes(OAUTH_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
+                    CONSUMER_FIVE_HOUR_NEAR_LIMIT_PERCENT,
+                    CONSUMER_FIVE_HOUR_UNUSED_PERCENT_MAX,
+                    Duration::minutes(CONSUMER_FIVE_HOUR_RESET_REMINDER_WINDOW_MINUTES),
                     "quota_5h_exhausted",
                     "quota_5h_near_limit",
                     "quota_5h_unused_before_reset",
@@ -2969,15 +1912,15 @@ fn evaluate_oauth_alerts(
             }
 
             if let Some((used_percent, reset_at)) = secondary_quota {
-                push_oauth_window_alerts(
+                push_consumer_window_alerts(
                     &mut alerts,
                     now,
                     "Week",
                     used_percent,
                     reset_at,
-                    OAUTH_WEEKLY_NEAR_LIMIT_PERCENT,
-                    OAUTH_WEEKLY_UNUSED_PERCENT_MAX,
-                    Duration::hours(OAUTH_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
+                    CONSUMER_WEEKLY_NEAR_LIMIT_PERCENT,
+                    CONSUMER_WEEKLY_UNUSED_PERCENT_MAX,
+                    Duration::hours(CONSUMER_WEEKLY_RESET_REMINDER_WINDOW_HOURS),
                     "quota_week_exhausted",
                     "quota_week_near_limit",
                     "quota_week_unused_before_reset",
@@ -3034,8 +1977,8 @@ pub fn evaluate_alerts(
     now: DateTime<Utc>,
     cfg: &AppConfig,
 ) -> Vec<Alert> {
-    if snapshot.source == "oauth" || snapshot.source == CONSUMER_LOCAL_SOURCE {
-        evaluate_oauth_alerts(snapshot, now, cfg)
+    if snapshot.source == CONSUMER_LOCAL_SOURCE {
+        evaluate_consumer_alerts(snapshot, now, cfg)
     } else {
         evaluate_standard_alerts(snapshot, cfg)
     }
@@ -3130,7 +2073,7 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
     // Local consumer app sources first.
     if let Some(mut s) = fetch_openai_consumer_usage() {
         if let Some(label) = cfg
-            .openai_oauth_label
+            .openai_consumer_label
             .as_deref()
             .filter(|l| !l.trim().is_empty())
         {
@@ -3142,7 +2085,7 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
 
     if let Some(mut s) = fetch_anthropic_consumer_usage() {
         if let Some(label) = cfg
-            .anthropic_oauth_label
+            .anthropic_consumer_label
             .as_deref()
             .filter(|l| !l.trim().is_empty())
         {
@@ -3224,19 +2167,6 @@ enum ApiFetchError {
 struct ApiWindowRollup {
     today: ApiMetricWindow,
     rolling_30d: ApiMetricWindow,
-}
-
-#[derive(Debug, Clone)]
-pub struct OpenAiOAuthVerification {
-    pub account_id: String,
-    pub plan_type: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct AnthropicOAuthVerification {
-    pub subscription_type: String,
-    pub rate_limit_tier: String,
-    pub plan_type: String,
 }
 
 fn verification_error_priority(kind: &VerificationErrorKind) -> u8 {
@@ -3362,6 +2292,74 @@ fn client_with_timeout() -> Result<reqwest::blocking::Client> {
         .timeout(std::time::Duration::from_secs(12))
         .build()
         .map_err(Into::into)
+}
+
+fn fetch_openai_local_usage_value(
+    access_token: &str,
+    account_id: &str,
+) -> std::result::Result<Value, ApiFetchError> {
+    #[cfg(test)]
+    if let Some(raw) = openai_local_usage_response_override() {
+        return serde_json::from_str(&raw).map_err(|error| ApiFetchError::InvalidResponse(error.into()));
+    }
+
+    let client = client_with_timeout().map_err(ApiFetchError::Transport)?;
+
+    let mut req = client
+        .get("https://chatgpt.com/backend-api/wham/usage")
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .header("User-Agent", "opencode/0.1");
+
+    if !account_id.is_empty() {
+        req = req.header("ChatGPT-Account-Id", account_id);
+    }
+
+    let resp = req
+        .send()
+        .map_err(|error| ApiFetchError::Transport(error.into()))?;
+
+    let status = resp.status();
+
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+
+        return Err(ApiFetchError::Http { status, body });
+    }
+
+    resp.json()
+        .map_err(|error| ApiFetchError::InvalidResponse(error.into()))
+}
+
+fn fetch_claude_local_usage_value(
+    access_token: &str,
+) -> std::result::Result<Value, ApiFetchError> {
+    #[cfg(test)]
+    if let Some(raw) = claude_local_usage_response_override() {
+        return serde_json::from_str(&raw).map_err(|error| ApiFetchError::InvalidResponse(error.into()));
+    }
+
+    let client = client_with_timeout().map_err(ApiFetchError::Transport)?;
+
+    let resp = client
+        .get(CLAUDE_CODE_USAGE_API_URL)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .header("anthropic-beta", ANTHROPIC_LOCAL_USAGE_BETA_HEADER)
+        .header("User-Agent", "usageguard/0.1")
+        .send()
+        .map_err(|error| ApiFetchError::Transport(error.into()))?;
+
+    let status = resp.status();
+
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+
+        return Err(ApiFetchError::Http { status, body });
+    }
+
+    resp.json()
+        .map_err(|error| ApiFetchError::InvalidResponse(error.into()))
 }
 
 fn fetch_json_value(
@@ -3776,26 +2774,6 @@ fn strict_anthropic_api_validation_error(error: &ApiFetchError) -> VerificationE
     )
 }
 
-fn strict_openai_oauth_validation_error(error: &ApiFetchError) -> VerificationError {
-    validation_error_from_api_fetch(
-        error,
-        "ChatGPT sign-in could not be verified. Sign in again. Nothing was saved.",
-        "ChatGPT subscription usage access was denied. Nothing was saved.",
-        "ChatGPT verification could not reach the usage service right now. Nothing was saved.",
-        "ChatGPT verification returned unusable subscription data. Nothing was saved.",
-    )
-}
-
-fn strict_anthropic_oauth_validation_error(error: &ApiFetchError) -> VerificationError {
-    validation_error_from_api_fetch(
-        error,
-        "Claude sign-in could not be verified. Sign in again. Nothing was saved.",
-        "Claude subscription usage access was denied. Nothing was saved.",
-        "Claude verification could not reach the usage service right now. Nothing was saved.",
-        "Claude verification returned unusable subscription data. Nothing was saved.",
-    )
-}
-
 fn verify_openai_organization_api_key(api_key: &str) -> std::result::Result<(), VerificationError> {
     let client = client_with_timeout().map_err(|error| {
         VerificationError::new(
@@ -3925,77 +2903,6 @@ pub fn verify_provider_api_key(
             format!("Unsupported provider '{provider_id}'. Nothing was saved."),
         )),
     }
-}
-
-pub fn verify_openai_oauth_access_token(
-    access_token: &str,
-    account_id_hint: &str,
-) -> std::result::Result<OpenAiOAuthVerification, VerificationError> {
-    let value = fetch_openai_oauth_usage_value(access_token, account_id_hint)
-        .map_err(|error| strict_openai_oauth_validation_error(&error))?;
-
-    let usage = parse_openai_oauth_usage_data(&value).map_err(|_| {
-        VerificationError::new(
-            VerificationErrorKind::InvalidResponse,
-            "ChatGPT verification returned unusable subscription data. Nothing was saved.",
-        )
-    })?;
-
-    Ok(OpenAiOAuthVerification {
-        account_id: usage.account_id,
-        plan_type: usage.plan_type,
-    })
-}
-
-pub fn verify_anthropic_oauth_access_token(
-    access_token: &str,
-    subscription_type_hint: &str,
-    rate_limit_tier_hint: &str,
-) -> std::result::Result<AnthropicOAuthVerification, VerificationError> {
-    let value = fetch_anthropic_oauth_usage_value(access_token)
-        .map_err(|error| strict_anthropic_oauth_validation_error(&error))?;
-
-    let usage = parse_anthropic_oauth_usage_data(&value).map_err(|_| {
-        VerificationError::new(
-            VerificationErrorKind::InvalidResponse,
-            "Claude verification returned unusable subscription data. Nothing was saved.",
-        )
-    })?;
-
-    let mut subscription_type = usage.subscription_type;
-
-    let mut rate_limit_tier = usage.rate_limit_tier;
-
-    if !is_non_empty(&subscription_type) && is_non_empty(subscription_type_hint) {
-        subscription_type = subscription_type_hint.to_string();
-    }
-
-    if !is_non_empty(&rate_limit_tier) && is_non_empty(rate_limit_tier_hint) {
-        rate_limit_tier = rate_limit_tier_hint.to_string();
-    }
-
-    if !is_non_empty(&subscription_type) || !is_non_empty(&rate_limit_tier) {
-        if let Some((local_subscription_type, local_rate_limit_tier)) =
-            load_local_claude_oauth_metadata()
-        {
-            if !is_non_empty(&subscription_type) {
-                subscription_type = local_subscription_type;
-            }
-
-            if !is_non_empty(&rate_limit_tier) {
-                rate_limit_tier = local_rate_limit_tier;
-            }
-        }
-    }
-
-    Ok(AnthropicOAuthVerification {
-        plan_type: anthropic_oauth_plan_label(anthropic_plan_type_from_fields(
-            &subscription_type,
-            &rate_limit_tier,
-        )),
-        subscription_type,
-        rate_limit_tier,
-    })
 }
 
 fn fetch_openai_api_snapshot(label: &str, api_key: &str) -> Result<UsageSnapshot> {
@@ -4608,20 +3515,20 @@ mod tests {
     use super::*;
     use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
-    #[cfg(test)]
-
-    fn set_claude_local_primary_quota_window_for_testing(window: Option<ConsumerQuotaWindow>) {
-        *claude_insights_cache().lock().unwrap() = ClaudeInsightsCacheState {
-            fetched_at: Some(Utc::now()),
-            primary_window: window,
-            secondary_window: None,
-        };
-    }
-
     fn with_codex_consumer_override(
         name: &str,
         auth_body: &str,
         session_lines: &[&str],
+        test: impl FnOnce(),
+    ) {
+        with_codex_local_usage_override(name, auth_body, session_lines, None, test);
+    }
+
+    fn with_codex_local_usage_override(
+        name: &str,
+        auth_body: &str,
+        session_lines: &[&str],
+        usage_response: Option<&str>,
         test: impl FnOnce(),
     ) {
         let _guard = crate::secret_store::test_env_lock()
@@ -4660,21 +3567,30 @@ mod tests {
             session_path.parent().unwrap(),
         );
 
-        clear_in_memory_oauth_session();
+        match usage_response {
+            Some(raw) => std::env::set_var(OPENAI_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV, raw),
+            None => std::env::remove_var(OPENAI_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV),
+        }
+
+        invalidate_claude_local_insights_cache();
+        invalidate_codex_wham_cache();
 
         let _ = SecretStore::clear();
 
         let result = catch_unwind(AssertUnwindSafe(test));
 
-        clear_in_memory_oauth_session();
-
         let _ = SecretStore::clear();
+
+        invalidate_claude_local_insights_cache();
+        invalidate_codex_wham_cache();
 
         std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
 
         std::env::remove_var(CODEX_AUTH_PATH_OVERRIDE_ENV);
 
         std::env::remove_var(CODEX_SESSIONS_DIR_OVERRIDE_ENV);
+
+        std::env::remove_var(OPENAI_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV);
 
         let _ = fs::remove_dir_all(&root);
 
@@ -4697,15 +3613,11 @@ mod tests {
 
         let credentials_path = root.join(".claude").join(".credentials.json");
 
-        let projects_dir = root.join(".claude").join("projects");
-
         let _ = fs::remove_dir_all(&root);
 
         fs::create_dir_all(&config_root).unwrap();
 
         fs::create_dir_all(credentials_path.parent().unwrap()).unwrap();
-
-        fs::create_dir_all(&projects_dir).unwrap();
 
         fs::write(&credentials_path, body).unwrap();
 
@@ -4713,19 +3625,11 @@ mod tests {
 
         std::env::set_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV, &credentials_path);
 
-        std::env::set_var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV, &projects_dir);
-
-        set_claude_local_primary_quota_window_for_testing(None);
-
         invalidate_claude_local_insights_cache();
-
-        clear_in_memory_anthropic_session();
 
         let _ = SecretStore::clear();
 
         let result = catch_unwind(AssertUnwindSafe(test));
-
-        clear_in_memory_anthropic_session();
 
         let _ = SecretStore::clear();
 
@@ -4734,8 +3638,6 @@ mod tests {
         std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
 
         std::env::remove_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV);
-
-        std::env::remove_var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV);
 
         let _ = fs::remove_dir_all(&root);
 
@@ -4747,9 +3649,7 @@ mod tests {
     fn with_claude_local_override(
         name: &str,
         credentials_body: &str,
-        project_lines: &[&str],
-        insights_stdout: Option<&str>,
-        _insights_status: i32,
+        usage_response: Option<&str>,
         test: impl FnOnce(),
     ) {
         let _guard = crate::secret_store::test_env_lock()
@@ -4765,66 +3665,40 @@ mod tests {
 
         let credentials_path = root.join(".claude").join(".credentials.json");
 
-        let projects_dir = root.join(".claude").join("projects");
-
-        let project_path = projects_dir.join("test.jsonl");
-
         let _ = fs::remove_dir_all(&root);
 
         fs::create_dir_all(&config_root).unwrap();
 
         fs::create_dir_all(credentials_path.parent().unwrap()).unwrap();
 
-        fs::create_dir_all(&projects_dir).unwrap();
-
         fs::write(&credentials_path, credentials_body).unwrap();
-
-        fs::write(&project_path, project_lines.join("\n")).unwrap();
 
         std::env::set_var("USAGEGUARD_CONFIG_DIR_OVERRIDE", &config_root);
 
         std::env::set_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV, &credentials_path);
 
-        std::env::set_var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV, &projects_dir);
-
-        // Inject the quota window directly into the cache (no subprocess needed).
-        if let Some(raw) = insights_stdout {
-            let window = raw.lines().find_map(|line| {
-                let trimmed = line.trim();
-
-                if trimmed.is_empty() {
-                    return None;
-                }
-
-                let value = serde_json::from_str::<Value>(trimmed).ok()?;
-
-                parse_claude_rate_limit_event(&value)
-            });
-
-            set_claude_local_primary_quota_window_for_testing(window);
-        } else {
-            set_claude_local_primary_quota_window_for_testing(None);
-
-            invalidate_claude_local_insights_cache();
+        match usage_response {
+            Some(raw) => std::env::set_var(CLAUDE_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV, raw),
+            None => std::env::remove_var(CLAUDE_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV),
         }
 
-        clear_in_memory_anthropic_session();
+        invalidate_codex_wham_cache();
+        invalidate_claude_local_insights_cache();
 
         let _ = SecretStore::clear();
 
         let result = catch_unwind(AssertUnwindSafe(test));
 
-        clear_in_memory_anthropic_session();
-
         let _ = SecretStore::clear();
 
+        invalidate_codex_wham_cache();
         invalidate_claude_local_insights_cache();
 
         std::env::remove_var("USAGEGUARD_CONFIG_DIR_OVERRIDE");
 
         std::env::remove_var(CLAUDE_CREDENTIALS_PATH_OVERRIDE_ENV);
 
-        std::env::remove_var(CLAUDE_PROJECTS_DIR_OVERRIDE_ENV);
+        std::env::remove_var(CLAUDE_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV);
 
         let _ = fs::remove_dir_all(&root);
 
@@ -4851,20 +3725,14 @@ mod tests {
 
         std::env::set_var("USAGEGUARD_CONFIG_DIR_OVERRIDE", &config_root);
 
-        clear_in_memory_oauth_session();
-
-        clear_in_memory_anthropic_session();
-
+        invalidate_codex_wham_cache();
         invalidate_claude_local_insights_cache();
 
         let _ = SecretStore::clear();
 
         let result = catch_unwind(AssertUnwindSafe(test));
 
-        clear_in_memory_oauth_session();
-
-        clear_in_memory_anthropic_session();
-
+        invalidate_codex_wham_cache();
         invalidate_claude_local_insights_cache();
 
         let _ = SecretStore::clear();
@@ -4905,7 +3773,7 @@ mod tests {
         assert!(alerts.iter().any(|a| a.code == "near_limit"));
     }
 
-    fn oauth_snapshot(
+    fn consumer_snapshot(
         five_hour_used: u64,
         week_used: f64,
         five_hour_reset_at: Option<&str>,
@@ -4919,7 +3787,7 @@ mod tests {
             tokens_in: five_hour_used,
             tokens_out: 0,
             inactive_hours: 0,
-            source: "oauth".into(),
+            source: CONSUMER_LOCAL_SOURCE.into(),
             status_code: None,
             status_message: None,
             api_metrics: None,
@@ -4931,14 +3799,14 @@ mod tests {
 
     #[test]
 
-    fn oauth_five_hour_near_limit_alert_fires_at_threshold() {
+    fn consumer_five_hour_near_limit_alert_fires_at_threshold() {
         let cfg = AppConfig::default();
 
         let now = Utc::now();
 
-        let below_threshold = oauth_snapshot(89, 10.0, None, None);
+        let below_threshold = consumer_snapshot(89, 10.0, None, None);
 
-        let at_threshold = oauth_snapshot(90, 10.0, None, None);
+        let at_threshold = consumer_snapshot(90, 10.0, None, None);
 
         assert!(!evaluate_alerts(&below_threshold, now, &cfg)
             .iter()
@@ -4951,14 +3819,14 @@ mod tests {
 
     #[test]
 
-    fn oauth_week_near_limit_alert_fires_at_threshold() {
+    fn consumer_week_near_limit_alert_fires_at_threshold() {
         let cfg = AppConfig::default();
 
         let now = Utc::now();
 
-        let below_threshold = oauth_snapshot(10, 79.0, None, None);
+        let below_threshold = consumer_snapshot(10, 79.0, None, None);
 
-        let at_threshold = oauth_snapshot(10, 80.0, None, None);
+        let at_threshold = consumer_snapshot(10, 80.0, None, None);
 
         assert!(!evaluate_alerts(&below_threshold, now, &cfg)
             .iter()
@@ -4976,7 +3844,7 @@ mod tests {
 
         let now = Utc::now();
 
-        let mut snapshot = oauth_snapshot(95, 85.0, None, None);
+        let mut snapshot = consumer_snapshot(95, 85.0, None, None);
 
         snapshot.source = CONSUMER_LOCAL_SOURCE.into();
 
@@ -4995,7 +3863,7 @@ mod tests {
 
     #[test]
 
-    fn oauth_five_hour_use_before_reset_requires_time_and_usage_thresholds() {
+    fn consumer_five_hour_use_before_reset_requires_time_and_usage_thresholds() {
         let cfg = AppConfig::default();
 
         let now = Utc::now();
@@ -5004,11 +3872,11 @@ mod tests {
 
         let outside_window = (now + Duration::minutes(46)).to_rfc3339();
 
-        let within_threshold = oauth_snapshot(20, 10.0, Some(&within_window), None);
+        let within_threshold = consumer_snapshot(20, 10.0, Some(&within_window), None);
 
-        let too_late = oauth_snapshot(20, 10.0, Some(&outside_window), None);
+        let too_late = consumer_snapshot(20, 10.0, Some(&outside_window), None);
 
-        let too_used = oauth_snapshot(21, 10.0, Some(&within_window), None);
+        let too_used = consumer_snapshot(21, 10.0, Some(&within_window), None);
 
         assert!(evaluate_alerts(&within_threshold, now, &cfg)
             .iter()
@@ -5025,7 +3893,7 @@ mod tests {
 
     #[test]
 
-    fn oauth_week_use_before_reset_requires_time_and_usage_thresholds() {
+    fn consumer_week_use_before_reset_requires_time_and_usage_thresholds() {
         let cfg = AppConfig::default();
 
         let now = Utc::now();
@@ -5034,11 +3902,11 @@ mod tests {
 
         let outside_window = (now + Duration::hours(25)).to_rfc3339();
 
-        let within_threshold = oauth_snapshot(10, 40.0, None, Some(&within_window));
+        let within_threshold = consumer_snapshot(10, 40.0, None, Some(&within_window));
 
-        let too_late = oauth_snapshot(10, 40.0, None, Some(&outside_window));
+        let too_late = consumer_snapshot(10, 40.0, None, Some(&outside_window));
 
-        let too_used = oauth_snapshot(10, 41.0, None, Some(&within_window));
+        let too_used = consumer_snapshot(10, 41.0, None, Some(&within_window));
 
         assert!(evaluate_alerts(&within_threshold, now, &cfg)
             .iter()
@@ -5055,14 +3923,14 @@ mod tests {
 
     #[test]
 
-    fn oauth_use_before_reset_skips_missing_or_invalid_reset_times() {
+    fn consumer_use_before_reset_skips_missing_or_invalid_reset_times() {
         let cfg = AppConfig::default();
 
         let now = Utc::now();
 
-        let missing_reset = oauth_snapshot(5, 10.0, None, None);
+        let missing_reset = consumer_snapshot(5, 10.0, None, None);
 
-        let invalid_reset = oauth_snapshot(5, 10.0, Some("not-a-timestamp"), None);
+        let invalid_reset = consumer_snapshot(5, 10.0, Some("not-a-timestamp"), None);
 
         assert!(!evaluate_alerts(&missing_reset, now, &cfg)
             .iter()
@@ -5075,15 +3943,15 @@ mod tests {
 
     #[test]
 
-    fn openai_5h_oauth_alerts_can_be_disabled_independently() {
+    fn openai_5h_consumer_alerts_can_be_disabled_independently() {
         let cfg = AppConfig {
-            openai_oauth_5h_alerts_enabled: false,
+            openai_consumer_5h_alerts_enabled: false,
             ..AppConfig::default()
         };
 
         let now = Utc::now();
 
-        let snapshot = oauth_snapshot(95, 85.0, None, None);
+        let snapshot = consumer_snapshot(95, 85.0, None, None);
 
         let alerts = evaluate_alerts(&snapshot, now, &cfg);
 
@@ -5098,15 +3966,15 @@ mod tests {
 
     #[test]
 
-    fn anthropic_week_oauth_alerts_can_be_disabled_independently() {
+    fn anthropic_week_consumer_alerts_can_be_disabled_independently() {
         let cfg = AppConfig {
-            anthropic_oauth_week_alerts_enabled: false,
+            anthropic_consumer_week_alerts_enabled: false,
             ..AppConfig::default()
         };
 
         let now = Utc::now();
 
-        let mut snapshot = oauth_snapshot(95, 85.0, None, None);
+        let mut snapshot = consumer_snapshot(95, 85.0, None, None);
 
         snapshot.provider = "anthropic".into();
 
@@ -5484,7 +4352,7 @@ mod tests {
 
     #[test]
 
-    fn load_config_migrates_legacy_oauth_alert_toggle_to_window_toggles() {
+    fn load_config_migrates_legacy_consumer_alert_toggle_to_window_toggles() {
         with_test_config_dir("legacy_oauth_alert_toggle", || {
             let path = config_path().unwrap();
 
@@ -5510,9 +4378,9 @@ mod tests {
 
             let cfg = load_config().unwrap();
 
-            assert!(!cfg.openai_oauth_5h_alerts_enabled);
+            assert!(!cfg.openai_consumer_5h_alerts_enabled);
 
-            assert!(!cfg.openai_oauth_week_alerts_enabled);
+            assert!(!cfg.openai_consumer_week_alerts_enabled);
 
             let saved = fs::read_to_string(&path).unwrap();
 
@@ -5522,14 +4390,14 @@ mod tests {
 
             assert_eq!(
                 saved
-                    .get("openai_oauth_5h_alerts_enabled")
+                    .get("openai_consumer_5h_alerts_enabled")
                     .and_then(|value| value.as_bool()),
                 Some(false)
             );
 
             assert_eq!(
                 saved
-                    .get("openai_oauth_week_alerts_enabled")
+                    .get("openai_consumer_week_alerts_enabled")
                     .and_then(|value| value.as_bool()),
                 Some(false)
             );
@@ -5538,181 +4406,39 @@ mod tests {
 
     #[test]
 
-    fn parse_anthropic_oauth_usage_response_full_data() {
-        clear_in_memory_anthropic_session();
-
-        update_in_memory_anthropic_session(
-            None,
-            None,
-            None,
-            Some("pro".into()),
-            Some("premium".into()),
-        );
-
+    fn parse_claude_local_usage_response_normalizes_fraction_utilization() {
         let value: Value = serde_json::json!({
-            "five_hour": { "utilization": 62.5, "resets_at": "2026-03-09T12:00:00Z" },
-            "seven_day": { "utilization": 37.0, "resets_at": "2026-03-12T00:00:00Z" }
-        });
-
-        let snap = parse_anthropic_oauth_usage_response(&value).unwrap();
-
-        assert_eq!(snap.provider, "anthropic");
-
-        assert_eq!(snap.source, "oauth");
-
-        assert!(snap.account_label.starts_with("Claude"));
-
-        assert_eq!(snap.tokens_in, 63);
-
-        assert!((snap.spent_usd - 37.0).abs() < f64::EPSILON);
-
-        assert!((snap.limit_usd - 100.0).abs() < f64::EPSILON);
-
-        assert_eq!(
-            snap.primary_reset_at.as_deref(),
-            Some("2026-03-09T12:00:00Z")
-        );
-
-        assert_eq!(
-            snap.secondary_reset_at.as_deref(),
-            Some("2026-03-12T00:00:00Z")
-        );
-    }
-
-    #[test]
-
-    fn parse_anthropic_oauth_usage_response_falls_back_when_window_missing() {
-        clear_in_memory_anthropic_session();
-
-        let value: Value = serde_json::json!({
-            "seven_day": { "utilization": 24.0 }
-        });
-
-        let snap = parse_anthropic_oauth_usage_response(&value).unwrap();
-
-        assert_eq!(snap.tokens_in, 24);
-
-        assert!((snap.spent_usd - 24.0).abs() < f64::EPSILON);
-
-        assert!(snap.primary_reset_at.is_none());
-
-        assert!(snap.secondary_reset_at.is_none());
-    }
-
-    #[test]
-
-    fn parse_claude_rate_limit_event_normalizes_fraction_utilization() {
-        let value: Value = serde_json::json!({
-            "type": "rate_limit_event",
-            "rate_limit_info": {
-                "rateLimitType": "five_hour",
+            "five_hour": {
                 "utilization": 0.62,
-                "resetsAt": 1773709200i64
+                "resets_at": 1773709200i64
             }
         });
 
-        let window = parse_claude_rate_limit_event(&value).expect("window missing");
+        let (window, secondary) =
+            parse_claude_local_usage_response(&value).expect("windows missing");
 
         assert_eq!(window.used_percent, Some(62.0));
 
         assert!(window.reset_at.is_some());
+
+        assert!(secondary.is_none());
     }
 
     #[test]
 
-    fn parse_claude_rate_limit_event_accepts_percent_utilization() {
+    fn parse_claude_local_usage_response_accepts_percent_utilization() {
         let value: Value = serde_json::json!({
-            "type": "rate_limit_event",
-            "rate_limit_info": {
-                "rateLimitType": "five_hour",
+            "five_hour": {
                 "utilization": 73.0
             }
         });
 
-        let window = parse_claude_rate_limit_event(&value).expect("window missing");
+        let (window, secondary) =
+            parse_claude_local_usage_response(&value).expect("windows missing");
 
         assert_eq!(window.used_percent, Some(73.0));
-    }
 
-    #[test]
-
-    fn parse_openai_oauth_usage_data_extracts_reset_times() {
-        let value: Value = serde_json::json!({
-            "plan_type": "plus",
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 48.0,
-                    "resets_at": "2026-03-10T11:00:00Z"
-                },
-                "secondary_window": {
-                    "used_percent": 21.5,
-                    "reset_at": "2026-03-12T00:00:00Z"
-                }
-            }
-        });
-
-        let usage = parse_openai_oauth_usage_data(&value).unwrap();
-
-        assert!((usage.primary_percent - 48.0).abs() < f64::EPSILON);
-
-        assert!((usage.secondary_percent - 21.5).abs() < f64::EPSILON);
-
-        assert_eq!(
-            usage.primary_reset_at.as_deref(),
-            Some("2026-03-10T11:00:00Z")
-        );
-
-        assert_eq!(
-            usage.secondary_reset_at.as_deref(),
-            Some("2026-03-12T00:00:00Z")
-        );
-    }
-
-    #[test]
-
-    fn parse_openai_oauth_usage_data_extracts_unix_timestamp_reset_times() {
-        // wham API returns reset_at as a Unix timestamp integer, not a string
-        let value: Value = serde_json::json!({
-            "plan_type": "plus",
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 22.0,
-                    "reset_at": 1773188548i64
-                },
-                "secondary_window": {
-                    "used_percent": 29.0,
-                    "reset_at": 1773757308i64
-                }
-            }
-        });
-
-        let usage = parse_openai_oauth_usage_data(&value).unwrap();
-
-        assert!((usage.primary_percent - 22.0).abs() < f64::EPSILON);
-
-        assert!((usage.secondary_percent - 29.0).abs() < f64::EPSILON);
-
-        assert!(
-            usage.primary_reset_at.is_some(),
-            "primary reset_at should be parsed from Unix timestamp"
-        );
-
-        assert!(
-            usage.secondary_reset_at.is_some(),
-            "secondary reset_at should be parsed from Unix timestamp"
-        );
-    }
-
-    #[test]
-
-    fn parse_openai_oauth_usage_data_requires_supported_windows() {
-        let value: Value = serde_json::json!({
-            "plan_type": "plus"
-        });
-
-        let error = parse_openai_oauth_usage_data(&value).unwrap_err();
-
-        assert!(error.to_string().contains("quota window"));
+        assert!(secondary.is_none());
     }
 
     #[test]
@@ -5870,6 +4596,42 @@ mod tests {
 
     #[test]
 
+    fn openai_consumer_usage_falls_back_to_auth_json_usage_when_sessions_missing() {
+        let usage_response = serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 24.0,
+                    "reset_at": 1773188548i64
+                },
+                "secondary_window": {
+                    "used_percent": 61.0,
+                    "reset_at": 1773757308i64
+                }
+            }
+        })
+        .to_string();
+
+        with_codex_local_usage_override(
+            "auth_json_fallback",
+            r#"{"tokens":{"access_token":"present","account_id":"acct_123"}}"#,
+            &[],
+            Some(&usage_response),
+            || {
+                let snapshot = fetch_openai_consumer_usage().expect("snapshot missing");
+
+                assert_eq!(snapshot.provider, "openai");
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_SOURCE);
+                assert_eq!(snapshot.account_label, "Codex Pro");
+                assert_eq!(snapshot.tokens_in, 24);
+                assert!((snapshot.spent_usd - 61.0).abs() < f64::EPSILON);
+                assert!(has_openai_consumer_usage());
+            },
+        );
+    }
+
+    #[test]
+
     fn openai_consumer_usage_falls_back_to_status_snapshot_without_sessions() {
         with_codex_consumer_override(
             "status_only",
@@ -5888,32 +4650,6 @@ mod tests {
                 );
             },
         );
-    }
-
-    #[test]
-
-    fn parse_anthropic_oauth_usage_data_requires_supported_buckets() {
-        let value: Value = serde_json::json!({
-            "subscriptionType": "pro"
-        });
-
-        let error = parse_anthropic_oauth_usage_data(&value).unwrap_err();
-
-        assert!(error.to_string().contains("utilization buckets"));
-    }
-
-    #[test]
-
-    fn failed_oauth_verification_parse_does_not_persist_secrets() {
-        with_test_config_dir("oauth_parse_failure", || {
-            let value: Value = serde_json::json!({});
-
-            let _ = parse_openai_oauth_usage_data(&value).unwrap_err();
-
-            assert_eq!(SecretStore::load_or_default(), SecretPayload::default());
-
-            assert!(!has_openai_oauth_session());
-        });
     }
 
     #[test]
@@ -5937,15 +4673,9 @@ mod tests {
                 }
             }"#,
             || {
-                let plan_type = get_anthropic_oauth_plan_type();
-
-                let session = anthropic_session().lock().unwrap().clone();
+                let plan_type = get_anthropic_consumer_plan_type();
 
                 assert_eq!(plan_type.as_deref(), Some("Pro"));
-
-                assert_eq!(session.subscription_type, "pro");
-
-                assert_eq!(session.rate_limit_tier, "default_claude_ai");
             },
         );
     }
@@ -5986,12 +4716,12 @@ mod tests {
             r#"{
                 "claudeAiOauth": {
                     "subscriptionType": "pro",
-                    "rateLimitTier": "default_claude_ai"
+                    "rateLimitTier": "default_claude_ai",
+                    "accessToken": "present",
+                    "expiresAt": 4102444800000
                 }
             }"#,
-            &[],
             None,
-            0,
             || {
                 let snapshot = fetch_anthropic_consumer_usage().unwrap();
 
@@ -6007,45 +4737,30 @@ mod tests {
 
     #[test]
 
-    fn claude_consumer_usage_prefers_insights_quota_and_omits_week_window() {
-        let now = Utc::now();
-
-        let recent_week = now - Duration::days(1);
-
-        let insights_stdout = serde_json::json!({
-            "type": "rate_limit_event",
-            "rate_limit_info": {
-                "status": "allowed_warning",
-                "rateLimitType": "five_hour",
-                "utilization": 0.62,
-                "resetsAt": 1773709200i64
+    fn claude_consumer_usage_fetches_local_token_usage_windows() {
+        let usage_response = serde_json::json!({
+            "five_hour": {
+                "utilization": 62.0,
+                "resets_at": "2026-03-19T10:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 74.0,
+                "resets_at": "2026-03-23T10:00:00Z"
             }
         })
         .to_string();
 
         with_claude_local_override(
-            "insights_quota",
+            "local_usage_api",
             r#"{
                 "claudeAiOauth": {
                     "subscriptionType": "pro",
-                    "rateLimitTier": "default_claude_ai"
+                    "rateLimitTier": "default_claude_ai",
+                    "accessToken": "present",
+                    "expiresAt": 4102444800000
                 }
             }"#,
-            &[&serde_json::json!({
-                "timestamp": recent_week.to_rfc3339(),
-                "message": {
-                    "id": "msg-2",
-                    "role": "assistant",
-                    "usage": {
-                        "input_tokens": 200,
-                        "cache_read_input_tokens": 30,
-                        "output_tokens": 11
-                    }
-                }
-            })
-            .to_string()],
-            Some(&insights_stdout),
-            1,
+            Some(&usage_response),
             || {
                 let snapshot = fetch_anthropic_consumer_usage().unwrap();
 
@@ -6067,58 +4782,23 @@ mod tests {
 
                 assert_eq!(primary.used_percent, Some(62.0));
 
-                assert!(primary.reset_at.is_some());
+                assert_eq!(primary.reset_at.as_deref(), Some("2026-03-19T10:00:00Z"));
 
-                assert!(consumer_quota.secondary.is_none());
+                let secondary = consumer_quota.secondary.expect("secondary window missing");
+
+                assert_eq!(secondary.used_percent, Some(74.0));
 
                 assert!(snapshot.api_metrics.is_none());
-
-                let alerts = evaluate_alerts(&snapshot, Utc::now(), &AppConfig::default());
-
-                assert!(alerts
-                    .iter()
-                    .all(|alert| !alert.code.starts_with("quota_week_")));
             },
         );
     }
-
-    #[test]
-
-    fn clearing_openai_oauth_preserves_anthropic_secret() {
-        let mut payload = SecretPayload::default();
-
-        payload.openai_oauth.refresh_token = "openai-refresh".into();
-
-        payload.anthropic_oauth.refresh_token = "claude-refresh".into();
-
-        payload.anthropic_oauth.subscription_type = "max".into();
-
-        let updated = payload_after_clearing_openai_secret(payload).unwrap();
-
-        assert_eq!(updated.openai_oauth, OpenAiOAuthSecret::default());
-
-        assert_eq!(updated.anthropic_oauth.refresh_token, "claude-refresh");
-
-        assert_eq!(updated.anthropic_oauth.subscription_type, "max");
-    }
-
-    #[test]
-
-    fn clearing_anthropic_oauth_preserves_openai_secret() {
-        let mut payload = SecretPayload::default();
-
-        payload.openai_oauth.refresh_token = "openai-refresh".into();
-
-        payload.openai_oauth.plan_type = "plus".into();
-
-        payload.anthropic_oauth.refresh_token = "claude-refresh".into();
-
-        let updated = payload_after_clearing_anthropic_secret(payload).unwrap();
-
-        assert_eq!(updated.anthropic_oauth, AnthropicOAuthSecret::default());
-
-        assert_eq!(updated.openai_oauth.refresh_token, "openai-refresh");
-
-        assert_eq!(updated.openai_oauth.plan_type, "plus");
-    }
 }
+
+
+
+
+
+
+
+
+

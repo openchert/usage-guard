@@ -8,7 +8,7 @@
 UsageGuard keeps provider usage visible in a small desktop widget instead of burying it across multiple dashboards. It runs locally on Windows and Linux and stores your credentials securely on your machine.
 
 ## What It Does
-- Tracks Codex consumer quotas, Claude Code local `5h` quota plus local activity, and OpenAI/Anthropic org/admin API usage in one widget
+- Tracks Codex consumer quotas, Claude Code consumer quota, and OpenAI/Anthropic org/admin API usage in one widget
 - Shows compact cards with hover details for usage, spend, tokens, requests, reset times, and status
 - Sends native desktop notifications and shows in-widget alert badges for quota, budget, and inactivity issues
 - Supports local consumer-app detection for Codex and Claude Code, plus multiple OpenAI and Anthropic monitoring accounts
@@ -72,8 +72,8 @@ The first Linux release does not ship a one-line installer or package repository
 - On Linux, `Start on Login` writes a managed XDG autostart entry at `${XDG_CONFIG_HOME:-~/.config}/autostart/com.usageguard.app.desktop`.
 
 ## Supported Connections
-- Codex consumer usage through local Codex sign-in and session logs
-- Claude Code exact local `5h` quota through local Claude Code insights, plus local project activity details
+- Codex consumer usage through local Codex sign-in files: fresh `~/.codex/sessions/*.jsonl` quota logs first, then a built-in fallback fetch using the token from `~/.codex/auth.json`
+- Claude Code consumer usage through local Claude Code credentials: plan/status from `~/.claude/.credentials.json`, plus a built-in quota fetch using the local `accessToken` from that file
 - OpenAI organization usage through an organization or admin monitoring key
 - Anthropic organization usage through an admin monitoring key
 
@@ -86,7 +86,7 @@ UsageGuard ships with native desktop notifications and an in-widget alert state 
 - Near-limit alerts fire at `90%` used for `5h` and `80%` used for `week`
 - Use-before-reset reminders fire when a reset is close and usage is still low
 - API/admin monitoring sources keep spend and inactivity alerts
-- Claude Code local detection shows exact `5h` quota from CLI insights and local `7d` token activity from project logs; weekly consumer quota percentage is not exposed through the local client
+- Claude Code local detection uses the local credentials file plus a built-in quota fetch; the app reliably exposes the `5h` window and can show a longer secondary window when the upstream response includes it
 
 See [`docs/ALERTS.md`](docs/ALERTS.md) for the full alert model and delivery behavior.
 
@@ -111,11 +111,12 @@ usageguard demo
 - The desktop app checks GitHub Releases in the background on startup and shows a native notification when a newer version is available.
 
 ## Security
-On Windows, API keys and any legacy OAuth refresh tokens from older builds are stored in a DPAPI-encrypted file at `%APPDATA%\usage-guard\secrets.bin`. On Linux, they are stored in the desktop Secret Service keyring (for example GNOME Keyring or KWallet-backed Secret Service). The default consumer flow reads local Codex and Claude Code state instead of requesting a browser OAuth login.
+On Windows, provider API keys are stored in a DPAPI-encrypted file at `%APPDATA%\usage-guard\secrets.bin`. On Linux, they are stored in the desktop Secret Service keyring (for example GNOME Keyring or KWallet-backed Secret Service). Consumer monitoring reuses the local Codex and Claude Code client files already present on the machine and never stores those consumer tokens in UsageGuard's own secret store.
 
 UsageGuard does not fall back to plaintext secret storage if secure storage is unavailable.
 
 See [`docs/SECURITY.md`](docs/SECURITY.md) for storage, local consumer imports, and threat-model details.
+See [`docs/LOCAL_CONSUMER_SOURCES.md`](docs/LOCAL_CONSUMER_SOURCES.md) for the exact local-file and token-backed acquisition flow.
 See [`docs/ALERTS.md`](docs/ALERTS.md) for alert thresholds, native notifications, and widget badges.
 See [`docs/PROVIDERS.md`](docs/PROVIDERS.md) for the provider/source display model.
 
@@ -126,8 +127,9 @@ MIT. See [`LICENSE`](LICENSE).
 - If the install command succeeds but `usageguard` is not found, restart the terminal so `PATH` is reloaded.
 - If you use `curl.exe`, remember it only downloads `install.ps1`; you still need to run the second `powershell -File ...` command, or use the one-line CMD install command above.
 - If `irm` is unavailable, use `Invoke-RestMethod`, `Invoke-WebRequest`, `curl.exe`, or the manual ZIP install above.
-- If the Codex card stays in local-status mode, run at least one Codex request so a fresh session log exists under `~/.codex/sessions`.
-- Claude Code currently exposes exact local `5h` quota, but not a reliable local weekly consumer quota percentage.
+- If the Codex card stays in local-status mode, run at least one Codex request so a fresh session log exists under `~/.codex/sessions`. UsageGuard prefers those local logs and only falls back to the `auth.json` token-backed fetch when the logs are stale or missing.
+- If the Claude Code card stays in syncing or pending status, confirm Claude Code is signed in on this machine and that `~/.claude/.credentials.json` still contains a valid local `accessToken`.
+- Claude Code consumer monitoring reliably exposes the `5h` window. A longer secondary window can appear when the upstream usage response includes it, but the desktop status/settings flow still treats weekly Claude support as unavailable.
 - If an API card shows an admin-access status, verify the key has org usage access and that Anthropic uses an `sk-ant-admin...` key.
 - If the widget shows a provider load failure, verify the API key or local client sign-in.
 - On Linux, if secure storage is unavailable, make sure a Secret Service provider such as GNOME Keyring or KWallet is running.

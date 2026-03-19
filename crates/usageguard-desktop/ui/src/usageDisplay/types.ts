@@ -80,8 +80,8 @@ export interface HybridUsageCardSpec extends UsageCardBase {
 export interface StatusUsageCardSpec extends UsageCardBase {
   kind: 'status';
   /** Visual state of the ring animation. */
-  statusKind: 'loading' | 'waiting' | 'auth' | 'error';
-  /** Short label shown beneath the ring (e.g. "syncing", "sign in"). */
+  statusKind: 'loading' | 'waiting' | 'error';
+  /** Short label shown beneath the ring (e.g. "syncing", "waiting"). */
   label: string;
 }
 
