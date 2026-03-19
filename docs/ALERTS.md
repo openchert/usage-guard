@@ -46,8 +46,11 @@ These are preserved so organization monitoring still surfaces spend pressure eve
 ## Delivery and re-arm behavior
 
 - Each alert is tracked independently per provider account.
-- Consumer quota alerts use the reset timestamp as part of the notification signature so the same alert can fire again after a new quota window starts.
-- Alerts also re-arm after they clear and later become active again.
+- Notification dedup memory is kept in-process only and resets when the app exits.
+- Consumer quota alerts use the normalized reset timestamp as part of the notification signature so the same alert can fire again after a new quota window starts.
+- The same alert does not re-notify on refresh, even if it temporarily clears and then returns in the same app session.
+- A different alert on the same provider account re-arms notification delivery for later alerts on that card.
+- Quiet-hours-suppressed alerts are not remembered until they are actually emitted.
 - Demo snapshots never emit notifications.
 
 ## Widget behavior

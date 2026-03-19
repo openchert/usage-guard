@@ -408,15 +408,22 @@ mod tests {
                     "rate_limit_tier": "premium"
                 }
             });
-            let encrypted = encrypt_bytes(serde_json::to_string(&legacy).unwrap().as_bytes()).unwrap();
+            let encrypted =
+                encrypt_bytes(serde_json::to_string(&legacy).unwrap().as_bytes()).unwrap();
             fs::write(app_dir.join(SECRET_STORE_FILE_NAME), encrypted).unwrap();
 
             let loaded = SecretStore::load().unwrap();
-            assert_eq!(loaded.provider_api_keys.get("openai"), Some(&"sk-test".to_string()));
-            assert_eq!(loaded, SecretPayload {
-                version: SECRET_PAYLOAD_VERSION,
-                provider_api_keys: HashMap::from([("openai".into(), "sk-test".into())]),
-            });
+            assert_eq!(
+                loaded.provider_api_keys.get("openai"),
+                Some(&"sk-test".to_string())
+            );
+            assert_eq!(
+                loaded,
+                SecretPayload {
+                    version: SECRET_PAYLOAD_VERSION,
+                    provider_api_keys: HashMap::from([("openai".into(), "sk-test".into())]),
+                }
+            );
         });
     }
 

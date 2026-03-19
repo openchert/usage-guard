@@ -2,7 +2,7 @@
 
 mod icon_art;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -36,16 +36,16 @@ struct SnapshotView {
     alerts: Vec<Alert>,
 }
 
-/// Tracks when a specific alert was last sent and with which cycle key.
-/// Used to deduplicate native notifications so they fire at most once per
-/// cycle (window rotation) within a per-type cooldown period.
-#[derive(Debug, Clone)]
-struct NotifiedAlertEntry {
-    /// Value returned by `alert_cycle_key` at the time the notification was sent.
-    /// When this changes to a *new real timestamp* the alert is allowed to re-fire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlertSignature {
+    code: String,
     cycle_key: String,
-    /// Wall-clock time the notification was fired, for cooldown enforcement.
-    fired_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAlertNotification {
+    signature: AlertSignature,
+    body: String,
 }
 
 #[derive(Debug, Clone)]
@@ -56,9 +56,9 @@ struct ManualAlert {
 
 struct AppState {
     cfg: Mutex<AppConfig>,
-    /// Key: `"provider::account_label::alert_code"` (no cycle component).
-    /// Value: the entry from the last time this alert was actually fired.
-    notified_alerts: Mutex<HashMap<String, NotifiedAlertEntry>>,
+    /// Key: `"provider::account_label"`.
+    /// Value: the last non-empty set of emitted alert signatures for that card.
+    notified_alerts: Mutex<HashMap<String, HashMap<String, String>>>,
     snapshots: Mutex<Vec<SnapshotView>>,
     manual_alerts: Mutex<HashMap<String, ManualAlert>>,
     refresh: Mutex<RefreshState>,
@@ -66,15 +66,6 @@ struct AppState {
     start_on_login_enabled: Mutex<bool>,
     tray_start_on_login_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
 }
-
-/// After an alert notification is fired, suppress re-notification for this
-/// duration *unless* the window cycle genuinely rotates (new reset timestamp).
-
-const FIVE_HOUR_ALERT_COOLDOWN_SECS: i64 = 4 * 3600;
-
-const WEEKLY_ALERT_COOLDOWN_SECS: i64 = 23 * 3600;
-
-const DEFAULT_ALERT_COOLDOWN_SECS: i64 = 4 * 3600;
 
 const TRAY_TOGGLE_ID: &str = "tray.toggle";
 
@@ -521,11 +512,6 @@ fn apply_manual_alerts(
     }
 }
 
-fn refresh_notified_alert_signatures(_state: &AppState) {
-    // No-op: deduplication is now time-based (see NotifiedAlertEntry / collect_pending_notifications)
-    // and entries are not evicted on alert clear to prevent spurious re-notification.
-}
-
 fn find_snapshot_for_test_alert(
     state: &AppState,
     target: &TestAlertInput,
@@ -592,8 +578,6 @@ fn spawn_manual_alert_expiry(app: AppHandle, target_key: String, expires_at: Ins
             }
         }
 
-        refresh_notified_alert_signatures(state.inner());
-
         emit_widget_refresh(&app);
     });
 }
@@ -632,8 +616,6 @@ fn refresh_snapshot_alert_state(state: &AppState, cfg: &AppConfig) {
         .snapshots
         .lock()
         .expect("AppState snapshots lock poisoned") = refreshed;
-
-    refresh_notified_alert_signatures(state);
 }
 
 fn spawn_snapshot_refresh(app: AppHandle) {
@@ -1130,7 +1112,7 @@ fn fire_notifications(
     snapshots: &[SnapshotView],
     now: chrono::DateTime<Local>,
     cfg: &AppConfig,
-    notified_alerts: &mut HashMap<String, NotifiedAlertEntry>,
+    notified_alerts: &mut HashMap<String, HashMap<String, String>>,
 ) {
     for (title, body) in collect_pending_notifications(snapshots, now, cfg, notified_alerts) {
         emit_native_notification(&title, &body);
@@ -1141,10 +1123,8 @@ fn collect_pending_notifications(
     snapshots: &[SnapshotView],
     now: chrono::DateTime<Local>,
     cfg: &AppConfig,
-    notified_alerts: &mut HashMap<String, NotifiedAlertEntry>,
+    notified_alerts: &mut HashMap<String, HashMap<String, String>>,
 ) -> Vec<(String, String)> {
-    let now_utc = now.with_timezone(&Utc);
-
     let mut pending = Vec::new();
 
     for snapshot_view in snapshots {
@@ -1152,103 +1132,139 @@ fn collect_pending_notifications(
             continue;
         }
 
+        let remembered = notified_alerts.get(&snapshot_key(&snapshot_view.snapshot));
+        let mut current = Vec::new();
+
         for alert in &snapshot_view.alerts {
-            if !should_notify_alert(alert, now, cfg) {
-                continue;
+            if should_notify_alert(alert, now, cfg) {
+                current.push(PendingAlertNotification {
+                    signature: alert_signature(&snapshot_view.snapshot, alert),
+                    body: format!(
+                        "{}: {}",
+                        snapshot_view.snapshot.account_label, alert.message
+                    ),
+                });
             }
-
-            let base_key = alert_base_key(&snapshot_view.snapshot, alert);
-
-            let cycle_key = alert_cycle_key(&snapshot_view.snapshot, alert);
-
-            let cooldown = alert_cooldown_secs(&alert.code);
-
-            let suppressed = match notified_alerts.get(&base_key) {
-                None => false,
-                Some(prev) => {
-                    // Suppress if we are in the same window cycle AND within the cooldown.
-                    // Two cycle keys are considered the "same cycle" when either key is a
-                    // stable fallback (meaning reset_at is unknown) — this prevents a
-                    // None→Some(timestamp) transition from being mistaken for a new cycle.
-                    let is_stable = |k: &str| k.ends_with("-stable") || k == "stable";
-
-                    let same_cycle = prev.cycle_key == cycle_key
-                        || is_stable(&prev.cycle_key)
-                        || is_stable(&cycle_key);
-
-                    same_cycle
-                        && now_utc.signed_duration_since(prev.fired_at)
-                            < chrono::Duration::seconds(cooldown)
-                }
-            };
-
-            if suppressed {
-                continue;
-            }
-
-            notified_alerts.insert(
-                base_key,
-                NotifiedAlertEntry {
-                    cycle_key,
-                    fired_at: now_utc,
-                },
-            );
-
-            pending.push((
-                "UsageGuard".to_string(),
-                format!(
-                    "{}: {}",
-                    snapshot_view.snapshot.account_label, alert.message
-                ),
-            ));
         }
+        if current.is_empty() {
+            continue;
+        }
+
+        for notification in current.iter().filter(|notification| {
+            !remembered_contains_signature(remembered, &notification.signature)
+        }) {
+            pending.push(("UsageGuard".to_string(), notification.body.clone()));
+        }
+
+        remember_snapshot_alerts(notified_alerts, &snapshot_view.snapshot, &current);
     }
 
     pending
 }
 
-/// Stable map key for an alert: identifies the alert type without a cycle component.
-/// The cycle is tracked separately inside `NotifiedAlertEntry`.
-
-fn alert_base_key(snapshot: &UsageSnapshot, alert: &Alert) -> String {
-    format!(
-        "{}::{}::{}",
-        snapshot.provider, snapshot.account_label, alert.code
-    )
+fn remembered_contains_signature(
+    remembered: Option<&HashMap<String, String>>,
+    signature: &AlertSignature,
+) -> bool {
+    remembered
+        .and_then(|remembered| remembered.get(&signature.code))
+        .is_some_and(|previous| alert_cycles_match(previous, &signature.cycle_key))
 }
 
-/// Returns the "cycle discriminator" for an alert — a value that changes when the
-/// underlying quota window genuinely resets. Used to allow re-notification after
-/// a window rotation even if the cooldown has not yet elapsed.
+fn is_stable_cycle_key(cycle_key: &str) -> bool {
+    cycle_key == "stable" || cycle_key.ends_with("-stable")
+}
+
+fn alert_cycles_match(left: &str, right: &str) -> bool {
+    left == right || is_stable_cycle_key(left) || is_stable_cycle_key(right)
+}
+
+fn preferred_cycle_key(previous: &str, current: &str) -> String {
+    match (is_stable_cycle_key(previous), is_stable_cycle_key(current)) {
+        (true, false) => current.to_string(),
+        (false, true) => previous.to_string(),
+        _ => current.to_string(),
+    }
+}
+
+fn remember_snapshot_alerts(
+    notified_alerts: &mut HashMap<String, HashMap<String, String>>,
+    snapshot: &UsageSnapshot,
+    current: &[PendingAlertNotification],
+) {
+    let snapshot_id = snapshot_key(snapshot);
+    let previous = notified_alerts.remove(&snapshot_id).unwrap_or_default();
+    let mut remembered = HashMap::with_capacity(current.len());
+
+    for notification in current {
+        let cycle_key = previous
+            .get(&notification.signature.code)
+            .filter(|previous| alert_cycles_match(previous, &notification.signature.cycle_key))
+            .map(|previous| preferred_cycle_key(previous, &notification.signature.cycle_key))
+            .unwrap_or_else(|| notification.signature.cycle_key.clone());
+
+        remembered.insert(notification.signature.code.clone(), cycle_key);
+    }
+
+    notified_alerts.insert(snapshot_id, remembered);
+}
+
+fn remember_emitted_alert(
+    notified_alerts: &mut HashMap<String, HashMap<String, String>>,
+    snapshot: &UsageSnapshot,
+    alert: &Alert,
+) {
+    let signature = alert_signature(snapshot, alert);
+    let snapshot_alerts = notified_alerts.entry(snapshot_key(snapshot)).or_default();
+    let cycle_key = snapshot_alerts
+        .get(&signature.code)
+        .map(|previous| preferred_cycle_key(previous, &signature.cycle_key))
+        .unwrap_or_else(|| signature.cycle_key.clone());
+
+    snapshot_alerts.insert(signature.code, cycle_key);
+}
+
+fn canonicalize_cycle_key(value: &str) -> String {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        return "stable".to_string();
+    }
+
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map(|parsed| {
+            parsed
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        })
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
+fn alert_signature(snapshot: &UsageSnapshot, alert: &Alert) -> AlertSignature {
+    AlertSignature {
+        code: alert.code.clone(),
+        cycle_key: alert_cycle_key(snapshot, alert),
+    }
+}
+
+/// Returns the "cycle discriminator" for an alert. This changes when the
+/// underlying quota window genuinely resets, which re-arms notification delivery.
 
 fn alert_cycle_key(snapshot: &UsageSnapshot, alert: &Alert) -> String {
     match alert.code.as_str() {
         "quota_5h_exhausted" | "quota_5h_near_limit" | "quota_5h_unused_before_reset" => snapshot
             .primary_reset_at
-            .clone()
+            .as_deref()
+            .map(canonicalize_cycle_key)
             .unwrap_or_else(|| "5h-stable".to_string()),
         "quota_week_exhausted" | "quota_week_near_limit" | "quota_week_unused_before_reset" => {
             snapshot
                 .secondary_reset_at
-                .clone()
+                .as_deref()
+                .map(canonicalize_cycle_key)
                 .unwrap_or_else(|| "week-stable".to_string())
         }
         _ => "stable".to_string(),
-    }
-}
-
-/// Per-alert-type cooldown: minimum seconds between repeated notifications
-/// for the same alert while the window cycle has not changed.
-
-fn alert_cooldown_secs(code: &str) -> i64 {
-    match code {
-        "quota_5h_exhausted" | "quota_5h_near_limit" | "quota_5h_unused_before_reset" => {
-            FIVE_HOUR_ALERT_COOLDOWN_SECS
-        }
-        "quota_week_exhausted" | "quota_week_near_limit" | "quota_week_unused_before_reset" => {
-            WEEKLY_ALERT_COOLDOWN_SECS
-        }
-        _ => DEFAULT_ALERT_COOLDOWN_SECS,
     }
 }
 
@@ -2301,17 +2317,14 @@ fn send_test_alert(
         }
     }
 
-    state
-        .notified_alerts
-        .lock()
-        .expect("AppState notified_alerts lock poisoned")
-        .insert(
-            alert_base_key(&snapshot, &alert),
-            NotifiedAlertEntry {
-                cycle_key: alert_cycle_key(&snapshot, &alert),
-                fired_at: Utc::now(),
-            },
-        );
+    remember_emitted_alert(
+        &mut state
+            .notified_alerts
+            .lock()
+            .expect("AppState notified_alerts lock poisoned"),
+        &snapshot,
+        &alert,
+    );
 
     emit_native_notification(
         "UsageGuard",
@@ -2331,7 +2344,7 @@ mod tests {
     use super::{
         alert_cycle_key, apply_manual_alerts, apply_provider_account_save,
         clamp_widget_origin_to_area, collect_pending_notifications, compare_versions,
-        default_widget_origin_for_area, prune_manual_alerts,
+        default_widget_origin_for_area, prune_manual_alerts, remember_emitted_alert,
         work_area_contains_point, Alert, AppConfig, LogicalWorkArea, ManualAlert, ProviderAccount,
         ProviderAccountInput, ProviderCatalogEntry, SnapshotView, UsageSnapshot,
         DEFAULT_WIDGET_HEIGHT, DEFAULT_WIDGET_MARGIN_BOTTOM, DEFAULT_WIDGET_MARGIN_RIGHT,
@@ -2343,7 +2356,7 @@ mod tests {
         linux_autostart_file_contents, linux_autostart_path, set_start_on_login_enabled,
         XDG_CONFIG_HOME_ENV,
     };
-    use chrono::Local;
+    use chrono::{Local, Timelike};
     use std::cell::Cell;
     use std::cmp::Ordering;
     use std::collections::HashMap;
@@ -2764,6 +2777,14 @@ mod tests {
         }
     }
 
+    fn warning_alert(code: &str, message: &str) -> Alert {
+        Alert {
+            level: "warning".into(),
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     #[test]
 
     fn notification_state_does_not_reemit_unchanged_alerts() {
@@ -2775,11 +2796,10 @@ mod tests {
 
         let snapshot = snapshot_view_with_alerts(
             Some("2026-03-10T12:00:00Z"),
-            vec![Alert {
-                level: "warning".into(),
-                code: "quota_5h_near_limit".into(),
-                message: "5h quota nearly used up".into(),
-            }],
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
         );
 
         let first = collect_pending_notifications(
@@ -2803,9 +2823,7 @@ mod tests {
 
     #[test]
 
-    fn notification_state_suppressed_during_cooldown_even_after_clear() {
-        // After firing once, alert is suppressed for cooldown window even if it clears and returns.
-        // This prevents the alert from re-firing on transient fluctuations.
+    fn notification_state_stays_suppressed_after_clear_until_a_different_alert_rearms_it() {
         let cfg = AppConfig::default();
 
         let now = Local::now();
@@ -2814,14 +2832,20 @@ mod tests {
 
         let active = snapshot_view_with_alerts(
             Some("2026-03-10T12:00:00Z"),
-            vec![Alert {
-                level: "warning".into(),
-                code: "quota_5h_near_limit".into(),
-                message: "5h quota nearly used up".into(),
-            }],
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
         );
 
         let cleared = snapshot_view_with_alerts(Some("2026-03-10T12:00:00Z"), vec![]);
+        let different = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![warning_alert(
+                "quota_5h_unused_before_reset",
+                "5h quota reset soon with little usage",
+            )],
+        );
 
         assert_eq!(
             collect_pending_notifications(std::slice::from_ref(&active), now, &cfg, &mut notified)
@@ -2837,9 +2861,165 @@ mod tests {
         )
         .is_empty());
 
-        // Same `now` = well within 4h cooldown — should NOT re-fire.
         assert!(collect_pending_notifications(
             std::slice::from_ref(&active),
+            now,
+            &cfg,
+            &mut notified
+        )
+        .is_empty());
+
+        assert_eq!(
+            collect_pending_notifications(
+                std::slice::from_ref(&different),
+                now,
+                &cfg,
+                &mut notified
+            )
+            .len(),
+            1
+        );
+
+        assert_eq!(
+            collect_pending_notifications(std::slice::from_ref(&active), now, &cfg, &mut notified)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+
+    fn notification_signature_rearms_for_new_reset_cycle() {
+        let cfg = AppConfig::default();
+        let now = Local::now();
+        let mut notified = HashMap::new();
+
+        let current_cycle = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
+        );
+
+        let next_cycle = snapshot_view_with_alerts(
+            Some("2026-03-10T17:00:00Z"),
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
+        );
+
+        assert_ne!(
+            alert_cycle_key(&current_cycle.snapshot, &current_cycle.alerts[0]),
+            alert_cycle_key(&next_cycle.snapshot, &next_cycle.alerts[0])
+        );
+
+        assert_eq!(
+            collect_pending_notifications(
+                std::slice::from_ref(&current_cycle),
+                now,
+                &cfg,
+                &mut notified
+            )
+            .len(),
+            1
+        );
+
+        assert_eq!(
+            collect_pending_notifications(
+                std::slice::from_ref(&next_cycle),
+                now,
+                &cfg,
+                &mut notified
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+
+    fn notification_state_only_emits_new_alerts_when_the_state_grows() {
+        let cfg = AppConfig::default();
+        let now = Local::now();
+        let mut notified = HashMap::new();
+
+        let base = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
+        );
+        let expanded = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![
+                warning_alert("quota_5h_near_limit", "5h quota nearly used up"),
+                warning_alert(
+                    "quota_5h_unused_before_reset",
+                    "5h quota reset soon with little usage",
+                ),
+            ],
+        );
+
+        assert_eq!(
+            collect_pending_notifications(std::slice::from_ref(&base), now, &cfg, &mut notified)
+                .len(),
+            1
+        );
+
+        let added = collect_pending_notifications(
+            std::slice::from_ref(&expanded),
+            now,
+            &cfg,
+            &mut notified,
+        );
+
+        assert_eq!(added.len(), 1);
+        assert!(added[0].1.contains("little usage"));
+    }
+
+    #[test]
+
+    fn equivalent_reset_formats_share_the_same_cycle_signature() {
+        let cfg = AppConfig::default();
+        let now = Local::now();
+        let mut notified = HashMap::new();
+
+        let current_cycle = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
+        );
+        let equivalent_cycle = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00+00:00"),
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
+        );
+
+        assert_eq!(
+            alert_cycle_key(&current_cycle.snapshot, &current_cycle.alerts[0]),
+            alert_cycle_key(&equivalent_cycle.snapshot, &equivalent_cycle.alerts[0])
+        );
+
+        assert_eq!(
+            collect_pending_notifications(
+                std::slice::from_ref(&current_cycle),
+                now,
+                &cfg,
+                &mut notified
+            )
+            .len(),
+            1
+        );
+
+        assert!(collect_pending_notifications(
+            std::slice::from_ref(&equivalent_cycle),
             now,
             &cfg,
             &mut notified
@@ -2849,29 +3029,86 @@ mod tests {
 
     #[test]
 
-    fn notification_signature_rearms_for_new_reset_cycle() {
-        let current_cycle = snapshot_view_with_alerts(
+    fn quiet_hours_suppressed_alerts_emit_after_quiet_hours_end() {
+        let mut quiet_cfg = AppConfig::default();
+        let now = Local::now();
+        let current_hour = now.hour() as u8;
+        let mut notified = HashMap::new();
+
+        quiet_cfg.quiet_hours.enabled = true;
+        quiet_cfg.quiet_hours.start_hour = current_hour;
+        quiet_cfg.quiet_hours.end_hour = (current_hour + 1) % 24;
+
+        let snapshot = snapshot_view_with_alerts(
             Some("2026-03-10T12:00:00Z"),
-            vec![Alert {
-                level: "warning".into(),
-                code: "quota_5h_near_limit".into(),
-                message: "5h quota nearly used up".into(),
-            }],
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
         );
 
-        let next_cycle = snapshot_view_with_alerts(
-            Some("2026-03-10T17:00:00Z"),
-            vec![Alert {
-                level: "warning".into(),
-                code: "quota_5h_near_limit".into(),
-                message: "5h quota nearly used up".into(),
-            }],
+        assert!(collect_pending_notifications(
+            std::slice::from_ref(&snapshot),
+            now,
+            &quiet_cfg,
+            &mut notified
+        )
+        .is_empty());
+
+        let mut active_cfg = quiet_cfg.clone();
+        active_cfg.quiet_hours.enabled = false;
+
+        assert_eq!(
+            collect_pending_notifications(
+                std::slice::from_ref(&snapshot),
+                now,
+                &active_cfg,
+                &mut notified
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+
+    fn manual_test_alert_memory_does_not_reemit_existing_alerts_on_refresh() {
+        let cfg = AppConfig::default();
+        let now = Local::now();
+        let mut notified = HashMap::new();
+        let snapshot = snapshot_view_with_alerts(
+            Some("2026-03-10T12:00:00Z"),
+            vec![warning_alert(
+                "quota_5h_near_limit",
+                "5h quota nearly used up",
+            )],
+        );
+        let manual_alert = Alert {
+            level: "warning".into(),
+            code: TEST_ALERT_CODE.into(),
+            message: TEST_ALERT_MESSAGE.into(),
+        };
+
+        assert_eq!(
+            collect_pending_notifications(
+                std::slice::from_ref(&snapshot),
+                now,
+                &cfg,
+                &mut notified
+            )
+            .len(),
+            1
         );
 
-        assert_ne!(
-            alert_cycle_key(&current_cycle.snapshot, &current_cycle.alerts[0]),
-            alert_cycle_key(&next_cycle.snapshot, &next_cycle.alerts[0])
-        );
+        remember_emitted_alert(&mut notified, &snapshot.snapshot, &manual_alert);
+
+        assert!(collect_pending_notifications(
+            std::slice::from_ref(&snapshot),
+            now,
+            &cfg,
+            &mut notified
+        )
+        .is_empty());
     }
 
     #[test]
@@ -3007,4 +3244,3 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error running tauri application");
 }
-
