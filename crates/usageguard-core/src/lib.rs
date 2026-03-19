@@ -25,8 +25,10 @@ const CONSUMER_LOCAL_SOURCE: &str = "consumer_local";
 const CONSUMER_LOCAL_STATUS_SOURCE: &str = "consumer_local_status";
 const CLAUDE_CODE_USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_LOCAL_USAGE_BETA_HEADER: &str = "oauth-2025-04-20";
-const CLAUDE_LOCAL_USAGE_CACHE_TTL_SECS: i64 = 300;
+const CLAUDE_LOCAL_USAGE_CACHE_TTL_SECS: i64 = 120;
 const CODEX_WHAM_CACHE_TTL_SECS: i64 = 60;
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 4;
+const HTTP_REQUEST_TIMEOUT_SECS: u64 = 12;
 const CODEX_SESSION_SCAN_FILE_LIMIT: usize = 32;
 const CODEX_SESSION_SCAN_LINE_LIMIT: usize = 256;
 const CODEX_RATE_LIMIT_STALENESS_THRESHOLD_SECS: u64 = 15 * 60;
@@ -242,16 +244,28 @@ pub struct AppConfig {
     #[serde(default)]
     pub light_mode: bool,
     /// Whether Codex 5h consumer alerts are enabled.
-    #[serde(default = "default_consumer_alerts_enabled", alias = "openai_oauth_5h_alerts_enabled")]
+    #[serde(
+        default = "default_consumer_alerts_enabled",
+        alias = "openai_oauth_5h_alerts_enabled"
+    )]
     pub openai_consumer_5h_alerts_enabled: bool,
     /// Whether Codex weekly consumer alerts are enabled.
-    #[serde(default = "default_consumer_alerts_enabled", alias = "openai_oauth_week_alerts_enabled")]
+    #[serde(
+        default = "default_consumer_alerts_enabled",
+        alias = "openai_oauth_week_alerts_enabled"
+    )]
     pub openai_consumer_week_alerts_enabled: bool,
     /// Whether Claude Code 5h consumer alerts are enabled.
-    #[serde(default = "default_consumer_alerts_enabled", alias = "anthropic_oauth_5h_alerts_enabled")]
+    #[serde(
+        default = "default_consumer_alerts_enabled",
+        alias = "anthropic_oauth_5h_alerts_enabled"
+    )]
     pub anthropic_consumer_5h_alerts_enabled: bool,
     /// Whether Claude Code weekly consumer alerts are enabled.
-    #[serde(default = "default_consumer_alerts_enabled", alias = "anthropic_oauth_week_alerts_enabled")]
+    #[serde(
+        default = "default_consumer_alerts_enabled",
+        alias = "anthropic_oauth_week_alerts_enabled"
+    )]
     pub anthropic_consumer_week_alerts_enabled: bool,
     /// Last release tag that already triggered an update notification.
     #[serde(default)]
@@ -627,7 +641,9 @@ fn get_valid_claude_code_access_token() -> Option<String> {
 
     let oauth = credentials.claude_ai_oauth;
 
-    let access_token = oauth.access_token.filter(|token| !token.trim().is_empty())?;
+    let access_token = oauth
+        .access_token
+        .filter(|token| !token.trim().is_empty())?;
 
     if let Some(expires_at_ms) = oauth.expires_at_ms {
         let now_ms = Utc::now().timestamp_millis();
@@ -1314,7 +1330,7 @@ pub fn fetch_anthropic_consumer_usage() -> Option<UsageSnapshot> {
         },
         CONSUMER_LOCAL_STATUS_SOURCE,
         Some("consumer_local_usage_pending"),
-        Some("Fetching Claude Code 5h quota… (appears ~10 s after app launch)"),
+        Some("Fetching Claude Code 5h quota…"),
     ))
 }
 
@@ -1322,19 +1338,19 @@ fn resolve_provider_api_key(provider_id: &str, env_var: &str) -> Option<String> 
     get_provider_api_key(provider_id).or_else(|| std::env::var(env_var).ok())
 }
 
-struct ProviderSpec<'a> {
-    id: &'a str,
-    label: &'a str,
-    env_prefix: &'a str,
+struct ProviderSpec {
+    id: &'static str,
+    label: String,
+    env_prefix: &'static str,
     api_key: Option<String>,
     endpoint: Option<String>,
-    default_endpoint: Option<&'a str>,
+    default_endpoint: Option<&'static str>,
     method: HttpMethod,
-    auth_header: &'a str,
+    auth_header: &'static str,
     auth_mode: AuthMode,
-    extra_headers: Vec<(&'a str, String)>,
+    extra_headers: Vec<(&'static str, String)>,
     request_body: Option<Value>,
-    usage_log_env: Option<&'a str>,
+    usage_log_env: Option<&'static str>,
     allow_env_fallback: bool,
 }
 
@@ -2012,12 +2028,12 @@ pub fn should_notify(alerts: &[Alert], now: DateTime<Local>, cfg: &AppConfig) ->
         .any(|alert| should_notify_alert(alert, now, cfg))
 }
 
-fn build_legacy_provider_specs() -> Vec<ProviderSpec<'static>> {
+fn build_legacy_provider_specs() -> Vec<ProviderSpec> {
     builtin_provider_templates()
         .into_iter()
         .map(|template| ProviderSpec {
             id: template.id,
-            label: template.label,
+            label: template.label.to_string(),
             env_prefix: template.env_prefix,
             api_key: match template.id {
                 "openai" => resolve_provider_api_key("openai", "OPENAI_API_KEY"),
@@ -2041,14 +2057,14 @@ fn build_legacy_provider_specs() -> Vec<ProviderSpec<'static>> {
         .collect()
 }
 
-fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec<'_>> {
+fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec> {
     let template = provider_template(&account.provider)?;
 
     template.default_endpoint?;
 
     Some(ProviderSpec {
         id: template.id,
-        label: &account.label,
+        label: account.label.clone(),
         env_prefix: template.env_prefix,
         api_key: get_provider_account_api_key(&account.id),
         endpoint: None,
@@ -2068,50 +2084,73 @@ fn build_provider_account_spec(account: &ProviderAccount) -> Option<ProviderSpec
 }
 
 pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
-    let mut items: Vec<UsageSnapshot> = vec![];
+    let openai_consumer_label = cfg
+        .openai_consumer_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string);
 
-    // Local consumer app sources first.
-    if let Some(mut s) = fetch_openai_consumer_usage() {
-        if let Some(label) = cfg
-            .openai_consumer_label
-            .as_deref()
-            .filter(|l| !l.trim().is_empty())
-        {
-            s.account_label = label.to_string();
-        }
+    let anthropic_consumer_label = cfg
+        .anthropic_consumer_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string);
 
-        items.push(s);
-    }
-
-    if let Some(mut s) = fetch_anthropic_consumer_usage() {
-        if let Some(label) = cfg
-            .anthropic_consumer_label
-            .as_deref()
-            .filter(|l| !l.trim().is_empty())
-        {
-            s.account_label = label.to_string();
-        }
-
-        items.push(s);
-    }
-
-    // API-key / env sources
-    let api_items: Vec<UsageSnapshot> = if cfg.provider_accounts.is_empty() {
+    let api_specs = if cfg.provider_accounts.is_empty() {
         build_legacy_provider_specs()
-            .into_iter()
-            .filter_map(fetch_provider_snapshot)
-            .collect()
     } else {
         cfg.provider_accounts
             .iter()
             .filter_map(build_provider_account_spec)
-            .filter_map(fetch_provider_snapshot)
-            .collect()
+            .collect::<Vec<_>>()
     };
 
-    items.extend(api_items);
+    std::thread::scope(|scope| {
+        let openai_handle = scope.spawn(move || {
+            let mut snapshot = fetch_openai_consumer_usage()?;
 
-    items
+            if let Some(label) = openai_consumer_label {
+                snapshot.account_label = label;
+            }
+
+            Some(snapshot)
+        });
+
+        let anthropic_handle = scope.spawn(move || {
+            let mut snapshot = fetch_anthropic_consumer_usage()?;
+
+            if let Some(label) = anthropic_consumer_label {
+                snapshot.account_label = label;
+            }
+
+            Some(snapshot)
+        });
+
+        let api_handles = api_specs
+            .into_iter()
+            .map(|spec| scope.spawn(move || fetch_provider_snapshot(spec)))
+            .collect::<Vec<_>>();
+
+        let mut items = Vec::new();
+
+        if let Some(snapshot) = openai_handle.join().ok().flatten() {
+            items.push(snapshot);
+        }
+
+        if let Some(snapshot) = anthropic_handle.join().ok().flatten() {
+            items.push(snapshot);
+        }
+
+        for handle in api_handles {
+            if let Some(snapshot) = handle.join().ok().flatten() {
+                items.push(snapshot);
+            }
+        }
+
+        items
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2289,7 +2328,8 @@ fn apply_rollup_value(
 
 fn client_with_timeout() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
+        .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
         .build()
         .map_err(Into::into)
 }
@@ -2300,7 +2340,8 @@ fn fetch_openai_local_usage_value(
 ) -> std::result::Result<Value, ApiFetchError> {
     #[cfg(test)]
     if let Some(raw) = openai_local_usage_response_override() {
-        return serde_json::from_str(&raw).map_err(|error| ApiFetchError::InvalidResponse(error.into()));
+        return serde_json::from_str(&raw)
+            .map_err(|error| ApiFetchError::InvalidResponse(error.into()));
     }
 
     let client = client_with_timeout().map_err(ApiFetchError::Transport)?;
@@ -2331,12 +2372,11 @@ fn fetch_openai_local_usage_value(
         .map_err(|error| ApiFetchError::InvalidResponse(error.into()))
 }
 
-fn fetch_claude_local_usage_value(
-    access_token: &str,
-) -> std::result::Result<Value, ApiFetchError> {
+fn fetch_claude_local_usage_value(access_token: &str) -> std::result::Result<Value, ApiFetchError> {
     #[cfg(test)]
     if let Some(raw) = claude_local_usage_response_override() {
-        return serde_json::from_str(&raw).map_err(|error| ApiFetchError::InvalidResponse(error.into()));
+        return serde_json::from_str(&raw)
+            .map_err(|error| ApiFetchError::InvalidResponse(error.into()));
     }
 
     let client = client_with_timeout().map_err(ApiFetchError::Transport)?;
@@ -3101,10 +3141,10 @@ fn fetch_anthropic_api_snapshot(label: &str, api_key: &str) -> Result<UsageSnaps
     ))
 }
 
-fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
+fn fetch_provider_snapshot(spec: ProviderSpec) -> Option<UsageSnapshot> {
     if let Some(log_env) = spec.usage_log_env {
         if let Ok(path) = std::env::var(log_env) {
-            if let Ok(s) = snapshot_from_ndjson(&path, spec.id, spec.label) {
+            if let Ok(s) = snapshot_from_ndjson(&path, spec.id, spec.label.as_str()) {
                 return Some(s);
             }
         }
@@ -3112,8 +3152,8 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
 
     if let Some(key) = spec.api_key {
         let result = match spec.id {
-            "openai" => fetch_openai_api_snapshot(spec.label, &key),
-            "anthropic" => fetch_anthropic_api_snapshot(spec.label, &key),
+            "openai" => fetch_openai_api_snapshot(spec.label.as_str(), &key),
+            "anthropic" => fetch_anthropic_api_snapshot(spec.label.as_str(), &key),
             _ => {
                 let endpoint = spec
                     .endpoint
@@ -3127,7 +3167,7 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
                         &spec.extra_headers,
                         spec.request_body.as_ref(),
                         spec.id,
-                        spec.label,
+                        spec.label.as_str(),
                         "api",
                     ),
                     None => Err(anyhow!("No endpoint configured")),
@@ -3140,7 +3180,7 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
             Err(_error) => {
                 return Some(error_snapshot(
                     spec.id,
-                    spec.label,
+                    spec.label.as_str(),
                     "api",
                     Some("api_usage_unavailable"),
                     Some("Unable to load provider usage right now."),
@@ -3150,11 +3190,11 @@ fn fetch_provider_snapshot(spec: ProviderSpec<'_>) -> Option<UsageSnapshot> {
     }
 
     if spec.allow_env_fallback {
-        env_fallback_snapshot(spec.id, spec.label, spec.env_prefix)
+        env_fallback_snapshot(spec.id, spec.label.as_str(), spec.env_prefix)
     } else {
         Some(error_snapshot(
             spec.id,
-            spec.label,
+            spec.label.as_str(),
             "api",
             Some("api_key_missing"),
             Some("API key missing for configured account."),
@@ -3172,9 +3212,7 @@ fn snapshot_from_http_json(
     label: &str,
     source: &str,
 ) -> Result<UsageSnapshot> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .build()?;
+    let client = client_with_timeout()?;
 
     let mut req = match method {
         HttpMethod::Get => client.get(url),
@@ -4793,12 +4831,3 @@ mod tests {
         );
     }
 }
-
-
-
-
-
-
-
-
-
