@@ -1333,6 +1333,31 @@ fn set_cached_start_on_login_enabled(app: &AppHandle, enabled: bool) {
 }
 
 #[cfg(target_os = "windows")]
+fn initialize_windows_start_on_login(cfg: &mut AppConfig) -> bool {
+    let mut enabled = is_start_on_login_enabled();
+
+    if cfg.windows_start_on_login_initialized {
+        return enabled;
+    }
+
+    if !enabled && set_start_on_login_enabled(true).is_ok() {
+        enabled = true;
+    }
+
+    if enabled {
+        cfg.windows_start_on_login_initialized = true;
+        let _ = save_config(cfg);
+    }
+
+    enabled
+}
+
+#[cfg(not(target_os = "windows"))]
+fn initialize_windows_start_on_login(_cfg: &mut AppConfig) -> bool {
+    is_start_on_login_enabled()
+}
+
+#[cfg(target_os = "windows")]
 fn set_start_on_login_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
         let startup_command = windows_start_on_login_command()?;
@@ -2929,11 +2954,12 @@ mod tests {
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let cfg = load_config().map_err(|error| std::io::Error::other(error.to_string()))?;
+            let mut cfg =
+                load_config().map_err(|error| std::io::Error::other(error.to_string()))?;
 
             let saved_position = cfg.widget_position;
 
-            let startup_enabled = is_start_on_login_enabled();
+            let startup_enabled = initialize_windows_start_on_login(&mut cfg);
 
             app.manage(AppState {
                 cfg: Mutex::new(cfg),

@@ -207,6 +207,9 @@ pub struct AppConfig {
     /// Whether the UI should display in light mode instead of the default dark mode.
     #[serde(default)]
     pub light_mode: bool,
+    /// Whether Windows start-on-login has already been initialized once.
+    #[serde(default)]
+    pub windows_start_on_login_initialized: bool,
     /// Whether Codex 5h consumer alerts are enabled.
     #[serde(
         default = "default_consumer_alerts_enabled",
@@ -245,6 +248,7 @@ impl Default for AppConfig {
             openai_consumer_label: None,
             anthropic_consumer_label: None,
             light_mode: false,
+            windows_start_on_login_initialized: false,
             openai_consumer_5h_alerts_enabled: true,
             openai_consumer_week_alerts_enabled: true,
             anthropic_consumer_5h_alerts_enabled: true,
