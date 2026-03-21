@@ -1118,7 +1118,7 @@ fn claude_local_usage_bucket_value(bucket: &Value) -> Option<f64> {
         return None;
     }
 
-    let percent = if value <= 1.0 { value * 100.0 } else { value };
+    let percent = if value > 0.0 && value < 1.0 { value * 100.0 } else { value };
 
     Some(percent.clamp(0.0, 100.0))
 }
