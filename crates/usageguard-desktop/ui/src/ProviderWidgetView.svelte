@@ -9,7 +9,7 @@
   const CARD_GAP = 6;
   const WIDGET_H = 90;
   const WIDGET_PAD = 8;
-  const DEFAULT_REFRESH_INTERVAL_MS = 60_000;
+  const DEFAULT_REFRESH_INTERVAL_MS = 5_000;
   const REFRESH_EVENT = 'usageguard://refresh';
 
   interface ConsumerStatus {

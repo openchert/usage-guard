@@ -13,6 +13,7 @@ serde_json = "1"
 chrono.workspace = true
 usageguard-core = { path = "../usageguard-core" }
 reqwest.workspace = true
+dirs.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = "4"

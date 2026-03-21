@@ -24,14 +24,15 @@ const CONSUMER_LOCAL_STATUS_SOURCE: &str = "consumer_local_status";
 const CLAUDE_CODE_USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_LOCAL_USAGE_BETA_HEADER: &str = "oauth-2025-04-20";
 const CLAUDE_LOCAL_USAGE_CACHE_TTL_SECS: i64 = 180;
-const CODEX_WHAM_CACHE_TTL_SECS: i64 = 60;
+const CODEX_WHAM_CACHE_TTL_SECS: i64 = 5;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 4;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 12;
 const CODEX_SESSION_SCAN_FILE_LIMIT: usize = 32;
 const CODEX_SESSION_SCAN_LINE_LIMIT: usize = 256;
-const CODEX_RATE_LIMIT_STALENESS_THRESHOLD_SECS: u64 = 15 * 60;
-pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 15;
-pub const MIN_REFRESH_INTERVAL_SECS: u32 = 15;
+const CODEX_RATE_LIMIT_STALENESS_THRESHOLD_SECS: u64 = 10;
+const LEGACY_DEFAULT_REFRESH_INTERVAL_SECS: u32 = 15;
+pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
+pub const MIN_REFRESH_INTERVAL_SECS: u32 = 5;
 pub const MAX_REFRESH_INTERVAL_SECS: u32 = 900;
 const CONSUMER_FIVE_HOUR_NEAR_LIMIT_PERCENT: f64 = 90.0;
 const CONSUMER_WEEKLY_NEAR_LIMIT_PERCENT: f64 = 80.0;
@@ -374,6 +375,17 @@ fn codex_sessions_dir() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".codex").join("sessions"))
 }
 
+fn codex_rate_limit_staleness_threshold_secs() -> u64 {
+    #[cfg(test)]
+    if let Ok(value) = std::env::var("USAGEGUARD_CODEX_RATE_LIMIT_STALENESS_OVERRIDE_SECS") {
+        if let Ok(parsed) = value.trim().parse::<u64>() {
+            return parsed;
+        }
+    }
+
+    CODEX_RATE_LIMIT_STALENESS_THRESHOLD_SECS
+}
+
 fn has_local_codex_auth() -> bool {
     let Some(path) = codex_auth_path() else {
         return false;
@@ -654,7 +666,7 @@ fn codex_rate_limit_is_fresh(modified: SystemTime) -> bool {
         .elapsed()
         .unwrap_or(std::time::Duration::MAX)
         .as_secs()
-        <= CODEX_RATE_LIMIT_STALENESS_THRESHOLD_SECS
+        <= codex_rate_limit_staleness_threshold_secs()
 }
 
 fn build_claude_local_consumer_snapshot(
@@ -1040,19 +1052,37 @@ fn fetch_codex_wham_usage() -> Option<UsageSnapshot> {
 }
 
 pub fn fetch_openai_consumer_usage() -> Option<UsageSnapshot> {
-    // Prefer fresh local JSONL data written by Codex within the last 15 minutes.
-    if let Some((payload, modified)) = latest_codex_rate_limit_payload() {
+    // Prefer very recent local JSONL data written by Codex for near real-time updates
+    // immediately after a request. Once that local snapshot ages out, prefer the live
+    // usage endpoint and only fall back to the older local snapshot if the live fetch fails.
+    let local_snapshot = latest_codex_rate_limit_payload().and_then(|(payload, modified)| {
         if codex_rate_limit_is_fresh(modified) {
             match parse_codex_local_usage_payload(&payload) {
-                Ok(snapshot) => return Some(snapshot),
+                Ok(snapshot) => return Some((snapshot, true)),
                 Err(error) => {
                     let _ = error;
                 }
             }
         }
+
+        match parse_codex_local_usage_payload(&payload) {
+            Ok(snapshot) => Some((snapshot, false)),
+            Err(error) => {
+                let _ = error;
+                None
+            }
+        }
+    });
+
+    if let Some((snapshot, true)) = local_snapshot.as_ref() {
+        return Some(snapshot.clone());
     }
 
     if let Some(snapshot) = fetch_codex_wham_usage() {
+        return Some(snapshot);
+    }
+
+    if let Some((snapshot, false)) = local_snapshot {
         return Some(snapshot);
     }
 
@@ -1273,6 +1303,15 @@ pub fn load_config() -> Result<AppConfig> {
     let mut migrated = false;
 
     migrated |= migrate_legacy_consumer_alert_preferences(&raw_value, &mut cfg);
+
+    if raw_value
+        .get("refresh_interval_secs")
+        .and_then(Value::as_u64)
+        == Some(LEGACY_DEFAULT_REFRESH_INTERVAL_SECS as u64)
+    {
+        cfg.refresh_interval_secs = DEFAULT_REFRESH_INTERVAL_SECS;
+        migrated = true;
+    }
 
     if [
         "near_limit_ratio",
@@ -1886,6 +1925,8 @@ mod tests {
             None => std::env::remove_var(OPENAI_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV),
         }
 
+        std::env::remove_var("USAGEGUARD_CODEX_RATE_LIMIT_STALENESS_OVERRIDE_SECS");
+
         invalidate_claude_local_insights_cache();
         invalidate_codex_wham_cache();
 
@@ -1901,6 +1942,8 @@ mod tests {
         std::env::remove_var(CODEX_SESSIONS_DIR_OVERRIDE_ENV);
 
         std::env::remove_var(OPENAI_LOCAL_USAGE_RESPONSE_OVERRIDE_ENV);
+
+        std::env::remove_var("USAGEGUARD_CODEX_RATE_LIMIT_STALENESS_OVERRIDE_SECS");
 
         let _ = fs::remove_dir_all(&root);
 
@@ -2451,6 +2494,42 @@ mod tests {
 
     #[test]
 
+    fn load_config_migrates_legacy_refresh_interval_to_new_default() {
+        with_test_config_dir("legacy_refresh_interval", || {
+            let path = config_path().unwrap();
+
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+            fs::write(
+                &path,
+                serde_json::json!({
+                    "quiet_hours": {
+                        "enabled": true,
+                        "start_hour": 23,
+                        "end_hour": 8
+                    },
+                    "refresh_interval_secs": LEGACY_DEFAULT_REFRESH_INTERVAL_SECS
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let cfg = load_config().unwrap();
+
+            assert_eq!(cfg.refresh_interval_secs, DEFAULT_REFRESH_INTERVAL_SECS);
+
+            let saved = fs::read_to_string(&path).unwrap();
+            let saved: Value = serde_json::from_str(&saved).unwrap();
+
+            assert_eq!(
+                saved.get("refresh_interval_secs").and_then(Value::as_u64),
+                Some(DEFAULT_REFRESH_INTERVAL_SECS as u64)
+            );
+        });
+    }
+
+    #[test]
+
     fn parse_claude_local_usage_response_normalizes_fraction_utilization() {
         let value: Value = serde_json::json!({
             "five_hour": {
@@ -2671,6 +2750,102 @@ mod tests {
                 assert_eq!(snapshot.tokens_in, 24);
                 assert!((snapshot.spent_usd - 61.0).abs() < f64::EPSILON);
                 assert!(has_openai_consumer_usage());
+            },
+        );
+    }
+
+    #[test]
+
+    fn openai_consumer_usage_prefers_live_usage_when_local_session_is_stale() {
+        let usage_response = serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 24.0,
+                    "reset_at": 1773188548i64
+                },
+                "secondary_window": {
+                    "used_percent": 61.0,
+                    "reset_at": 1773757308i64
+                }
+            }
+        })
+        .to_string();
+
+        with_codex_local_usage_override(
+            "stale_session_prefers_live",
+            r#"{"tokens":{"access_token":"present","account_id":"acct_123"}}"#,
+            &[&serde_json::json!({
+                "timestamp": "2026-03-17T15:21:42Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "plan_type": "plus",
+                        "primary": {
+                            "used_percent": 10.0,
+                            "resets_at": 1773762721i64
+                        },
+                        "secondary": {
+                            "used_percent": 86.0,
+                            "resets_at": 1773855809i64
+                        }
+                    }
+                }
+            })
+            .to_string()],
+            Some(&usage_response),
+            || {
+                std::env::set_var("USAGEGUARD_CODEX_RATE_LIMIT_STALENESS_OVERRIDE_SECS", "0");
+                std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+                let snapshot = fetch_openai_consumer_usage().expect("snapshot missing");
+
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_SOURCE);
+                assert_eq!(snapshot.account_label, "Codex Pro");
+                assert_eq!(snapshot.tokens_in, 24);
+                assert!((snapshot.spent_usd - 61.0).abs() < f64::EPSILON);
+            },
+        );
+    }
+
+    #[test]
+
+    fn openai_consumer_usage_falls_back_to_stale_local_session_when_live_fetch_fails() {
+        with_codex_local_usage_override(
+            "stale_session_fallback",
+            r#"{"tokens":{"access_token":"present","account_id":"acct_123"}}"#,
+            &[&serde_json::json!({
+                "timestamp": "2026-03-17T15:21:42Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "plan_type": "plus",
+                        "primary": {
+                            "used_percent": 10.0,
+                            "resets_at": 1773762721i64
+                        },
+                        "secondary": {
+                            "used_percent": 86.0,
+                            "resets_at": 1773855809i64
+                        }
+                    }
+                }
+            })
+            .to_string()],
+            None,
+            || {
+                std::env::set_var("USAGEGUARD_CODEX_RATE_LIMIT_STALENESS_OVERRIDE_SECS", "0");
+
+                let snapshot = fetch_openai_consumer_usage().expect("snapshot missing");
+
+                assert_eq!(snapshot.source, CONSUMER_LOCAL_SOURCE);
+                assert_eq!(snapshot.account_label, "Codex Plus");
+                assert_eq!(snapshot.tokens_in, 10);
+                assert!((snapshot.spent_usd - 86.0).abs() < f64::EPSILON);
             },
         );
     }

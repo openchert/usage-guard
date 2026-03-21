@@ -4450,7 +4450,7 @@ dependencies = [
 
 [[package]]
 name = "usageguard-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "clap",
@@ -4459,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "usageguard-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4471,9 +4471,10 @@ dependencies = [
 
 [[package]]
 name = "usageguard-desktop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
+ "dirs",
  "ico 0.3.0",
  "mac-notification-sys",
  "notify-rust",

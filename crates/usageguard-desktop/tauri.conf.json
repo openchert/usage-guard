@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "UsageGuard",
-  "identifier": "com.usageguard.app",
+  "identifier": "com.openchert.usageguard",
   "build": {
-    "beforeBuildCommand": "npm run build --prefix ui",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "ui/dist"
   },
   "app": {
@@ -29,7 +29,11 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "publisher": "Lukas Reichert",
+    "category": "Utility",
+    "shortDescription": "Local-first AI usage widget for desktop.",
+    "longDescription": "UsageGuard keeps ChatGPT, Claude, OpenAI, and Anthropic usage visible in a compact desktop widget without dashboard noise.",
     "icon": [
       "icons/icon.ico",
       "icons/256x256.png",
