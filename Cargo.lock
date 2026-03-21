@@ -4450,7 +4450,7 @@ dependencies = [
 
 [[package]]
 name = "usageguard-cli"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "chrono",
  "clap",
@@ -4459,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "usageguard-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4471,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "usageguard-desktop"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "chrono",
  "dirs",
