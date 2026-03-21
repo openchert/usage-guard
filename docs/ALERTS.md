@@ -3,7 +3,7 @@
 UsageGuard treats alerts as a core desktop feature.
 
 - Native OS notifications are the primary delivery mechanism.
-- The widget also keeps a visible alert state on the affected provider card until the alert clears.
+- The widget also keeps a visible alert state on the affected connection card until the alert clears.
 - Quiet hours still suppress non-critical notifications, but the widget state remains visible.
 
 ## Consumer quota alerts
@@ -33,25 +33,14 @@ UsageGuard evaluates two alert types on every available consumer window.
 - `week`: alert when reset is within `24 hours` and usage is `<= 40%`
 - reminders are skipped if the provider does not supply a valid reset timestamp
 
-## API and admin monitoring alerts
-
-Built-in API/admin monitoring sources keep the existing non-consumer alerts:
-
-- near budget limit
-- budget exceeded
-- under-used / inactivity reminder
-
-These are preserved so organization monitoring still surfaces spend pressure even though it does not use the consumer quota-window model.
-
 ## Delivery and re-arm behavior
 
-- Each alert is tracked independently per provider account.
+- Each alert is tracked independently per local connection.
 - Notification dedup memory is kept in-process only and resets when the app exits.
 - Consumer quota alerts use the normalized reset timestamp as part of the notification signature so the same alert can fire again after a new quota window starts.
 - The same alert does not re-notify on refresh, even if it temporarily clears and then returns in the same app session.
-- A different alert on the same provider account re-arms notification delivery for later alerts on that card.
+- A different alert on the same connection re-arms notification delivery for later alerts on that card.
 - Quiet-hours-suppressed alerts are not remembered until they are actually emitted.
-- Demo snapshots never emit notifications.
 
 ## Widget behavior
 

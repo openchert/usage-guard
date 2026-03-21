@@ -29,8 +29,8 @@ function statusTitleLines(
   const lines = [displayLabel];
 
   if (kind === 'loading') {
-    lines.push(isOpenAI ? 'Fetching Codex quota…' : 'Fetching Claude Code quota…');
-    lines.push('Refreshes every 5 minutes');
+    lines.push(isOpenAI ? 'Fetching Codex quota...' : 'Fetching Claude Code quota...');
+    lines.push('Refreshes on the next update cycle');
     const primaryReset = formatResetTime(quotaResetAt(snapshot, 'primary'));
     if (primaryReset) lines.push(`5h resets: ${primaryReset}`);
   } else if (kind === 'waiting') {

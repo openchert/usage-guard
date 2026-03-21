@@ -18,7 +18,6 @@
 
   interface WidgetConfig {
     light_mode: boolean;
-    provider_accounts?: Array<unknown>;
   }
 
   let snapshots = [] as UsageSnapshot[];
@@ -106,9 +105,7 @@
         refreshIntervalMs = nextRefreshIntervalMs;
         resetRefreshTimer();
       }
-    } catch (error) {
-      console.error('get_refresh_interval_secs failed:', error);
-    }
+    } catch {}
   }
 
   async function applyTheme(): Promise<void> {
@@ -116,26 +113,21 @@
     try {
       const cfg = await invoke('get_config') as WidgetConfig;
       document.documentElement.classList.toggle('light-mode', cfg.light_mode);
-    } catch (error) {
-      console.error('get_config (theme) failed:', error);
-    }
+    } catch {}
   }
 
   async function loadConfiguredSources(): Promise<void> {
     if (!invoke) return;
 
     try {
-      const [cfg, openaiStatus, anthropicStatus] = await Promise.all([
-        invoke('get_config') as Promise<WidgetConfig>,
+      const [openaiStatus, anthropicStatus] = await Promise.all([
         invoke('get_openai_consumer_status') as Promise<ConsumerStatus>,
         invoke('get_anthropic_consumer_status') as Promise<ConsumerStatus>,
       ]);
       hasConfiguredSources =
-        (cfg.provider_accounts?.length ?? 0) > 0
-        || openaiStatus.connected
+        openaiStatus.connected
         || anthropicStatus.connected;
-    } catch (error) {
-      console.error('widget startup state check failed:', error);
+    } catch {
       hasConfiguredSources = false;
     }
   }
@@ -151,9 +143,7 @@
         await resizeToFit(snapshots.length);
         lastRenderedCardCount = snapshots.length;
       }
-    } catch (error) {
-      console.error('get_snapshots failed:', error);
-    } finally {
+    } catch {} finally {
       isLoading = false;
     }
   }
@@ -163,9 +153,7 @@
     initialShown = true;
     try {
       await currentWindow.show();
-    } catch (error) {
-      console.error('show window failed:', error);
-    }
+    } catch {}
   }
 
   async function revealWhenReady(): Promise<void> {
@@ -181,9 +169,7 @@
 
     try {
       await invoke('refresh_snapshots');
-    } catch (error) {
-      console.error('refresh_snapshots failed:', error);
-    }
+    } catch {}
   }
 
   function clearContextMenuCursor(): void {
@@ -222,8 +208,7 @@
     armContextMenuCursorReset();
     if (!invoke) return;
 
-    void invoke('show_context_menu', { x: event.clientX, y: event.clientY }).catch((error) => {
-      console.error('show_context_menu failed:', error);
+    void invoke('show_context_menu', { x: event.clientX, y: event.clientY }).catch(() => {
       clearContextMenuCursor();
     });
   }
@@ -295,7 +280,7 @@
 >
   {#if bootstrapComplete && snapshots.length === 0 && !isLoading && !hasConfiguredSources}
     <div class="empty-state">
-      <span class="empty-copy">Right-click to connect a provider</span>
+      <span class="empty-copy">Right-click to manage connections</span>
     </div>
   {:else}
     {#each snapshots as snapshot}
@@ -304,8 +289,6 @@
       {@const alertLevel = cardAlertLevel(snapshot)}
       <div
         class="provider-card"
-        class:provider-card-hybrid={card.kind === 'hybrid'}
-        class:provider-card-metrics={card.kind === 'metrics' || card.kind === 'hybrid'}
         data-alert-level={alertLevel ?? undefined}
         title={card.title}
       >
@@ -323,27 +306,6 @@
                 theme={provider.usageRing}
               />
             {/each}
-          </div>
-        {:else if card.kind === 'hybrid'}
-          <div class="hybrid-layout">
-            <div class="rings hybrid-rings">
-              {#each card.rings as ring}
-                <UsageRing
-                  ratio={ring.ratio}
-                  accent={provider.color}
-                  label={ring.label ?? ''}
-                  theme={provider.usageRing}
-                />
-              {/each}
-            </div>
-            <div class="metric-grid hybrid-metric-grid">
-              {#each card.stats as stat}
-                <div class="metric-tile">
-                  <span class="metric-value" style={`--metric-accent:${provider.color}`}>{stat.value}</span>
-                  <span class="metric-label">{stat.label}</span>
-                </div>
-              {/each}
-            </div>
           </div>
         {:else if card.kind === 'status'}
           <div class="status-body">
@@ -387,15 +349,6 @@
               {/if}
             </svg>
             <span class="status-label">{card.label}</span>
-          </div>
-        {:else}
-          <div class="metric-grid">
-            {#each card.stats as stat}
-              <div class="metric-tile">
-                <span class="metric-value" style={`--metric-accent:${provider.color}`}>{stat.value}</span>
-                <span class="metric-label">{stat.label}</span>
-              </div>
-            {/each}
           </div>
         {/if}
       </div>
@@ -512,60 +465,6 @@
     align-items: center;
     gap: 12px;
     flex: 1;
-  }
-
-  .provider-card-metrics {
-    gap: 4px;
-  }
-
-  .provider-card-hybrid {
-    gap: 5px;
-  }
-
-  .hybrid-layout {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-    flex: 1;
-  }
-
-  .hybrid-rings {
-    flex: 0;
-  }
-
-  .hybrid-metric-grid {
-    flex: 1;
-  }
-
-  .metric-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-    flex: 1;
-    align-items: center;
-  }
-
-  .metric-tile {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 3px;
-    min-width: 0;
-  }
-
-  .metric-label {
-    font-size: 9px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--text-lo);
-  }
-
-  .metric-value {
-    font-size: 13px;
-    font-weight: 700;
-    line-height: 1;
-    color: var(--metric-accent);
   }
 
   /* ── Status card (ghost ring) ─────────────────────────────────── */

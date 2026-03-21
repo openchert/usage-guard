@@ -15,17 +15,21 @@ use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use usageguard_core::{
-    clamp_refresh_interval_secs, evaluate_alerts, has_provider_account_api_key, load_config,
-    provider_catalog, provider_snapshots, save_config, secure_storage_status,
-    set_provider_account_api_key, should_notify_alert, verify_provider_api_key, Alert, AppConfig,
-    ProviderAccount, ProviderCatalogEntry, SecureStorageStatus, UsageSnapshot,
-    MAX_REFRESH_INTERVAL_SECS, MIN_REFRESH_INTERVAL_SECS,
+    clamp_refresh_interval_secs, evaluate_alerts, load_config, provider_snapshots, save_config,
+    should_notify_alert, Alert, AppConfig, UsageSnapshot, MAX_REFRESH_INTERVAL_SECS,
+    MIN_REFRESH_INTERVAL_SECS,
 };
 
 #[derive(Default)]
 struct RefreshState {
     in_flight: bool,
     queued: bool,
+}
+
+#[derive(Default)]
+struct ClaudeBootstrapState {
+    attempted: bool,
+    in_flight: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +66,7 @@ struct AppState {
     snapshots: Mutex<Vec<SnapshotView>>,
     manual_alerts: Mutex<HashMap<String, ManualAlert>>,
     refresh: Mutex<RefreshState>,
+    claude_bootstrap: Mutex<ClaudeBootstrapState>,
     tray_available: Mutex<bool>,
     start_on_login_enabled: Mutex<bool>,
     tray_start_on_login_item: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
@@ -92,6 +97,14 @@ const CTX_QUIT_ID: &str = "widget.quit";
 const REFRESH_EVENT: &str = "usageguard://refresh";
 
 const SETTINGS_LABEL: &str = "settings";
+
+const CONSUMER_LOCAL_STATUS_SOURCE: &str = "consumer_local_status";
+
+const CONSUMER_LOCAL_WAITING_FOR_USAGE_CODE: &str = "consumer_local_waiting_for_usage";
+
+const CONSUMER_LOCAL_USAGE_PENDING_CODE: &str = "consumer_local_usage_pending";
+
+const CLAUDE_AUTO_BOOTSTRAP_PROMPTS: [&str; 2] = ["Respond with exactly OK.", "/insights"];
 
 const RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/openchert/usage-guard/releases/latest";
@@ -127,31 +140,6 @@ const DEFAULT_WIDGET_HEIGHT: f64 = 100.0;
 const DEFAULT_WIDGET_MARGIN_RIGHT: f64 = 30.0;
 
 const DEFAULT_WIDGET_MARGIN_BOTTOM: f64 = 14.0;
-
-#[derive(Debug, Clone, Serialize)]
-struct ProviderAccountView {
-    id: String,
-    provider: String,
-    provider_label: String,
-    label: String,
-    has_api_key: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ProviderSettingsPayload {
-    providers: Vec<ProviderCatalogEntry>,
-    accounts: Vec<ProviderAccountView>,
-    secure_storage: SecureStorageStatus,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProviderAccountInput {
-    id: Option<String>,
-    provider: String,
-    label: String,
-    api_key: Option<String>,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -228,164 +216,6 @@ fn set_refresh_interval_secs(
     Ok(refresh_interval_secs)
 }
 
-fn normalize_optional(value: Option<String>) -> Option<String> {
-    value.and_then(|raw| {
-        let trimmed = raw.trim();
-
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn normalize_required(value: &str, field: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-
-    if trimmed.is_empty() {
-        Err(format!("{field} is required"))
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-fn apply_provider_account_save(
-    cfg: &mut AppConfig,
-    input: &ProviderAccountInput,
-    catalog: &[ProviderCatalogEntry],
-    has_api_key: impl Fn(&str) -> bool,
-    validate_api_key: impl Fn(&str, &str) -> Result<(), String>,
-    persist_api_key: impl Fn(&str, &str) -> Result<(), String>,
-    persist_config: impl Fn(&AppConfig) -> Result<(), String>,
-) -> Result<(), String> {
-    let provider = normalize_required(&input.provider, "Provider")?;
-
-    let label = normalize_required(&input.label, "Name")?;
-
-    let api_key = normalize_optional(input.api_key.clone());
-
-    let provider_meta = catalog
-        .iter()
-        .find(|entry| entry.id == provider)
-        .ok_or_else(|| "Unknown provider selected".to_string())?;
-
-    let existing_index = match input.id.as_ref() {
-        Some(id) => Some(
-            cfg.provider_accounts
-                .iter()
-                .position(|account| account.id == *id)
-                .ok_or_else(|| "Provider account not found".to_string())?,
-        ),
-        None => None,
-    };
-
-    if let Some(index) = existing_index {
-        let existing = &cfg.provider_accounts[index];
-
-        if existing.provider != provider {
-            return Err("Provider cannot be changed for an existing account".to_string());
-        }
-    }
-
-    if cfg
-        .provider_accounts
-        .iter()
-        .enumerate()
-        .any(|(index, account)| {
-            Some(index) != existing_index
-                && account.provider == provider
-                && account.label.eq_ignore_ascii_case(&label)
-        })
-    {
-        return Err(format!(
-            "A {} account named '{}' already exists",
-            provider_meta.label, label
-        ));
-    }
-
-    let account_id = existing_index
-        .and_then(|index| {
-            cfg.provider_accounts
-                .get(index)
-                .map(|account| account.id.clone())
-        })
-        .unwrap_or_else(|| make_account_id(&provider, &label));
-
-    if api_key.is_none() && !has_api_key(&account_id) {
-        return Err("API key is required".to_string());
-    }
-
-    if let Some(ref key) = api_key {
-        validate_api_key(&provider, key)?;
-    }
-
-    let original_cfg = cfg.clone();
-
-    let account = ProviderAccount {
-        id: account_id.clone(),
-        provider,
-        label,
-        endpoint: None,
-    };
-
-    if let Some(index) = existing_index {
-        cfg.provider_accounts[index] = account;
-    } else {
-        cfg.provider_accounts.push(account);
-    }
-
-    if let Err(error) = persist_config(cfg) {
-        *cfg = original_cfg;
-
-        return Err(error);
-    }
-
-    if let Some(ref key) = api_key {
-        if let Err(error) = persist_api_key(&account_id, key) {
-            *cfg = original_cfg.clone();
-
-            let _ = persist_config(&original_cfg);
-
-            return Err(error);
-        }
-    }
-
-    Ok(())
-}
-
-fn make_account_id(provider: &str, label: &str) -> String {
-    let slug: String = label
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-
-    let slug = slug
-        .split('-')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-
-    let slug = if slug.is_empty() {
-        "account".to_string()
-    } else {
-        slug
-    };
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    format!("acct_{provider}_{slug}_{ts}")
-}
-
 fn require_window_label(
     window: &WebviewWindow,
     expected_label: &str,
@@ -397,62 +227,6 @@ fn require_window_label(
         Err(format!(
             "{command_name} is only available from the {expected_label} window"
         ))
-    }
-}
-
-fn provider_settings_payload(cfg: &AppConfig) -> ProviderSettingsPayload {
-    let providers = provider_catalog();
-
-    let provider_map: HashMap<&str, &ProviderCatalogEntry> = providers
-        .iter()
-        .map(|provider| (provider.id.as_str(), provider))
-        .collect();
-
-    let mut accounts = cfg
-        .provider_accounts
-        .iter()
-        .filter_map(|account| {
-            let meta = provider_map.get(account.provider.as_str())?;
-
-            Some(ProviderAccountView {
-                id: account.id.clone(),
-                provider: account.provider.clone(),
-                provider_label: meta.label.clone(),
-                label: account.label.clone(),
-                has_api_key: has_provider_account_api_key(&account.id),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    accounts.sort_by(|a, b| {
-        a.provider_label
-            .cmp(&b.provider_label)
-            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
-    });
-
-    ProviderSettingsPayload {
-        providers,
-        accounts,
-        secure_storage: secure_storage_status(),
-    }
-}
-
-fn secure_storage_unavailable_message(status: &SecureStorageStatus) -> String {
-    status.detail.clone().unwrap_or_else(|| {
-        format!(
-            "Secure storage backend '{}' is unavailable.",
-            status.backend
-        )
-    })
-}
-
-fn require_secure_storage_available() -> Result<(), String> {
-    let status = secure_storage_status();
-
-    if status.available {
-        Ok(())
-    } else {
-        Err(secure_storage_unavailable_message(&status))
     }
 }
 
@@ -472,6 +246,10 @@ fn set_tray_available(app: &AppHandle, available: bool) {
 
 fn emit_widget_refresh(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
+        let _ = win.emit(REFRESH_EVENT, ());
+    }
+
+    if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = win.emit(REFRESH_EVENT, ());
     }
 }
@@ -655,6 +433,8 @@ fn spawn_snapshot_refresh(app: AppHandle) {
 
         let snapshots = provider_snapshots(&cfg);
 
+        maybe_spawn_claude_auto_bootstrap(&app, &snapshots);
+
         let now_local = Local::now();
 
         let now_utc = now_local.with_timezone(&Utc);
@@ -709,6 +489,84 @@ fn spawn_snapshot_refresh(app: AppHandle) {
     });
 }
 
+fn anthropic_snapshot_needs_bootstrap(snapshot: &UsageSnapshot) -> bool {
+    if snapshot.provider != "anthropic" || snapshot.source != CONSUMER_LOCAL_STATUS_SOURCE {
+        return false;
+    }
+
+    if snapshot.consumer_quota.is_some() {
+        return false;
+    }
+
+    snapshot.status_code.as_deref().is_some_and(|code| {
+        code == CONSUMER_LOCAL_WAITING_FOR_USAGE_CODE || code == CONSUMER_LOCAL_USAGE_PENDING_CODE
+    })
+}
+
+fn maybe_spawn_claude_auto_bootstrap(app: &AppHandle, snapshots: &[UsageSnapshot]) {
+    if !snapshots.iter().any(anthropic_snapshot_needs_bootstrap) {
+        return;
+    }
+
+    let should_spawn = {
+        let state = app.state::<AppState>();
+
+        let mut bootstrap = state
+            .claude_bootstrap
+            .lock()
+            .expect("AppState claude_bootstrap lock poisoned");
+
+        if bootstrap.attempted || bootstrap.in_flight {
+            false
+        } else {
+            bootstrap.attempted = true;
+            bootstrap.in_flight = true;
+            true
+        }
+    };
+
+    if !should_spawn {
+        return;
+    }
+
+    let app_handle = app.clone();
+
+    std::thread::spawn(move || {
+        for prompt in CLAUDE_AUTO_BOOTSTRAP_PROMPTS {
+            let command_result = std::process::Command::new("claude")
+                .args(["-p", prompt])
+                .output();
+
+            match command_result {
+                Ok(output) if output.status.success() => {
+                    break;
+                }
+                Ok(output) => {
+                    let _ = (prompt, output);
+                }
+                Err(error) => {
+                    let _ = (prompt, error);
+                }
+            }
+        }
+
+        usageguard_core::invalidate_claude_local_insights_cache();
+
+        {
+            let state = app_handle.state::<AppState>();
+
+            let mut bootstrap = state
+                .claude_bootstrap
+                .lock()
+                .expect("AppState claude_bootstrap lock poisoned");
+
+            bootstrap.in_flight = false;
+        }
+
+        spawn_snapshot_refresh(app_handle);
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LogicalWorkArea {
     left: f64,
@@ -746,6 +604,20 @@ fn clamp_widget_origin_to_area(area: LogicalWorkArea, x: f64, y: f64) -> (f64, f
     let max_x = (area.right - DEFAULT_WIDGET_WIDTH).max(area.left);
 
     let max_y = (area.bottom - DEFAULT_WIDGET_HEIGHT).max(area.top);
+
+    (x.clamp(area.left, max_x), y.clamp(area.top, max_y))
+}
+
+fn clamp_popup_origin_to_area(
+    area: LogicalWorkArea,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let max_x = (area.right - width).max(area.left);
+
+    let max_y = (area.bottom - height).max(area.top);
 
     (x.clamp(area.left, max_x), y.clamp(area.top, max_y))
 }
@@ -800,6 +672,48 @@ fn restore_widget_position(win: &WebviewWindow, saved_position: Option<[f64; 2]>
     }
 }
 
+fn adjacent_popup_position(
+    main_win: &WebviewWindow,
+    width: f64,
+    height: f64,
+) -> Option<(f64, f64)> {
+    const GAP: f64 = 8.0;
+    const BOTTOM_ALIGNMENT_OFFSET: f64 = 8.0;
+
+    let scale = main_win.scale_factor().ok()?;
+
+    let phys_pos = main_win.outer_position().ok()?;
+
+    let phys_size = main_win.inner_size().ok()?;
+
+    let widget_x = phys_pos.x as f64 / scale;
+    let widget_y = phys_pos.y as f64 / scale;
+    let widget_w = phys_size.width as f64 / scale;
+    let widget_h = phys_size.height as f64 / scale;
+
+    let area = preferred_widget_work_area(main_win)?;
+
+    let left_x = widget_x - width - GAP;
+    let right_x = widget_x + widget_w + GAP;
+    let preferred_x = if left_x >= area.left {
+        left_x
+    } else if right_x + width <= area.right {
+        right_x
+    } else {
+        left_x
+    };
+
+    let preferred_y = widget_y + widget_h - height + BOTTOM_ALIGNMENT_OFFSET;
+
+    Some(clamp_popup_origin_to_area(
+        area,
+        preferred_x,
+        preferred_y,
+        width,
+        height,
+    ))
+}
+
 fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = win.set_always_on_top(true);
@@ -813,41 +727,18 @@ fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
 
     const SETTINGS_W: f64 = 360.0;
 
-    const SETTINGS_H: f64 = 540.0;
+    const SETTINGS_H: f64 = 348.0;
 
-    const GAP: f64 = 8.0;
-
-    // Position the settings window to the left of the main widget, bottom-aligned.
-    // No clamping so it follows the widget to whichever monitor it lives on.
-    let position = app.get_webview_window("main").and_then(|main_win| {
-        let scale = main_win.scale_factor().ok()?;
-
-        let phys_pos = main_win.outer_position().ok()?;
-
-        let phys_size = main_win.inner_size().ok()?;
-
-        let widget_x = phys_pos.x as f64 / scale;
-
-        let widget_y = phys_pos.y as f64 / scale;
-
-        let widget_h = phys_size.height as f64 / scale;
-
-        // Left of the widget, bottom-aligned with the widget background edge.
-        // +8 compensates for the settings shell padding so the visible panel
-        // bottom lines up with the widget window bottom.
-        let x = widget_x - SETTINGS_W - GAP;
-
-        let y = widget_y + widget_h - SETTINGS_H + 8.0;
-
-        Some((x, y))
-    });
+    let position = app
+        .get_webview_window("main")
+        .and_then(|main_win| adjacent_popup_position(&main_win, SETTINGS_W, SETTINGS_H));
 
     let builder = WebviewWindowBuilder::new(
         app,
         SETTINGS_LABEL,
         WebviewUrl::App("index.html?view=settings".into()),
     )
-    .title("UsageGuard Providers")
+    .title("UsageGuard Connections")
     .inner_size(SETTINGS_W, SETTINGS_H)
     .resizable(false)
     .decorations(false)
@@ -872,122 +763,13 @@ fn open_provider_settings_impl(app: &AppHandle) -> Result<(), String> {
 
 fn spawn_open_provider_settings(app: AppHandle) {
     std::thread::spawn(move || {
-        if let Err(error) = open_provider_settings_impl(&app) {
-            eprintln!("failed to open provider settings: {error}");
-        }
+        let _ = open_provider_settings_impl(&app);
     });
-}
-
-#[tauri::command]
-fn update_config(
-    window: WebviewWindow,
-    mut config: AppConfig,
-    state: State<AppState>,
-    app: AppHandle,
-) -> Result<(), String> {
-    require_window_label(&window, SETTINGS_LABEL, "update_config")?;
-
-    config.refresh_interval_secs = clamp_refresh_interval_secs(config.refresh_interval_secs);
-
-    save_config(&config).map_err(|e| e.to_string())?;
-
-    *state.cfg.lock().expect("AppState cfg lock poisoned") = config;
-
-    emit_widget_refresh(&app);
-
-    Ok(())
 }
 
 #[tauri::command]
 fn open_provider_settings(app: AppHandle) {
     spawn_open_provider_settings(app);
-}
-
-#[tauri::command]
-fn get_provider_settings(state: State<AppState>) -> ProviderSettingsPayload {
-    provider_settings_payload(
-        &state
-            .cfg
-            .lock()
-            .expect("AppState cfg lock poisoned")
-            .clone(),
-    )
-}
-
-#[tauri::command]
-fn save_provider_account(
-    window: WebviewWindow,
-    input: ProviderAccountInput,
-    state: State<AppState>,
-    app: AppHandle,
-) -> Result<ProviderSettingsPayload, String> {
-    require_window_label(&window, SETTINGS_LABEL, "save_provider_account")?;
-
-    require_secure_storage_available()?;
-
-    // Clone out because apply_provider_account_save may perform HTTP validation,
-    // and we must not hold the mutex across network I/O.
-    let mut cfg = state
-        .cfg
-        .lock()
-        .expect("AppState cfg lock poisoned")
-        .clone();
-
-    let catalog = provider_catalog();
-
-    apply_provider_account_save(
-        &mut cfg,
-        &input,
-        &catalog,
-        has_provider_account_api_key,
-        |provider_id, key| {
-            verify_provider_api_key(provider_id, key).map_err(|error| error.to_string())
-        },
-        |account_id, key| {
-            set_provider_account_api_key(account_id, Some(key)).map_err(|error| error.to_string())
-        },
-        |updated_cfg| save_config(updated_cfg).map_err(|error| error.to_string()),
-    )?;
-
-    *state.cfg.lock().expect("AppState cfg lock poisoned") = cfg.clone();
-
-    spawn_snapshot_refresh(app);
-
-    Ok(provider_settings_payload(&cfg))
-}
-
-#[tauri::command]
-fn delete_provider_account(
-    window: WebviewWindow,
-    id: String,
-    state: State<AppState>,
-    app: AppHandle,
-) -> Result<ProviderSettingsPayload, String> {
-    require_window_label(&window, SETTINGS_LABEL, "delete_provider_account")?;
-
-    require_secure_storage_available()?;
-
-    let cfg = {
-        let mut guard = state.cfg.lock().expect("AppState cfg lock poisoned");
-
-        let before = guard.provider_accounts.len();
-
-        guard.provider_accounts.retain(|account| account.id != id);
-
-        if guard.provider_accounts.len() == before {
-            return Err("Provider account not found".to_string());
-        }
-
-        save_config(&guard).map_err(|e| e.to_string())?;
-
-        let _ = set_provider_account_api_key(&id, None);
-
-        guard.clone()
-    };
-
-    spawn_snapshot_refresh(app);
-
-    Ok(provider_settings_payload(&cfg))
 }
 
 /// Saves the current widget position to config, then exits.
@@ -1128,10 +910,6 @@ fn collect_pending_notifications(
     let mut pending = Vec::new();
 
     for snapshot_view in snapshots {
-        if snapshot_view.snapshot.source == "demo" {
-            continue;
-        }
-
         let remembered = notified_alerts.get(&snapshot_key(&snapshot_view.snapshot));
         let mut current = Vec::new();
 
@@ -1326,8 +1104,7 @@ fn spawn_release_check(app: AppHandle) {
         let latest_tag = match fetch_latest_release_tag() {
             Ok(tag_name) => tag_name,
             Err(error) => {
-                eprintln!("release check failed: {error}");
-
+                let _ = error;
                 return;
             }
         };
@@ -1346,9 +1123,7 @@ fn spawn_release_check(app: AppHandle) {
             } else {
                 cfg.last_update_notified_version = Some(latest_tag.clone());
 
-                if let Err(error) = save_config(&cfg) {
-                    eprintln!("failed to persist release notification state: {error}");
-                }
+                let _ = save_config(&cfg);
 
                 true
             }
@@ -1664,7 +1439,7 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
                 &MenuItem::with_id(
                     app,
                     CTX_PROVIDERS_ID,
-                    "Manage Providers...",
+                    "Manage Connections...",
                     true,
                     None::<&str>,
                 )?,
@@ -1715,7 +1490,7 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
                     &MenuItem::with_id(
                         app,
                         CTX_PROVIDERS_ID,
-                        "Manage Providers...",
+                        "Manage Connections...",
                         true,
                         None::<&str>,
                     )?,
@@ -1751,7 +1526,7 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
                     &MenuItem::with_id(
                         app,
                         CTX_PROVIDERS_ID,
-                        "Manage Providers...",
+                        "Manage Connections...",
                         true,
                         None::<&str>,
                     )?,
@@ -1791,7 +1566,7 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
                     &MenuItem::with_id(
                         app,
                         CTX_PROVIDERS_ID,
-                        "Manage Providers...",
+                        "Manage Connections...",
                         true,
                         None::<&str>,
                     )?,
@@ -1826,7 +1601,7 @@ fn create_widget_menu(window: &WebviewWindow) -> tauri::Result<Menu<tauri::Wry>>
                     &MenuItem::with_id(
                         app,
                         CTX_PROVIDERS_ID,
-                        "Manage Providers...",
+                        "Manage Connections...",
                         true,
                         None::<&str>,
                     )?,
@@ -1889,7 +1664,7 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                 &MenuItem::with_id(
                     app,
                     TRAY_PROVIDERS_ID,
-                    "Manage Providers...",
+                    "Manage Connections...",
                     true,
                     None::<&str>,
                 )?,
@@ -1930,7 +1705,7 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                 &MenuItem::with_id(
                     app,
                     TRAY_PROVIDERS_ID,
-                    "Manage Providers...",
+                    "Manage Connections...",
                     true,
                     None::<&str>,
                 )?,
@@ -1952,7 +1727,7 @@ fn create_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                 &MenuItem::with_id(
                     app,
                     TRAY_PROVIDERS_ID,
-                    "Manage Providers...",
+                    "Manage Connections...",
                     true,
                     None::<&str>,
                 )?,
@@ -2001,10 +1776,7 @@ fn build_tray(app: &mut tauri::App<tauri::Wry>) -> tauri::Result<()> {
 fn setup_tray(app: &mut tauri::App<tauri::Wry>) -> tauri::Result<bool> {
     match build_tray(app) {
         Ok(()) => Ok(true),
-        Err(error) => {
-            eprintln!("failed to create tray icon; continuing without tray: {error}");
-            Ok(false)
-        }
+        Err(_) => Ok(false),
     }
 }
 
@@ -2029,9 +1801,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         TRAY_START_ON_LOGIN_ID | CTX_START_ON_LOGIN_ID => {
             let enabled = !cached_start_on_login_enabled(app);
 
-            if let Err(error) = set_start_on_login_enabled(enabled) {
-                eprintln!("failed to update {START_ON_LOGIN_LABEL}: {error}");
-
+            if set_start_on_login_enabled(enabled).is_err() {
                 emit_native_notification("UsageGuard", START_ON_LOGIN_FAILURE_MESSAGE);
             } else {
                 set_cached_start_on_login_enabled(app, enabled);
@@ -2063,10 +1833,6 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             }
 
             emit_widget_refresh(app);
-
-            if let Some(win) = app.get_webview_window(SETTINGS_LABEL) {
-                let _ = win.emit(REFRESH_EVENT, ());
-            }
         }
         CTX_HIDE_ID => {
             if tray_available(app) {
@@ -2093,15 +1859,57 @@ struct ConsumerStatus {
     status_message: Option<String>,
 }
 
+fn latest_consumer_snapshot(state: &AppState, provider: &str) -> Option<UsageSnapshot> {
+    state
+        .snapshots
+        .lock()
+        .expect("AppState snapshots lock poisoned")
+        .iter()
+        .find(|view| {
+            view.snapshot.provider == provider
+                && matches!(
+                    view.snapshot.source.as_str(),
+                    "consumer_local" | "consumer_local_status"
+                )
+        })
+        .map(|view| view.snapshot.clone())
+}
+
+fn snapshot_window_supported(snapshot: &UsageSnapshot, window: &'static str) -> bool {
+    if snapshot.source != "consumer_local" {
+        return false;
+    }
+
+    let quota_window = match window {
+        "primary" => snapshot
+            .consumer_quota
+            .as_ref()
+            .and_then(|quota| quota.primary.as_ref()),
+        "secondary" => snapshot
+            .consumer_quota
+            .as_ref()
+            .and_then(|quota| quota.secondary.as_ref()),
+        _ => None,
+    };
+
+    quota_window.is_some_and(|entry| entry.available && entry.used_percent.is_some())
+}
+
 #[tauri::command]
 fn get_openai_consumer_status(state: State<AppState>) -> ConsumerStatus {
     let connected = usageguard_core::has_openai_consumer_source();
 
-    let supports_usage = usageguard_core::has_openai_consumer_usage();
+    let snapshot = latest_consumer_snapshot(state.inner(), "openai");
 
-    let supports_5h_usage = supports_usage;
+    let supports_5h_usage = snapshot
+        .as_ref()
+        .is_some_and(|value| snapshot_window_supported(value, "primary"));
 
-    let supports_week_usage = supports_usage;
+    let supports_week_usage = snapshot
+        .as_ref()
+        .is_some_and(|value| snapshot_window_supported(value, "secondary"));
+
+    let supports_usage = supports_5h_usage || supports_week_usage;
 
     let plan_type = if connected {
         usageguard_core::get_openai_consumer_plan_type().filter(|s| !s.is_empty())
@@ -2125,12 +1933,16 @@ fn get_openai_consumer_status(state: State<AppState>) -> ConsumerStatus {
         supports_5h_usage,
         supports_week_usage,
         source_label: "Codex local client".to_string(),
-        status_message: if connected && !supports_usage {
+        status_message: if !connected {
+            Some("Sign in to Codex on this machine to enable local usage import.".to_string())
+        } else if let Some(snapshot) = snapshot {
+            snapshot.status_message.clone()
+        } else if !supports_usage {
             Some("Signed in locally. Usage appears after your next Codex request.".to_string())
         } else if connected {
             None
         } else {
-            Some("Sign in to Codex on this machine to enable local usage import.".to_string())
+            None
         },
     }
 }
@@ -2139,9 +1951,15 @@ fn get_openai_consumer_status(state: State<AppState>) -> ConsumerStatus {
 fn get_anthropic_consumer_status(state: State<AppState>) -> ConsumerStatus {
     let connected = usageguard_core::has_anthropic_consumer_source();
 
-    let supports_5h_usage = usageguard_core::has_anthropic_consumer_5h_usage();
+    let snapshot = latest_consumer_snapshot(state.inner(), "anthropic");
 
-    let supports_week_usage = usageguard_core::has_anthropic_consumer_week_usage();
+    let supports_5h_usage = snapshot
+        .as_ref()
+        .is_some_and(|value| snapshot_window_supported(value, "primary"));
+
+    let supports_week_usage = snapshot
+        .as_ref()
+        .is_some_and(|value| snapshot_window_supported(value, "secondary"));
 
     let supports_usage = supports_5h_usage || supports_week_usage;
 
@@ -2167,18 +1985,38 @@ fn get_anthropic_consumer_status(state: State<AppState>) -> ConsumerStatus {
         supports_5h_usage,
         supports_week_usage,
         source_label: "Claude Code local client".to_string(),
-        status_message: if connected && supports_5h_usage {
+        status_message: if !connected {
+            Some("Sign in to Claude Code on this machine to enable local detection.".to_string())
+        } else if let Some(snapshot) = snapshot {
+            if supports_week_usage {
+                Some(
+                    "Showing exact Claude Code 5h and week quota from locally sourced usage data."
+                        .to_string(),
+                )
+            } else if supports_5h_usage {
+                Some(
+                    "Showing exact Claude Code 5h quota from locally sourced usage data. Weekly quota is not currently available from local data."
+                        .to_string(),
+                )
+            } else {
+                snapshot.status_message.clone().or_else(|| {
+                    Some("Claude Code local sign-in detected. Quota data is syncing.".to_string())
+                })
+            }
+        } else if connected && supports_week_usage {
             Some(
-                "Showing exact Claude Code 5h quota from locally sourced usage data. Weekly quota percentage is not exposed by the local client."
+                "Showing exact Claude Code 5h and week quota from locally sourced usage data."
+                    .to_string(),
+            )
+        } else if connected && supports_5h_usage {
+            Some(
+                "Showing exact Claude Code 5h quota from locally sourced usage data. Weekly quota is not currently available from local data."
                     .to_string(),
             )
         } else if connected {
-            Some(
-                "Claude Code local sign-in detected. Exact 5h quota is currently unavailable, and weekly quota percentage is not exposed by the local client."
-                    .to_string(),
-            )
+            Some("Claude Code local sign-in detected. Quota data is syncing.".to_string())
         } else {
-            Some("Sign in to Claude Code on this machine to enable local detection.".to_string())
+            None
         },
     }
 }
@@ -2342,13 +2180,14 @@ fn send_test_alert(
 mod tests {
 
     use super::{
-        alert_cycle_key, apply_manual_alerts, apply_provider_account_save,
-        clamp_widget_origin_to_area, collect_pending_notifications, compare_versions,
-        default_widget_origin_for_area, prune_manual_alerts, remember_emitted_alert,
-        work_area_contains_point, Alert, AppConfig, LogicalWorkArea, ManualAlert, ProviderAccount,
-        ProviderAccountInput, ProviderCatalogEntry, SnapshotView, UsageSnapshot,
-        DEFAULT_WIDGET_HEIGHT, DEFAULT_WIDGET_MARGIN_BOTTOM, DEFAULT_WIDGET_MARGIN_RIGHT,
-        DEFAULT_WIDGET_WIDTH, TEST_ALERT_CODE, TEST_ALERT_MESSAGE,
+        alert_cycle_key, anthropic_snapshot_needs_bootstrap, apply_manual_alerts,
+        clamp_popup_origin_to_area, clamp_widget_origin_to_area, collect_pending_notifications,
+        compare_versions, default_widget_origin_for_area, prune_manual_alerts,
+        remember_emitted_alert, snapshot_window_supported, work_area_contains_point, Alert,
+        AppConfig, LogicalWorkArea, ManualAlert, SnapshotView, UsageSnapshot,
+        CONSUMER_LOCAL_STATUS_SOURCE, CONSUMER_LOCAL_USAGE_PENDING_CODE,
+        CONSUMER_LOCAL_WAITING_FOR_USAGE_CODE, DEFAULT_WIDGET_HEIGHT, DEFAULT_WIDGET_MARGIN_BOTTOM,
+        DEFAULT_WIDGET_MARGIN_RIGHT, DEFAULT_WIDGET_WIDTH, TEST_ALERT_CODE, TEST_ALERT_MESSAGE,
     };
     #[cfg(target_os = "linux")]
     use super::{
@@ -2357,7 +2196,6 @@ mod tests {
         XDG_CONFIG_HOME_ENV,
     };
     use chrono::{Local, Timelike};
-    use std::cell::Cell;
     use std::cmp::Ordering;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -2438,17 +2276,120 @@ mod tests {
         );
     }
 
-    fn provider_catalog_fixture() -> Vec<ProviderCatalogEntry> {
-        vec![
-            ProviderCatalogEntry {
-                id: "openai".into(),
-                label: "OpenAI".into(),
+    #[test]
+
+    fn clamp_popup_origin_to_area_keeps_popup_fully_visible() {
+        let area = LogicalWorkArea {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 600.0,
+        };
+
+        let (x, y) = clamp_popup_origin_to_area(area, 760.0, 570.0, 360.0, 348.0);
+
+        assert_eq!(x, 440.0);
+
+        assert_eq!(y, 252.0);
+    }
+
+    #[test]
+
+    fn snapshot_window_supported_requires_local_quota_data() {
+        let snapshot = UsageSnapshot {
+            provider: "anthropic".into(),
+            account_label: "Claude Code".into(),
+            spent_usd: 0.0,
+            limit_usd: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+            inactive_hours: 0,
+            source: "consumer_local".into(),
+            status_code: Some("consumer_local_quota".into()),
+            status_message: None,
+            api_metrics: None,
+            consumer_quota: Some(usageguard_core::ConsumerQuotaCard {
+                primary: Some(usageguard_core::ConsumerQuotaWindow {
+                    available: true,
+                    used_percent: Some(62.0),
+                    reset_at: Some("2026-03-19T10:00:00Z".into()),
+                }),
+                secondary: Some(usageguard_core::ConsumerQuotaWindow {
+                    available: true,
+                    used_percent: Some(74.0),
+                    reset_at: Some("2026-03-23T10:00:00Z".into()),
+                }),
+            }),
+            primary_reset_at: None,
+            secondary_reset_at: None,
+        };
+
+        assert!(snapshot_window_supported(&snapshot, "primary"));
+
+        assert!(snapshot_window_supported(&snapshot, "secondary"));
+    }
+
+    fn anthropic_status_snapshot(status_code: &str, with_quota: bool) -> UsageSnapshot {
+        UsageSnapshot {
+            provider: "anthropic".into(),
+            account_label: "Claude Code".into(),
+            spent_usd: 0.0,
+            limit_usd: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+            inactive_hours: 0,
+            source: CONSUMER_LOCAL_STATUS_SOURCE.into(),
+            status_code: Some(status_code.into()),
+            status_message: None,
+            api_metrics: None,
+            consumer_quota: if with_quota {
+                Some(usageguard_core::ConsumerQuotaCard {
+                    primary: Some(usageguard_core::ConsumerQuotaWindow {
+                        available: true,
+                        used_percent: Some(12.0),
+                        reset_at: Some("2026-03-20T10:00:00Z".into()),
+                    }),
+                    secondary: None,
+                })
+            } else {
+                None
             },
-            ProviderCatalogEntry {
-                id: "anthropic".into(),
-                label: "Anthropic".into(),
-            },
-        ]
+            primary_reset_at: None,
+            secondary_reset_at: None,
+        }
+    }
+
+    #[test]
+
+    fn anthropic_waiting_status_without_quota_triggers_bootstrap() {
+        let snapshot = anthropic_status_snapshot(CONSUMER_LOCAL_WAITING_FOR_USAGE_CODE, false);
+
+        assert!(anthropic_snapshot_needs_bootstrap(&snapshot));
+    }
+
+    #[test]
+
+    fn anthropic_pending_status_without_quota_triggers_bootstrap() {
+        let snapshot = anthropic_status_snapshot(CONSUMER_LOCAL_USAGE_PENDING_CODE, false);
+
+        assert!(anthropic_snapshot_needs_bootstrap(&snapshot));
+    }
+
+    #[test]
+
+    fn anthropic_status_with_quota_does_not_trigger_bootstrap() {
+        let snapshot = anthropic_status_snapshot(CONSUMER_LOCAL_WAITING_FOR_USAGE_CODE, true);
+
+        assert!(!anthropic_snapshot_needs_bootstrap(&snapshot));
+    }
+
+    #[test]
+
+    fn non_anthropic_status_does_not_trigger_bootstrap() {
+        let mut snapshot = anthropic_status_snapshot(CONSUMER_LOCAL_WAITING_FOR_USAGE_CODE, false);
+        snapshot.provider = "openai".into();
+
+        assert!(!anthropic_snapshot_needs_bootstrap(&snapshot));
     }
 
     #[cfg(target_os = "linux")]
@@ -2558,198 +2499,6 @@ mod tests {
 
             assert!(!is_start_on_login_enabled());
         });
-    }
-
-    #[test]
-
-    fn provider_change_on_edit_is_rejected_server_side() {
-        let mut cfg = AppConfig::default();
-
-        cfg.provider_accounts.push(ProviderAccount {
-            id: "acct_openai_work".into(),
-            provider: "openai".into(),
-            label: "Work".into(),
-            endpoint: None,
-        });
-
-        let input = ProviderAccountInput {
-            id: Some("acct_openai_work".into()),
-            provider: "anthropic".into(),
-            label: "Work".into(),
-            api_key: None,
-        };
-
-        let error = apply_provider_account_save(
-            &mut cfg,
-            &input,
-            &provider_catalog_fixture(),
-            |_| true,
-            |_, _| Ok(()),
-            |_, _| Ok(()),
-            |_| Ok(()),
-        )
-        .unwrap_err();
-
-        assert!(error.contains("Provider cannot be changed"));
-    }
-
-    #[test]
-
-    fn provider_account_input_rejects_removed_individual_fields() {
-        let error = serde_json::from_value::<ProviderAccountInput>(serde_json::json!({
-            "provider": "openai",
-            "label": "Work",
-            "apiKey": "sk-test",
-            "accessMode": "individual",
-            "usageLogPath": "C:\\logs\\usage.ndjson"
-        }))
-        .unwrap_err();
-
-        assert!(error.to_string().contains("unknown field"));
-    }
-
-    #[test]
-
-    fn label_only_edit_keeps_existing_key_without_validation() {
-        let mut cfg = AppConfig::default();
-
-        cfg.provider_accounts.push(ProviderAccount {
-            id: "acct_openai_work".into(),
-            provider: "openai".into(),
-            label: "Work".into(),
-            endpoint: None,
-        });
-
-        let validation_called = Cell::new(false);
-
-        let persist_key_called = Cell::new(false);
-
-        let input = ProviderAccountInput {
-            id: Some("acct_openai_work".into()),
-            provider: "openai".into(),
-            label: "Renamed".into(),
-            api_key: None,
-        };
-
-        apply_provider_account_save(
-            &mut cfg,
-            &input,
-            &provider_catalog_fixture(),
-            |_| true,
-            |_, _| {
-                validation_called.set(true);
-
-                Ok(())
-            },
-            |_, _| {
-                persist_key_called.set(true);
-
-                Ok(())
-            },
-            |_| Ok(()),
-        )
-        .unwrap();
-
-        assert_eq!(cfg.provider_accounts[0].label, "Renamed");
-
-        assert!(!validation_called.get());
-
-        assert!(!persist_key_called.get());
-    }
-
-    #[test]
-
-    fn invalid_new_api_key_rejects_without_persisting() {
-        let mut cfg = AppConfig::default();
-
-        let persisted_key = Cell::new(false);
-
-        let persisted_config = Cell::new(false);
-
-        let input = ProviderAccountInput {
-            id: None,
-            provider: "openai".into(),
-            label: "Work".into(),
-            api_key: Some("bad-key".into()),
-        };
-
-        let error = apply_provider_account_save(
-            &mut cfg,
-            &input,
-            &provider_catalog_fixture(),
-            |_| false,
-            |_, _| Err("OpenAI API key is invalid. Nothing was saved.".into()),
-            |_, _| {
-                persisted_key.set(true);
-
-                Ok(())
-            },
-            |_| {
-                persisted_config.set(true);
-
-                Ok(())
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.contains("invalid"));
-
-        assert!(cfg.provider_accounts.is_empty());
-
-        assert!(!persisted_key.get());
-
-        assert!(!persisted_config.get());
-    }
-
-    #[test]
-
-    fn key_replacement_failure_keeps_old_key_and_config() {
-        let mut cfg = AppConfig::default();
-
-        cfg.provider_accounts.push(ProviderAccount {
-            id: "acct_openai_work".into(),
-            provider: "openai".into(),
-            label: "Work".into(),
-            endpoint: None,
-        });
-
-        let persisted_key = Cell::new(false);
-
-        let persisted_config = Cell::new(false);
-
-        let input = ProviderAccountInput {
-            id: Some("acct_openai_work".into()),
-            provider: "openai".into(),
-            label: "Work".into(),
-            api_key: Some("replacement".into()),
-        };
-
-        let error = apply_provider_account_save(
-            &mut cfg,
-            &input,
-            &provider_catalog_fixture(),
-            |_| true,
-            |_, _| Err("OpenAI API key is invalid. Nothing was saved.".into()),
-            |_, _| {
-                persisted_key.set(true);
-
-                Ok(())
-            },
-            |_| {
-                persisted_config.set(true);
-
-                Ok(())
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.contains("invalid"));
-
-        assert_eq!(cfg.provider_accounts[0].label, "Work");
-
-        assert!(!persisted_key.get());
-
-        assert!(!persisted_config.get());
     }
 
     fn snapshot_view_with_alerts(
@@ -3192,6 +2941,7 @@ fn main() {
                 snapshots: Mutex::new(Vec::new()),
                 manual_alerts: Mutex::new(HashMap::new()),
                 refresh: Mutex::new(RefreshState::default()),
+                claude_bootstrap: Mutex::new(ClaudeBootstrapState::default()),
                 tray_available: Mutex::new(false),
                 start_on_login_enabled: Mutex::new(startup_enabled),
                 tray_start_on_login_item: Mutex::new(None),
@@ -3226,11 +2976,7 @@ fn main() {
             get_config,
             get_refresh_interval_secs,
             refresh_snapshots,
-            get_provider_settings,
             open_provider_settings,
-            save_provider_account,
-            delete_provider_account,
-            update_config,
             quit,
             show_context_menu,
             set_window_rect,

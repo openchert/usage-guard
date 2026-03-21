@@ -6,8 +6,7 @@ Instead, it reads the local state already created by the official Codex and Clau
 
 ## Core rules
 
-- UsageGuard never stores consumer access tokens in its own secret store.
-- Provider API keys for organization monitoring still go through OS-native secure storage.
+- UsageGuard never stores consumer access tokens in its own config.
 - Consumer access tokens stay in the official client files and are only used in memory when UsageGuard needs to call a built-in consumer usage endpoint.
 - If local consumer usage is not available yet, the widget shows a local status card instead of asking the user to sign in through UsageGuard.
 
@@ -50,22 +49,22 @@ Acquisition order:
 4. Cache the normalized quota windows briefly for the widget refresh loop and for cheap status checks during startup.
 5. If quota data is not available yet, keep showing the local status snapshot instead of blocking startup.
 
-The current Claude consumer view reliably exposes the `5h` window. A second longer window can be normalized when the upstream response includes it, but the desktop status/settings flow still treats Claude weekly support as unavailable.
+Claude Code always exposes the `5h` window when the local upstream returns quota data. A second longer window is surfaced automatically when the upstream response includes it.
 
 ## What gets persisted
 
 UsageGuard persists:
 
-- provider API keys for organization/admin monitoring accounts
-- local config such as labels, alert toggles, quiet hours, and UI settings
+- local config such as labels, alert toggles, quiet hours, refresh interval, theme, and widget position
 
 UsageGuard does not persist:
 
 - consumer access tokens from Codex or Claude Code
 - consumer refresh tokens
 - browser sign-in session payloads from older builds
+- remote-monitoring credentials from older builds
 
-Legacy browser-sign-in artifacts from older builds are ignored during load and removed on the next save.
+Legacy remote-monitoring fields from older builds are ignored during load and removed on the next save.
 
 ## Why this model exists
 

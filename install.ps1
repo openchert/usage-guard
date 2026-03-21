@@ -106,7 +106,7 @@ try {
   Write-Host ''
   Write-Host "Installed version: $InstalledVersion"
   Write-Host 'Try:'
-  Write-Host '  usageguard demo'
+  Write-Host '  usageguard status'
   Write-Host '  usageguard-desktop'
 }
 finally {

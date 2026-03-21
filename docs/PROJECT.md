@@ -1,23 +1,22 @@
 # UsageGuard Project
 
-> Historical note: parts of this document predate the security hardening pass.
-> Current secret-storage and local consumer behavior is documented in `docs/SECURITY.md` and `docs/LOCAL_CONSUMER_SOURCES.md`.
+> Historical note: parts of this document predate the consumer-only cleanup.
+> Current local consumer behavior is documented in `docs/SECURITY.md` and `docs/LOCAL_CONSUMER_SOURCES.md`.
 > Current provider/source display behavior is documented in `docs/PROVIDERS.md`.
 
-UsageGuard is a local-first AI usage monitor built as a Rust workspace. It normalizes usage data from multiple providers into one shared snapshot model, then exposes that data through a CLI and a compact desktop widget.
+UsageGuard is a local-first AI usage monitor built as a Rust workspace. It normalizes local Codex and Claude Code usage into one shared snapshot model, then exposes that data through a CLI and a compact desktop widget.
 
 ## Workspace layout
 
-- `crates/usageguard-core`: config loading, OS-native secret storage, provider adapters, snapshot normalization, alert evaluation, and demo fallback data.
-- `crates/usageguard-cli`: terminal entrypoint for demo output, local alert checks, and basic config helpers.
+- `crates/usageguard-core`: config loading, local consumer adapters, snapshot normalization, and alert evaluation.
+- `crates/usageguard-cli`: terminal entrypoint for local status inspection.
 - `crates/usageguard-desktop`: Tauri desktop runtime, tray integration, native notifications, widget window management, and menu handling.
-- `crates/usageguard-desktop/ui`: Svelte 5 + Vite frontend for the mini desktop widget.
-- `examples/providers`: sample provider profile and NDJSON log inputs.
+- `crates/usageguard-desktop/ui`: Svelte 5 + Vite frontend for the mini desktop widget and connections window.
 - `docs`: project and interface documentation.
 
 ## Snapshot pipeline
 
-`usageguard-core` uses two different acquisition paths depending on the provider type.
+`usageguard-core` now uses only local consumer acquisition paths.
 
 ### Local consumer sources
 
@@ -26,61 +25,45 @@ UsageGuard is a local-first AI usage monitor built as a Rust workspace. It norma
 - Anthropic / Claude Code:
   local plan metadata from `~/.claude/.credentials.json`, then a built-in usage fetch using the local token from that file, then a local status snapshot if Claude Code is signed in but quota data is not available yet.
 
-### API and admin monitoring sources
-
-For API/admin providers, `usageguard-core` resolves data in this order:
-
-1. Provider usage log from `*_USAGE_LOG` if present.
-2. HTTP API call using configured endpoint and API key.
-3. Environment fallback such as `*_SPENT_USD` and `*_LIMIT_USD`.
-4. Demo data if no provider returns anything.
-
 Every provider is normalized into the shared `UsageSnapshot` model with:
 
 - provider id
 - account label
-- spend and limit in USD
-- input and output token counts
-- inactivity in hours
 - source label
-- optional safe status code/message fields
+- optional safe status code and message fields
+- normalized consumer quota windows when available
+- optional reset timestamps for `5h` and `week`
 
 Alerts are evaluated after snapshot collection. Current alert logic covers:
 
 - local consumer quota alerts for `5h` and `week` windows where available
 - near-limit warnings when quota is almost exhausted
 - use-before-reset reminders when reset is close and usage is still low
-- legacy budget and inactivity alerts for API/admin monitoring sources
 
 Quiet hours suppress non-critical notifications. Active alerts also surface in the widget card state, while native notifications are emitted when a new alert signature becomes active.
 
 ## Current desktop behavior
 
-The current desktop app is a Tauri 2 widget, not the older `eframe/egui` shell.
+The current desktop app is a Tauri 2 widget.
 
 - Frameless, transparent, compact widget window.
 - Starts in the bottom-right corner of the active monitor.
-- Uses the Windows work area on startup so the widget stays above the taskbar.
-- Resizes horizontally to fit the number of provider cards.
-- Refreshes snapshots every 30 seconds.
+- Uses the work area on startup so the widget stays on-screen.
+- Resizes horizontally to fit the number of connection cards.
+- Refreshes snapshots on a configurable interval.
 - Left mouse drag moves the widget.
-- A small add button opens provider management.
 - Right-click opens the platform native context menu.
-- Tray left-click toggles show/hide.
-- Tray and context menus expose provider management.
-- A dedicated native settings window manages provider accounts.
-- Native notifications are emitted on Linux, Windows, and macOS when alert signatures change.
+- Tray left-click toggles show and hide.
+- Tray and context menus expose `Manage Connections...`.
+- A dedicated native connections window manages local labels and alert toggles.
+- Native notifications are emitted when alert signatures change.
 - Widget cards keep a visible alert badge and border tint while an alert remains active.
 
-## Configuration and secrets
+## Configuration
 
 - Shared config is stored at the OS config directory under `usage-guard/config.json`.
-- On Windows, provider API keys are stored in `%APPDATA%\usage-guard\secrets.bin` using DPAPI.
-- On Linux, provider API keys are stored in the desktop Secret Service keyring.
-- Legacy browser-sign-in storage from older builds is cleaned up on load and is not used by the current runtime.
-- Named provider accounts are stored in `provider_accounts` and can reuse the same vendor multiple times with different labels and keys.
-- The first hardened desktop deploy is locked to built-in audited endpoints for outbound fetches.
-- Legacy custom provider profiles are no longer used for outbound fetches.
+- Current persisted settings are limited to quiet hours, refresh interval, theme, widget position, local connection labels, and per-window alert toggles.
+- Legacy remote-monitoring fields from older builds are ignored during load and removed on the next save.
 
 ## Development workflow
 
@@ -94,7 +77,7 @@ Common commands from the repository root:
 ```bash
 npm install --prefix crates/usageguard-desktop/ui
 cargo test
-cargo run -p usageguard-cli -- demo
+cargo run -p usageguard-cli -- status
 cargo run -p usageguard-desktop
 ```
 
@@ -103,7 +86,7 @@ The desktop build uses Tauri's `beforeBuildCommand` to build the Svelte UI from 
 ## Related docs
 
 - `docs/LOCAL_CONSUMER_SOURCES.md`: exact local-file and token-backed consumer acquisition flow.
-- `docs/SECURITY.md`: secret storage, local credential usage boundaries, and threat model.
-- `docs/PROVIDERS.md`: provider/source display adapters and normalized card behavior.
+- `docs/SECURITY.md`: local credential usage boundaries and threat model.
+- `docs/PROVIDERS.md`: provider and display model.
 - `docs/SESSION_2026-03-08_DESKTOP_REWRITE.md`: recap of the desktop rewrite and native context menu work.
 - `docs/ALERTS.md`: quota alert thresholds, reminder windows, and delivery behavior.

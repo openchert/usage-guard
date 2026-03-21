@@ -1,15 +1,3 @@
-export interface ApiMetricWindow {
-  spend_usd: number;
-  tokens_in: number;
-  tokens_out: number;
-  requests?: number | null;
-}
-
-export interface ApiMetricCard {
-  today: ApiMetricWindow;
-  rolling_30d: ApiMetricWindow;
-}
-
 export interface ConsumerQuotaWindow {
   available: boolean;
   used_percent?: number | null;
@@ -38,7 +26,6 @@ export interface UsageSnapshot {
   source: string;
   status_code?: string | null;
   status_message?: string | null;
-  api_metrics?: ApiMetricCard | null;
   consumer_quota?: ConsumerQuotaCard | null;
   primary_reset_at?: string | null;
   secondary_reset_at?: string | null;
@@ -60,23 +47,6 @@ export interface QuotaUsageCardSpec extends UsageCardBase {
   rings: UsageRingSpec[];
 }
 
-export interface MetricStatSpec {
-  label: string;
-  value: string;
-  detail?: string;
-}
-
-export interface MetricsUsageCardSpec extends UsageCardBase {
-  kind: 'metrics';
-  stats: MetricStatSpec[];
-}
-
-export interface HybridUsageCardSpec extends UsageCardBase {
-  kind: 'hybrid';
-  rings: UsageRingSpec[];
-  stats: MetricStatSpec[];
-}
-
 export interface StatusUsageCardSpec extends UsageCardBase {
   kind: 'status';
   /** Visual state of the ring animation. */
@@ -85,7 +55,7 @@ export interface StatusUsageCardSpec extends UsageCardBase {
   label: string;
 }
 
-export type UsageCardSpec = QuotaUsageCardSpec | MetricsUsageCardSpec | HybridUsageCardSpec | StatusUsageCardSpec;
+export type UsageCardSpec = QuotaUsageCardSpec | StatusUsageCardSpec;
 
 export interface UsageDisplayContext {
   providerLabel: string;

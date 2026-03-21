@@ -2,22 +2,20 @@
 
 ## Scope
 
-This document describes the current Windows and Linux implementation for secret storage, local consumer imports, and provider authentication.
+This document describes the current Windows and Linux implementation for local consumer imports and built-in consumer usage fetches.
 
-## Secret storage
+## Local data handling
 
-UsageGuard stores secrets through OS-native secure storage:
+UsageGuard no longer stores external provider credentials or runs an account-management flow for remote monitoring.
 
-- Windows: DPAPI-encrypted blob at `%APPDATA%\usage-guard\secrets.bin`
-- Linux: desktop Secret Service keyring through the OS credential store (for example GNOME Keyring or a KWallet-backed Secret Service provider)
+For normal operation:
 
-For normal operation, the app reads and writes secrets only through secure OS storage for provider API keys. Consumer monitoring reads local Codex and Claude Code files directly from the current user profile and uses those local credentials only in memory when a built-in consumer usage fetch is needed.
+- Codex state is read from local client files already present on the machine.
+- Claude Code state is read from local client files already present on the machine.
+- Local consumer access tokens stay in those client files and are only used in memory when a built-in consumer usage fetch is needed.
+- UsageGuard persists only local app config such as labels, alert toggles, refresh interval, theme, and widget position.
 
-The encrypted payload currently contains:
-
-- Provider API keys for OpenAI and Anthropic accounts
-
-Legacy browser-sign-in payloads from earlier builds are ignored and cleaned up during migration. The current consumer flow does not request, store, or refresh consumer tokens inside UsageGuard.
+Legacy provider-secret artifacts from older builds are ignored by the current runtime and are not required for normal operation.
 
 ## Supported connection types
 
@@ -27,10 +25,8 @@ Current built-in connection types are:
 - OpenAI `consumer_local_status`: Codex local signed-in status when quota data is not available yet
 - Anthropic `consumer_local`: Claude Code consumer usage via the local credentials file plus a built-in usage fetch that uses the local token from `~/.claude/.credentials.json`
 - Anthropic `consumer_local_status`: Claude Code local status via `~/.claude/.credentials.json` when quota data is not available yet
-- OpenAI `api`: `GET https://api.openai.com/v1/organization/costs` and `GET https://api.openai.com/v1/organization/usage/completions`
-- Anthropic `api`: `GET https://api.anthropic.com/v1/organizations/cost_report` and `GET https://api.anthropic.com/v1/organizations/usage_report/messages`
 
-Outbound requests are limited to these built-in audited endpoints. Custom endpoint overrides and custom provider profiles are not used for outbound fetches.
+Outbound requests are limited to these built-in consumer endpoints.
 
 ## OpenAI local consumer import
 
@@ -54,16 +50,7 @@ Claude Code local state is read from the user profile.
 5. The response is normalized into the shared consumer quota model and cached briefly for the widget refresh loop.
 6. If quota data is not available yet, the widget still shows the local Claude Code status snapshot instead of a browser sign-in prompt.
 
-The current desktop status/settings flow officially treats Claude `5h` quota as supported. A longer secondary window can still appear in the widget when the upstream response includes it.
-
-## API-key authentication
-
-Built-in API providers use these authentication methods:
-
-- OpenAI API: `Authorization: Bearer <api key>` with organization/admin usage access for the Administration endpoints
-- Anthropic API: `x-api-key: <api key>` with `anthropic-version: 2023-06-01`; organization monitoring requires an Admin API key (`sk-ant-admin...`)
-
-UsageGuard does not accept individual API keys for provider-reported historical usage. Individual-user monitoring is handled through local consumer imports where the official local client exposes enough data.
+Claude Code local status and settings now expose weekly support whenever the normalized local snapshot contains a secondary quota window.
 
 ## UI and command hardening
 
@@ -72,7 +59,7 @@ The desktop app includes these protections:
 - Tauri global bridge disabled (`withGlobalTauri: false`)
 - restrictive CSP enabled in `tauri.conf.json`
 - UI uses `@tauri-apps/api` imports instead of `window.__TAURI__`
-- sensitive commands validate the calling window label, so mutating actions only run from the settings window
+- sensitive commands validate the calling window label, so mutating actions only run from the connections window
 
 ## Threat model
 
@@ -80,18 +67,16 @@ This protects secrets at rest against casual disclosure such as:
 
 - copied config directories
 - inspecting files in `%APPDATA%`
-- copying Linux config directories without also having access to the user's unlocked secret-service session
-- accidental plaintext token leakage from UsageGuard-managed storage
+- accidental plaintext leakage from UsageGuard-managed config files
 
 It does not attempt to defend against:
 
 - same-user malware
 - a fully compromised desktop session
-- an attacker who can already call the platform credential APIs as the logged-in user
+- an attacker who can already access the local Codex or Claude Code client files as the logged-in user
 
 ## Current limitations
 
-- Secure persistence is implemented on Windows and Linux in this release.
-- If secure persistence is unavailable, UsageGuard does not intentionally fall back to plaintext secret storage.
-- On Linux, a Secret Service provider must be available and unlocked for credential persistence to work.
-- Claude Code desktop status/settings currently expose the `5h` window as the supported local quota signal, even though the normalized snapshot can carry a longer secondary window when the upstream response includes it.
+- UsageGuard depends on the local Codex or Claude Code client already being signed in on the current machine.
+- If the local client has not produced usable quota data yet, UsageGuard shows a status card until data becomes available.
+- Claude Code weekly support depends on the upstream local usage response including a secondary window.
