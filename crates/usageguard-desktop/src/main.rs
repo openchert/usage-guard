@@ -1873,6 +1873,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 #[derive(Serialize)]
 struct ConsumerStatus {
     connected: bool,
+    enabled: bool,
     plan_type: Option<String>,
     label: Option<String>,
     alerts_5h_enabled: bool,
@@ -1950,6 +1951,7 @@ fn get_openai_consumer_status(state: State<AppState>) -> ConsumerStatus {
 
     ConsumerStatus {
         connected,
+        enabled: true,
         plan_type,
         label: cfg.openai_consumer_label,
         alerts_5h_enabled: cfg.openai_consumer_5h_alerts_enabled,
@@ -2002,6 +2004,7 @@ fn get_anthropic_consumer_status(state: State<AppState>) -> ConsumerStatus {
 
     ConsumerStatus {
         connected,
+        enabled: cfg.anthropic_consumer_enabled,
         plan_type,
         label: cfg.anthropic_consumer_label,
         alerts_5h_enabled: cfg.anthropic_consumer_5h_alerts_enabled,
@@ -2104,6 +2107,36 @@ fn set_consumer_window_alerts_enabled(
             ("openai", "week") => cfg.openai_consumer_week_alerts_enabled = enabled,
             ("anthropic", "5h") => cfg.anthropic_consumer_5h_alerts_enabled = enabled,
             ("anthropic", "week") => cfg.anthropic_consumer_week_alerts_enabled = enabled,
+            _ => return Err(format!("Unknown consumer provider: {provider}")),
+        }
+
+        save_config(&cfg).map_err(|e| e.to_string())?;
+
+        refresh_snapshot_alert_state(&state, &cfg);
+    }
+
+    emit_widget_refresh(&app);
+
+    spawn_snapshot_refresh(app);
+
+    Ok(())
+}
+
+#[tauri::command]
+fn set_consumer_enabled(
+    window: WebviewWindow,
+    provider: String,
+    enabled: bool,
+    state: State<AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    require_window_label(&window, SETTINGS_LABEL, "set_consumer_enabled")?;
+
+    {
+        let mut cfg = state.cfg.lock().expect("AppState cfg lock poisoned");
+
+        match provider.as_str() {
+            "anthropic" => cfg.anthropic_consumer_enabled = enabled,
             _ => return Err(format!("Unknown consumer provider: {provider}")),
         }
 
@@ -3010,6 +3043,7 @@ fn main() {
             get_anthropic_consumer_status,
             set_consumer_label,
             set_consumer_window_alerts_enabled,
+            set_consumer_enabled,
             send_test_alert,
             set_refresh_interval_secs,
         ])

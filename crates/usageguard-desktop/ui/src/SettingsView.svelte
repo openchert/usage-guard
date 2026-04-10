@@ -4,6 +4,7 @@
 
   interface ConsumerStatus {
     connected: boolean;
+    enabled: boolean;
     plan_type: string | null;
     label: string | null;
     alerts_5h_enabled: boolean;
@@ -19,6 +20,7 @@
   let errorMessage = '';
   let openaiConsumerStatus: ConsumerStatus = {
     connected: false,
+    enabled: true,
     plan_type: null,
     label: null,
     alerts_5h_enabled: true,
@@ -31,6 +33,7 @@
   };
   let anthropicConsumerStatus: ConsumerStatus = {
     connected: false,
+    enabled: false,
     plan_type: null,
     label: null,
     alerts_5h_enabled: true,
@@ -157,6 +160,19 @@
     }
   }
 
+  async function setConsumerEnabled(provider: 'anthropic', enabled: boolean): Promise<void> {
+    if (!invoke) return;
+    const previous = anthropicConsumerStatus.enabled;
+    anthropicConsumerStatus = { ...anthropicConsumerStatus, enabled };
+    errorMessage = '';
+    try {
+      await invoke('set_consumer_enabled', { provider, enabled });
+    } catch (error) {
+      anthropicConsumerStatus = { ...anthropicConsumerStatus, enabled: previous };
+      errorMessage = String(error);
+    }
+  }
+
   onMount(async () => {
     window.addEventListener('keydown', onKeydown);
     await applyTheme();
@@ -234,50 +250,60 @@
         <span class="field-help">{openaiConsumerStatus.status_message}</span>
       {/if}
 
-      <div class="consumer-row" class:consumer-connected={anthropicConsumerStatus.connected}>
-        <div class="account-dot" style="--accent:{anthropicConsumerStatus.connected ? '#d97a4e' : 'rgba(130, 138, 165, 0.35)'}"></div>
-        {#if anthropicConsumerStatus.connected}
+      <div class="consumer-row">
+        <div class="account-dot" style="--accent:{anthropicConsumerStatus.enabled && anthropicConsumerStatus.connected ? '#d97a4e' : 'rgba(130, 138, 165, 0.35)'}"></div>
+        <label class="consumer-enable-label" on:mousedown|stopPropagation>
           <input
-            class="consumer-name"
-            type="text"
-            bind:value={anthropicEditLabel}
-            on:focus={() => { anthropicLabelFocused = true; }}
-            on:blur={() => {
-              anthropicLabelFocused = false;
-              void saveConsumerLabel('anthropic', anthropicEditLabel);
-            }}
+            type="checkbox"
+            checked={anthropicConsumerStatus.enabled}
+            on:change={(event) => void setConsumerEnabled('anthropic', (event.currentTarget as HTMLInputElement).checked)}
             on:mousedown|stopPropagation
           />
-        {:else}
-          <span class="consumer-name static-label">{defaultAnthropicLabel(anthropicConsumerStatus)}</span>
-        {/if}
+          {#if anthropicConsumerStatus.enabled && anthropicConsumerStatus.connected}
+            <input
+              class="consumer-name"
+              type="text"
+              bind:value={anthropicEditLabel}
+              on:focus={() => { anthropicLabelFocused = true; }}
+              on:blur={() => {
+                anthropicLabelFocused = false;
+                void saveConsumerLabel('anthropic', anthropicEditLabel);
+              }}
+              on:mousedown|stopPropagation
+            />
+          {:else}
+            <span class="consumer-name static-label">{defaultAnthropicLabel(anthropicConsumerStatus)}</span>
+          {/if}
+        </label>
         <span class="consumer-provider-label">{anthropicConsumerStatus.source_label}</span>
       </div>
-      <div class="consumer-subrow">
-        <span class="consumer-subrow-label">Alerts</span>
-        <label class="consumer-checkbox">
-          <input
-            type="checkbox"
-            checked={anthropicConsumerStatus.alerts_5h_enabled}
-            disabled={!anthropicConsumerStatus.supports_5h_usage}
-            on:change={(event) => void setConsumerWindowAlertsEnabled('anthropic', '5h', (event.currentTarget as HTMLInputElement).checked)}
-            on:mousedown|stopPropagation
-          />
-          <span>5h</span>
-        </label>
-        <label class="consumer-checkbox">
-          <input
-            type="checkbox"
-            checked={anthropicConsumerStatus.alerts_week_enabled}
-            disabled={!anthropicConsumerStatus.supports_week_usage}
-            on:change={(event) => void setConsumerWindowAlertsEnabled('anthropic', 'week', (event.currentTarget as HTMLInputElement).checked)}
-            on:mousedown|stopPropagation
-          />
-          <span>{anthropicConsumerStatus.supports_week_usage ? 'Week' : 'Week unavailable locally'}</span>
-        </label>
-      </div>
-      {#if anthropicConsumerStatus.status_message}
-        <span class="field-help">{anthropicConsumerStatus.status_message}</span>
+      {#if anthropicConsumerStatus.enabled}
+        <div class="consumer-subrow">
+          <span class="consumer-subrow-label">Alerts</span>
+          <label class="consumer-checkbox">
+            <input
+              type="checkbox"
+              checked={anthropicConsumerStatus.alerts_5h_enabled}
+              disabled={!anthropicConsumerStatus.supports_5h_usage}
+              on:change={(event) => void setConsumerWindowAlertsEnabled('anthropic', '5h', (event.currentTarget as HTMLInputElement).checked)}
+              on:mousedown|stopPropagation
+            />
+            <span>5h</span>
+          </label>
+          <label class="consumer-checkbox">
+            <input
+              type="checkbox"
+              checked={anthropicConsumerStatus.alerts_week_enabled}
+              disabled={!anthropicConsumerStatus.supports_week_usage}
+              on:change={(event) => void setConsumerWindowAlertsEnabled('anthropic', 'week', (event.currentTarget as HTMLInputElement).checked)}
+              on:mousedown|stopPropagation
+            />
+            <span>{anthropicConsumerStatus.supports_week_usage ? 'Week' : 'Week unavailable locally'}</span>
+          </label>
+        </div>
+        {#if anthropicConsumerStatus.status_message}
+          <span class="field-help">{anthropicConsumerStatus.status_message}</span>
+        {/if}
       {/if}
 
       <div class="status-row">
@@ -387,6 +413,14 @@
     border-radius: 8px;
     background: var(--surface-row);
     flex-shrink: 0;
+  }
+
+  .consumer-enable-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    cursor: pointer;
   }
 
   .consumer-subrow {

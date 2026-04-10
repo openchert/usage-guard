@@ -234,6 +234,9 @@ pub struct AppConfig {
         alias = "anthropic_oauth_week_alerts_enabled"
     )]
     pub anthropic_consumer_week_alerts_enabled: bool,
+    /// Whether the Claude Code consumer widget and data fetching are enabled.
+    #[serde(default)]
+    pub anthropic_consumer_enabled: bool,
     /// Last release tag that already triggered an update notification.
     #[serde(default)]
     pub last_update_notified_version: Option<String>,
@@ -253,6 +256,7 @@ impl Default for AppConfig {
             openai_consumer_week_alerts_enabled: true,
             anthropic_consumer_5h_alerts_enabled: true,
             anthropic_consumer_week_alerts_enabled: true,
+            anthropic_consumer_enabled: false,
             last_update_notified_version: None,
         }
     }
@@ -1190,6 +1194,8 @@ fn parse_claude_local_usage_response(
 }
 
 pub fn fetch_anthropic_consumer_usage() -> Option<UsageSnapshot> {
+    // Note: the /api/oauth/usage endpoint blocks non-Claude-Code user agents (returns 429).
+    // This function is only called when anthropic_consumer_enabled is true in AppConfig.
     if !has_anthropic_consumer_source() {
         return None;
     }
@@ -1723,6 +1729,8 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
         .filter(|label| !label.is_empty())
         .map(str::to_string);
 
+    let anthropic_consumer_enabled = cfg.anthropic_consumer_enabled;
+
     std::thread::scope(|scope| {
         let openai_handle = scope.spawn(move || {
             let mut snapshot = fetch_openai_consumer_usage()?;
@@ -1735,6 +1743,10 @@ pub fn provider_snapshots(cfg: &AppConfig) -> Vec<UsageSnapshot> {
         });
 
         let anthropic_handle = scope.spawn(move || {
+            if !anthropic_consumer_enabled {
+                return None;
+            }
+
             let mut snapshot = fetch_anthropic_consumer_usage()?;
 
             if let Some(label) = anthropic_consumer_label {
